@@ -15,10 +15,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
+import json
 import math
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -57,7 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-clip-to-pm", action="store_true")
     parser.add_argument("--generated-masks-dirname", default="masks_for_analysis")
     parser.add_argument("--num-threads", type=int, default=0)
-    parser.add_argument("--skip-plots", action="store_true")
+    parser.add_argument("--skip-plots", action="store_true", help="Skip thumbnail generation (faster processing).")
+    parser.add_argument("--force-reprocess", action="store_true", help="Re-process cells even if report.csv already exists.")
     parser.add_argument(
         "--max-skeleton-voxels",
         type=int,
@@ -349,51 +354,6 @@ def per_label_metrics(
     return df
 
 
-def center_slice_index(mask_3d: np.ndarray) -> int:
-    coords = np.argwhere(mask_3d)
-    if coords.size == 0:
-        return int(mask_3d.shape[0] // 2)
-    return int(np.median(coords[:, 0]))
-
-
-def save_qc_plots_for_label_entity(out_dir: Path, membrane: np.ndarray, labels: np.ndarray, df: pd.DataFrame, entity_name: str) -> None:
-    if df.empty:
-        return
-    plots_dir = out_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    z = center_slice_index(membrane)
-    labels_2d = labels[z]
-
-    for value_col in [c for c in df.columns if c in ("volume_um3", "distance_to_membrane_um")]:
-        values = np.full(labels_2d.shape, np.nan, dtype=np.float32)
-        vmap = dict(zip(df["label"].astype(int), df[value_col].astype(float)))
-        for lab in np.unique(labels_2d):
-            if lab == 0:
-                continue
-            v = vmap.get(int(lab))
-            if v is not None and np.isfinite(v):
-                values[labels_2d == lab] = v
-
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.imshow(membrane[z], cmap="gray", alpha=0.2)
-        im = ax.imshow(np.ma.masked_invalid(values), cmap="viridis")
-        ax.set_axis_off()
-        ax.set_title(f"{entity_name}: {value_col} (z={z})")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        fig.tight_layout()
-        fig.savefig(plots_dir / f"{entity_name}_center_slice_{value_col}.png", dpi=180)
-        plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(6, 4))
-    vals = df["volume_um3"].replace([np.inf, -np.inf], np.nan).dropna()
-    if not vals.empty:
-        ax.hist(vals, bins=30)
-    ax.set_title(f"{entity_name}: volume distribution")
-    ax.set_xlabel("volume_um3")
-    ax.set_ylabel("count")
-    fig.tight_layout()
-    fig.savefig(plots_dir / f"{entity_name}_volume_hist.png", dpi=180)
-    plt.close(fig)
 
 
 def _render_depth_shaded(binary: np.ndarray, rgb: Tuple[float, float, float]) -> np.ndarray:
@@ -438,74 +398,30 @@ def _render_depth_shaded(binary: np.ndarray, rgb: Tuple[float, float, float]) ->
     return (img * 255).astype(np.uint8)
 
 
-def save_mosaic_3d_labels(
-    out_dir: Path,
-    labels: np.ndarray,
-    df: pd.DataFrame,
-    entity_name: str,
-    voxel_size_zyx: Tuple[float, float, float],
-) -> None:
-    if df.empty:
-        return
 
-    plots_dir = out_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
 
-    df_sorted = df.copy()
-    df_sorted["_sort"] = df_sorted["branches"].fillna(np.inf)
-    df_sorted = df_sorted.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
+def _to_png_b64(rgba: np.ndarray) -> str:
+    buf = io.BytesIO()
+    plt.imsave(buf, rgba.astype(np.float32) / 255.0, format="png")
+    return base64.b64encode(buf.getvalue()).decode()
 
-    finite_branches = df_sorted["branches"].dropna()
-    if finite_branches.empty:
-        return
 
-    props_map = {rp.label: rp for rp in regionprops(labels)}
-    n = len(df_sorted)
-    if n == 0:
-        return
-
-    ncols = max(1, int(np.ceil(np.sqrt(n))))
-    nrows = max(1, int(np.ceil(n / ncols)))
-
-    b_min = float(finite_branches.min())
-    b_max = float(finite_branches.max())
-    if b_min == b_max:
-        b_max = b_min + 1.0
-    cmap = matplotlib.cm.plasma
-    norm = matplotlib.colors.Normalize(vmin=b_min, vmax=b_max)
-
-    cell_size = 2.5
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * cell_size, nrows * cell_size + 0.7), squeeze=False)
-
-    for pos, (_, row) in enumerate(df_sorted.iterrows()):
-        ax = axes[pos // ncols][pos % ncols]
-        ax.set_axis_off()
-        lbl = int(row["label"])
-        branches = row["branches"]
-
-        rp = props_map.get(lbl)
-        if rp is not None:
-            rgb = (0.65, 0.65, 0.65) if pd.isna(branches) else cmap(norm(float(branches)))[:3]
-            thumb = _render_depth_shaded(rp.image.astype(bool), rgb)
-            ax.imshow(thumb, interpolation="bilinear", aspect="equal")
-
-        branch_str = "N/A" if pd.isna(branches) else str(int(branches))
-        ax.set_title(f"#{lbl}  b={branch_str}", fontsize=7, pad=1)
-
-    for pos in range(len(df_sorted), nrows * ncols):
-        axes[pos // ncols][pos % ncols].set_visible(False)
-
-    sm = matplotlib.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    fig.subplots_adjust(bottom=0.1)
-    cbar_ax = fig.add_axes([0.1, 0.03, 0.8, 0.022])
-    fig.colorbar(sm, cax=cbar_ax, orientation="horizontal", label="branch count")
-
-    fig.suptitle(f"{entity_name} — mosaic sorted by branch count", fontsize=10)
-    out_path = plots_dir / f"{entity_name}_mosaic_3d.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Wrote 3D mosaic: {out_path.name}", flush=True)
+def _thumbnail_b64(binary: np.ndarray, rgb: Tuple[float, float, float], size: int = 64) -> str:
+    arr = _render_depth_shaded(binary, rgb)  # (H, W, 4) uint8
+    H, W = arr.shape[:2]
+    if H == 0 or W == 0:
+        return ""
+    scale = size / max(H, W)
+    nH = max(1, round(H * scale))
+    nW = max(1, round(W * scale))
+    ri = (np.arange(nH) * H / nH).astype(int)
+    ci = (np.arange(nW) * W / nW).astype(int)
+    resized = arr[np.ix_(ri, ci)]
+    square = np.zeros((size, size, 4), dtype=np.uint8)
+    y0 = (size - nH) // 2
+    x0 = (size - nW) // 2
+    square[y0:y0 + nH, x0:x0 + nW] = resized
+    return _to_png_b64(square)
 
 
 def resolve_voxel_size_zyx(args: argparse.Namespace, source_path: Path) -> Tuple[float, float, float]:
@@ -550,13 +466,6 @@ def write_generated_masks(
     print("Generated masks written.", flush=True)
 
 
-def init_overall_row(cell_id: str, volumes: Dict[str, np.ndarray], entities: Dict[str, Entity], membrane_key: str, voxel_um3: float) -> dict:
-    membrane = volumes[membrane_key] > 0
-    row = {"cell_id": cell_id, "cell_volume_um3": float(membrane.sum() * voxel_um3)}
-    for key, entity in entities.items():
-        if entity.kind == "mask":
-            row[f"mask_{entity.name}_volume_um3"] = float((volumes[key] > 0).sum() * voxel_um3)
-    return row
 
 
 def build_distance_targets(
@@ -625,42 +534,133 @@ def distance_transforms_for_source(
     return dts_for_src
 
 
-def update_overall_row_for_label(overall_row: dict, label_name: str, labels: np.ndarray, voxel_um3: float) -> None:
-    n_labels = int((labels > 0).max() and len(np.unique(labels[labels > 0])) or 0)
-    total_vol = float((labels > 0).sum() * voxel_um3)
-    overall_row[f"label_{label_name}_count"] = n_labels
-    overall_row[f"label_{label_name}_total_volume_um3"] = total_vol
-
-
 def analyze_label_entities(
     args: argparse.Namespace,
-    out_dir: Path,
     volumes: Dict[str, np.ndarray],
     entities: Dict[str, Entity],
     label_keys: list[str],
     mask_keys: list[str],
     all_dts: Dict[str, np.ndarray],
     voxel_size_zyx: Tuple[float, float, float],
-    voxel_um3: float,
-    membrane: np.ndarray,
-    overall_row: dict,
-) -> None:
+) -> Dict[str, pd.DataFrame]:
+    label_dfs: Dict[str, pd.DataFrame] = {}
     for src_key in label_keys:
         src_entity = entities[src_key]
         print(f"Analyzing label entity: {src_entity.name}", flush=True)
         src_labels = volumes[src_key].astype(np.int32)
         dts_for_src = distance_transforms_for_source(src_key, label_keys, mask_keys, entities, all_dts)
         df = per_label_metrics(src_labels, voxel_size_zyx, dts_for_src, max_skeleton_voxels=args.max_skeleton_voxels)
-        out_name = f"individual_{src_entity.name}.csv"
-        df.to_csv(out_dir / out_name, index=False)
-        print(f"Wrote {out_name} ({len(df)} rows)", flush=True)
-        update_overall_row_for_label(overall_row, src_entity.name, src_labels, voxel_um3)
+        label_dfs[src_key] = df
+        print(f"  {src_entity.name}: {len(df)} instances", flush=True)
+    return label_dfs
 
-        if not args.skip_plots:
-            print(f"Generating QC plots for {src_entity.name}...", flush=True)
-            save_qc_plots_for_label_entity(out_dir, membrane, src_labels, df, src_entity.name)
-            save_mosaic_3d_labels(out_dir, src_labels, df, src_entity.name, voxel_size_zyx)
-            print(f"QC plots for {src_entity.name} done.", flush=True)
+
+def _sanitize(v: object) -> object:
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+
+def build_report_rows(
+    cell_id: str,
+    volumes: Dict[str, np.ndarray],
+    entities: Dict[str, Entity],
+    label_keys: list[str],
+    mask_keys: list[str],
+    label_dfs: Dict[str, pd.DataFrame],
+    voxel_size_zyx: Tuple[float, float, float],
+    voxel_um3: float,
+    skip_thumbnails: bool = False,
+    source_path: Path | None = None,
+    generated_masks_dir: Path | None = None,
+) -> list[dict]:
+    def _file_meta(path: Path) -> dict:
+        resolved = path
+        if generated_masks_dir is not None:
+            candidate = generated_masks_dir / path.name
+            if candidate.exists():
+                resolved = candidate
+        try:
+            st = resolved.stat()
+            return {
+                "file_size_bytes": st.st_size,
+                "file_mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                "file_name": resolved.name,
+            }
+        except OSError:
+            return {"file_size_bytes": None, "file_mtime": None, "file_name": path.name}
+
+    rows: list[dict] = []
+
+    if source_path is not None:
+        rows.append({
+            "cell_id": cell_id, "entity_name": "source",
+            "entity_kind": "source", "row_type": "file",
+            "label_id": None, "instance_count": None, "total_volume_um3": None,
+            **_file_meta(source_path),
+        })
+
+    for mk in mask_keys:
+        ent = entities[mk]
+        rows.append({
+            "cell_id": cell_id, "entity_name": ent.name, "entity_kind": ent.kind,
+            "row_type": "file", "label_id": None, "instance_count": None,
+            "total_volume_um3": float((volumes[mk] > 0).sum() * voxel_um3),
+            **_file_meta(ent.path),
+        })
+
+    for lk in label_keys:
+        ent = entities[lk]
+        labels = volumes[lk].astype(np.int32)
+        df = label_dfs.get(lk, pd.DataFrame())
+        n_inst = int(len(np.unique(labels[labels > 0]))) if (labels > 0).any() else 0
+        rows.append({
+            "cell_id": cell_id, "entity_name": ent.name, "entity_kind": ent.kind,
+            "row_type": "file", "label_id": None, "instance_count": n_inst,
+            "total_volume_um3": float((labels > 0).sum() * voxel_um3),
+            **_file_meta(ent.path),
+        })
+        if df.empty:
+            continue
+
+        props_map = {rp.label: rp for rp in regionprops(labels)}
+
+        if skip_thumbnails:
+            thumb_ids: set[int] = set()
+        else:
+            thumb_ids = set(df["label"].astype(int).tolist())
+            print(f"  Rendering {len(thumb_ids)} thumbnails for {ent.name}...", flush=True)
+
+        for _, irow in df.iterrows():
+            lbl = int(irow["label"])
+            rp = props_map.get(lbl)
+            thumb_b64 = ""
+            if lbl in thumb_ids and rp is not None:
+                thumb_b64 = _thumbnail_b64(rp.image.astype(bool), (0.65, 0.65, 0.65))
+            row_dict: dict = {
+                "cell_id": cell_id, "entity_name": ent.name, "entity_kind": ent.kind,
+                "row_type": "instance", "label_id": lbl,
+                "instance_count": None, "total_volume_um3": None,
+                "file_size_bytes": None, "file_mtime": None, "file_name": ent.path.name,
+                "thumbnail_b64": thumb_b64,
+            }
+            for col in df.columns:
+                if col != "label":
+                    row_dict[col] = _sanitize(irow[col])
+            rows.append(row_dict)
+
+    return rows
+
+
+def write_report_csv(out_path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    df = pd.DataFrame([{k: _sanitize(v) for k, v in r.items()} for r in rows])
+    cols = [c for c in df.columns if c != "thumbnail_b64"] + (
+        ["thumbnail_b64"] if "thumbnail_b64" in df.columns else []
+    )
+    df[cols].to_csv(out_path, index=False)
+    print(f"Wrote {out_path.name} ({len(df)} rows, {out_path.stat().st_size // 1024} KB)", flush=True)
 
 
 def collect_cell_dirs(cell_dir: Path) -> list[Path]:
@@ -679,6 +679,11 @@ def collect_cell_dirs(cell_dir: Path) -> list[Path]:
 
 
 def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path) -> None:
+    report_csv = out_dir / "report.csv"
+    if report_csv.exists() and not args.force_reprocess:
+        print(f"  Skipping {cell_dir.name} — report.csv exists (--force-reprocess to re-run)", flush=True)
+        return
+
     print("Discovering dataset entities...", flush=True)
     dataset = discover_dataset(cell_dir)
     print(f"Source image: {dataset.source.name}", flush=True)
@@ -692,11 +697,8 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path) -> 
     write_generated_masks(volumes, dataset.entities, out_dir / args.generated_masks_dirname)
 
     volumes = crop_to_membrane_bbox(volumes, membrane_key)
-    membrane = volumes[membrane_key] > 0
     voxel_um3 = float(np.prod(voxel_size_zyx))
-
     out_dir.mkdir(parents=True, exist_ok=True)
-    overall_row = init_overall_row(cell_dir.name, volumes, dataset.entities, membrane_key, voxel_um3)
 
     label_keys = [k for k, e in dataset.entities.items() if e.kind == "label"]
     mask_keys = [k for k, e in dataset.entities.items() if e.kind == "mask"]
@@ -709,36 +711,59 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path) -> 
         num_threads=args.num_threads,
     )
 
-    analyze_label_entities(
+    label_dfs = analyze_label_entities(
         args=args,
-        out_dir=out_dir,
         volumes=volumes,
         entities=dataset.entities,
         label_keys=label_keys,
         mask_keys=mask_keys,
         all_dts=all_dts,
         voxel_size_zyx=voxel_size_zyx,
-        voxel_um3=voxel_um3,
-        membrane=membrane,
-        overall_row=overall_row,
     )
 
-    pd.DataFrame([overall_row]).to_csv(out_dir / "overall_cell.csv", index=False)
-    print(f"Wrote overall_cell.csv to {out_dir}", flush=True)
-    print("Analysis completed successfully.", flush=True)
+    print("Building report...", flush=True)
+    rows = build_report_rows(
+        cell_id=cell_dir.name,
+        volumes=volumes,
+        entities=dataset.entities,
+        label_keys=label_keys,
+        mask_keys=mask_keys,
+        label_dfs=label_dfs,
+        voxel_size_zyx=voxel_size_zyx,
+        voxel_um3=voxel_um3,
+        skip_thumbnails=args.skip_plots,
+        source_path=dataset.source,
+        generated_masks_dir=out_dir / args.generated_masks_dirname,
+    )
+    write_report_csv(report_csv, rows)
+    print("Cell analysis complete.", flush=True)
 
 
 def main() -> None:
     args = parse_args()
     cell_dirs = collect_cell_dirs(args.cell_dir)
-    if len(cell_dirs) > 1:
-        print(f"Batch mode: found {len(cell_dirs)} cell folders.", flush=True)
+    batch = len(cell_dirs) > 1
+    if batch:
+        print(f"Batch mode: {len(cell_dirs)} cell folders.", flush=True)
 
+    out_dirs: list[Path] = []
     for idx, cell_dir in enumerate(cell_dirs, start=1):
-        out_dir = args.out_dir if len(cell_dirs) == 1 else (args.out_dir / cell_dir.name)
-        print(f"===== Cell {idx}/{len(cell_dirs)}: {cell_dir.name} =====", flush=True)
+        out_dir = args.out_dir if not batch else (args.out_dir / cell_dir.name)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dirs.append(out_dir)
+        print(f"===== [{idx}/{len(cell_dirs)}] {cell_dir.name} =====", flush=True)
         run_single_cell(args, cell_dir, out_dir)
-    print("All done.", flush=True)
+
+    if batch:
+        dfs = [pd.read_csv(od / "report.csv") for od in out_dirs if (od / "report.csv").exists()]
+        if dfs:
+            joint = pd.concat(dfs, ignore_index=True)
+            joint_path = args.out_dir / "report.csv"
+            joint.to_csv(joint_path, index=False)
+            kb = joint_path.stat().st_size // 1024
+            print(f"Joint report.csv: {len(joint)} rows, {kb} KB → {joint_path}", flush=True)
+
+    print("Done. Open viewer.html in a browser and load report.csv to explore.", flush=True)
 
 
 if __name__ == "__main__":

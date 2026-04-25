@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CellSketch V2</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js@2.27.0/dist/plotly.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chroma-js@2.4.2/chroma.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; }
+body { font-size: .82rem; background: #f0f0f5; margin: 0; }
+
+.topbar { background: #1a1a2e; color: #e0e0f0; padding: .5rem 1.2rem;
+  display: flex; flex-wrap: wrap; gap: .6rem; align-items: center;
+  position: sticky; top: 0; z-index: 300; }
+.topbar .brand { font-weight: 700; font-size: 1rem; color: #a78bfa; margin-right: .4rem; white-space: nowrap; }
+.topbar .file-info { font-size: .72rem; color: #888; }
+
+.main { max-width: 1600px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+
+.section { background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  padding: 1.2rem 1.4rem; margin-bottom: 1.4rem; }
+.section-title { font-size: .9rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .06em; color: #555; border-bottom: 2px solid #eee; padding-bottom: .5rem; margin-bottom: 1rem; }
+
+.card-metric { text-align: center; padding: .6rem 1.4rem; background: #f8f8ff;
+  border-radius: 8px; border: 1px solid #ece8ff; }
+.card-metric .big { font-size: 2rem; font-weight: 300; color: #1a1a2e; line-height: 1.1; }
+.card-metric .lbl { font-size: .65rem; text-transform: uppercase; letter-spacing: .07em; color: #999; margin-top: 2px; }
+
+#drop-zone { border: 2px dashed #c4b5fd; border-radius: 12px; padding: 4rem 2rem;
+  cursor: pointer; transition: .2s; text-align: center; background: #fff; }
+#drop-zone:hover, #drop-zone.drag-over { border-color: #7c3aed; background: #f5f0ff; }
+
+.entity-block { border-left: 4px solid #ccc; padding-left: 1rem; margin-bottom: 1.2rem; }
+.entity-title { font-weight: 600; font-size: .88rem; color: #333; margin-bottom: .6rem; display: flex; align-items: center; gap: .5rem; }
+.charts-row { display: flex; flex-wrap: wrap; gap: 10px; overflow-x: auto; }
+.chart-cell { flex-shrink: 0; }
+
+.thumb-grid { display: flex; flex-wrap: wrap; gap: 7px; }
+.thumb-card { width: 92px; border: 1px solid #e0e0e0; border-radius: 5px;
+  background: #fff; text-align: center; padding: 4px; cursor: default; transition: .12s; }
+.thumb-card:hover { border-color: #7c3aed; box-shadow: 0 0 0 2px rgba(124,58,237,.18); }
+.thumb-card img, .thumb-card .no-thumb { width: 64px; height: 64px; object-fit: contain; display: block; margin: 0 auto; }
+.thumb-card .no-thumb { background: #f0f0f0; border-radius: 3px; }
+.thumb-card .tc-ent  { font-size: .6rem;  color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+.thumb-card .tc-cell { font-size: .58rem; color: #bbb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thumb-card .tc-val  { font-size: .7rem; font-weight: 500; color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<!-- ── Top bar ──────────────────────────────────────────────── -->
+<div class="topbar">
+  <span class="brand">CellSketch V2</span>
+  <button class="btn btn-sm btn-outline-light" id="load-btn">&#128194; Open CSV</button>
+  <input type="file" id="file-input" accept=".csv,.tsv" class="d-none">
+  <span class="file-info" id="file-info"></span>
+  <div id="global-filters" class="d-none d-flex flex-wrap gap-2 ms-auto align-items-center">
+    <select id="flt-cell"   class="form-select form-select-sm" style="width:auto"><option value="">All cells</option></select>
+    <select id="flt-entity" class="form-select form-select-sm" style="width:auto"><option value="">All entities</option></select>
+  </div>
+</div>
+
+<!-- ── Landing ─────────────────────────────────────────────── -->
+<div id="landing" class="container py-5">
+  <div class="row justify-content-center">
+    <div class="col-md-5">
+      <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+        <div style="font-size:3.5rem">&#128202;</div>
+        <div class="mt-2 fw-semibold fs-6">Drop <code>report.csv</code> here or click to browse</div>
+        <div class="small text-muted mt-1">Supports single-cell and multi-cell (joint) reports</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Main ────────────────────────────────────────────────── -->
+<div id="main-content" class="d-none main">
+
+  <!-- Overview -->
+  <div class="section" id="s-overview">
+    <div class="section-title">Overview</div>
+    <div id="overview-cards" class="d-flex flex-wrap gap-3 align-items-center mb-4"></div>
+    <div class="row g-3">
+      <div class="col-lg-5" id="overview-matrix-col"><div id="overview-matrix"></div></div>
+      <div class="col-lg-7"><div id="overview-volumes"></div></div>
+    </div>
+  </div>
+
+  <!-- Structure -->
+  <div class="section" id="s-structure">
+    <div class="section-title">File Structure</div>
+    <div class="row g-3">
+      <div class="col-lg-5"><div id="sunburst-chart" style="height:450px"></div></div>
+      <div class="col-lg-7">
+        <div style="max-height:400px;overflow-y:auto">
+          <table class="table table-sm table-hover mb-0">
+            <thead class="table-light sticky-top">
+              <tr><th>cell</th><th>entity</th><th>kind</th><th class="text-end">instances</th><th class="text-end">vol (&#956;m&#179;)</th><th class="text-end">size</th><th>modified</th></tr>
+            </thead>
+            <tbody id="file-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Per-entity stats -->
+  <div class="section" id="s-entities">
+    <div class="section-title">Component Stats</div>
+    <div id="entity-stats-container"></div>
+  </div>
+
+  <!-- Viewer -->
+  <div class="section" id="s-viewer">
+    <div class="section-title">Instance Viewer</div>
+    <div class="d-flex flex-wrap gap-3 align-items-end mb-3">
+      <div>
+        <label class="form-label small mb-1">Sort by</label>
+        <select id="v-sort-col" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <div>
+        <label class="form-label small mb-1">Direction</label>
+        <select id="v-sort-dir" class="form-select form-select-sm" style="width:auto">
+          <option value="desc">Highest first</option><option value="asc">Lowest first</option>
+        </select>
+      </div>
+      <div>
+        <label class="form-label small mb-1">Sample</label>
+        <select id="v-sample-mode" class="form-select form-select-sm" style="width:auto">
+          <option value="first">First N</option><option value="random">Random N</option>
+        </select>
+      </div>
+      <div style="width:190px">
+        <label class="form-label small mb-1">N = <span id="v-n-val">100</span></label>
+        <input type="range" id="v-n" class="form-range" min="10" max="500" step="10" value="100">
+      </div>
+      <div>
+        <label class="form-label small mb-1">Color by</label>
+        <select id="v-color-by" class="form-select form-select-sm" style="width:auto">
+          <option value="entity">Entity</option><option value="cell">Cell</option>
+        </select>
+      </div>
+      <span id="v-count" class="small text-muted align-self-end pb-1"></span>
+    </div>
+    <div id="thumb-grid" class="thumb-grid"></div>
+  </div>
+
+</div><!-- /main -->
+
+<script>
+// ══════════════════════════════════════════════════════════════
+//  Data & state
+// ══════════════════════════════════════════════════════════════
+var ALL = [], COLS = [];
+var st = { cell: '', entity: '' };
+var vSt = { sortCol: 'volume_um3', sortAsc: false, sampleMode: 'first', sampleN: 100, colorBy: 'entity' };
+var _viewerInited = false;
+
+// Color caches
+var _cellPal = null, _entPal = null;
+function cellPalette() {
+  if (!_cellPal) {
+    var cs = uniq(ALL.map(function(r){ return r.cell_id; }).filter(Boolean));
+    var p = chroma.scale('Set2').colors(Math.max(cs.length, 3));
+    _cellPal = {};
+    cs.forEach(function(c,i){ _cellPal[c] = p[i % p.length]; });
+  }
+  return _cellPal;
+}
+function entPalette() {
+  if (!_entPal) {
+    var es = uniq(ALL.map(function(r){ return r.entity_name; }));
+    var p = chroma.scale('Paired').colors(Math.max(es.length, 3));
+    _entPal = {};
+    es.forEach(function(e,i){ _entPal[e] = p[i % p.length]; });
+  }
+  return _entPal;
+}
+function cellColor(c){ return (cellPalette()[c] || '#aaa'); }
+function entColor(e) { return (entPalette()[e]  || '#aaa'); }
+
+// ══════════════════════════════════════════════════════════════
+//  File loading
+// ══════════════════════════════════════════════════════════════
+document.getElementById('load-btn').addEventListener('click', function(){ document.getElementById('file-input').click(); });
+document.getElementById('file-input').addEventListener('change', function(e){ if(e.target.files[0]) loadFile(e.target.files[0]); });
+
+var dz = document.getElementById('drop-zone');
+['dragenter','dragover'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.add('drag-over'); }); });
+['dragleave','drop'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.remove('drag-over'); }); });
+dz.addEventListener('drop', function(e){ if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+
+function loadFile(file) {
+  document.getElementById('file-info').textContent = file.name + ' (' + (file.size/1024).toFixed(0) + ' KB)';
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var res = Papa.parse(e.target.result, { header:true, dynamicTyping:true, skipEmptyLines:true });
+    ALL = res.data; COLS = res.meta.fields || [];
+    _cellPal = null; _entPal = null; _viewerInited = false;
+    onLoaded();
+  };
+  reader.readAsText(file);
+}
+
+function onLoaded() {
+  document.getElementById('landing').classList.add('d-none');
+  document.getElementById('main-content').classList.remove('d-none');
+  document.getElementById('global-filters').classList.remove('d-none');
+  initFilters();
+  renderAll();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Helpers
+// ══════════════════════════════════════════════════════════════
+function uniq(arr) { return [...new Set(arr)].sort(); }
+function cells()   { return uniq(ALL.map(function(r){ return r.cell_id; }).filter(Boolean)); }
+function ents()    { return uniq(ALL.map(function(r){ return r.entity_name; })); }
+
+function filtered(rowType) {
+  return ALL.filter(function(r) {
+    return (!rowType    || r.row_type    === rowType)
+        && (!st.cell   || r.cell_id     === st.cell)
+        && (!st.entity || r.entity_name === st.entity);
+  });
+}
+
+var SKIP = new Set(['cell_id','entity_name','entity_kind','row_type','label_id',
+  'instance_count','total_volume_um3','thumbnail_b64','file_size_bytes','file_mtime','file_name']);
+
+function metricCols(rows) {
+  return COLS.filter(function(c){
+    return !SKIP.has(c) && rows.some(function(r){ return r[c] != null && isFinite(r[c]); });
+  });
+}
+function distCols(rows) {
+  return metricCols(rows).filter(function(c){ return c.startsWith('distance_to_') && !c.includes('closest'); });
+}
+function nonDistMetricCols(rows) {
+  return metricCols(rows).filter(function(c){ return !c.startsWith('distance_to_'); });
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Filters
+// ══════════════════════════════════════════════════════════════
+function initFilters() {
+  var cs = cells(), es = ents();
+  document.getElementById('flt-cell').innerHTML =
+    '<option value="">All cells</option>' + cs.map(function(c){ return '<option value="'+c+'">'+c+'</option>'; }).join('');
+  document.getElementById('flt-entity').innerHTML =
+    '<option value="">All entities</option>' + es.map(function(e){ return '<option value="'+e+'">'+e+'</option>'; }).join('');
+  ['flt-cell','flt-entity'].forEach(function(id){
+    document.getElementById(id).addEventListener('change', function(){
+      st.cell   = document.getElementById('flt-cell').value;
+      st.entity = document.getElementById('flt-entity').value;
+      renderAll();
+    });
+  });
+}
+
+function renderAll() {
+  renderOverview();
+  renderStructure();
+  renderEntityStats();
+  renderViewer();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Overview
+// ══════════════════════════════════════════════════════════════
+function renderOverview() {
+  var fileRows = filtered('file');
+  var allCells = cells();
+  var allFileRows = ALL.filter(function(r){ return r.row_type === 'file'; });
+
+  function kindOrder(kind) { return kind==='source'?0 : kind==='mask'?1 : 2; }
+  function isMembrane(name) { var n=name.toLowerCase(); return n==='pm'||n.includes('membrane')||n.includes('plasma'); }
+  var colDefs = uniq(allFileRows.map(function(r){ return r.entity_name+'|'+r.entity_kind; }))
+    .map(function(s){ var p=s.split('|'); return {name:p[0], kind:p[1]}; })
+    .sort(function(a,b){
+      var ko = kindOrder(a.kind)-kindOrder(b.kind);
+      if(ko) return ko;
+      if(a.kind==='mask'){ var am=isMembrane(a.name)?0:1, bm=isMembrane(b.name)?0:1; if(am!==bm) return am-bm; }
+      return a.name.localeCompare(b.name);
+    });
+  var nonSource = colDefs.filter(function(c){ return c.kind !== 'source'; });
+
+  // Row 1: cell count card + component name badges
+  var badges = nonSource.map(function(c){
+    var cls = c.kind==='mask' ? 'bg-info text-dark' : 'bg-primary';
+    return '<span class="badge rounded-pill '+cls+'">'+c.name+'</span>';
+  }).join('');
+  document.getElementById('overview-cards').innerHTML =
+    '<div class="card-metric"><div class="big">'+(allCells.length||1)+'</div><div class="lbl">Cells</div></div>'
+    +'<div class="d-flex flex-wrap gap-2 align-items-center">'+badges+'</div>';
+
+  // Presence/absence matrix (multi-cell only)
+  var matCol = document.getElementById('overview-matrix-col');
+  var matEl  = document.getElementById('overview-matrix');
+  if(allCells.length < 2) {
+    matCol.classList.add('d-none');
+    matEl.innerHTML = '';
+  } else {
+    matCol.classList.remove('d-none');
+    var presSet = new Set(allFileRows.map(function(r){ return r.cell_id+'|'+r.entity_name; }));
+    var z    = allCells.map(function(c){ return colDefs.map(function(cd){ return presSet.has(c+'|'+cd.name)?1:0; }); });
+    var text = z.map(function(row){ return row.map(function(v){ return v?'✓':'✗'; }); });
+    var colColors = colDefs.map(function(cd){ return cd.kind==='source'?'#999': cd.kind==='mask'?'#0d9488':'#3b82f6'; });
+    Plotly.react('overview-matrix',[{
+      type:'heatmap', z:z, x:colDefs.map(function(c){ return c.name; }), y:allCells,
+      text:text, texttemplate:'%{text}',
+      colorscale:[[0,'#f8d7da'],[1,'#d1e7dd']], showscale:false,
+      hovertemplate:'<b>%{y}</b> × <b>%{x}</b>: %{text}<extra></extra>',
+    }],{
+      margin:{l:140,r:20,t:10,b:90},
+      height:Math.max(220, allCells.length*38+110),
+      xaxis:{tickangle:-35, tickfont:{color:colColors}},
+      font:{size:11},
+    },{responsive:true});
+  }
+
+  // Total volume bar chart per entity, grouped by cell
+  var volContainer = document.getElementById('overview-volumes');
+  volContainer.innerHTML = '';
+  var entNames = nonSource.map(function(c){ return c.name; });
+  if(!entNames.length) return;
+  var volEl = document.createElement('div');
+  volContainer.appendChild(volEl);
+  var volTraces;
+  if(allCells.length > 1) {
+    volTraces = allCells.map(function(c){
+      return { type:'bar', name:c, marker:{color:cellColor(c)},
+        x: entNames,
+        y: entNames.map(function(e){
+          var r = fileRows.find(function(r){ return r.cell_id===c && r.entity_name===e; });
+          return r && r.total_volume_um3 != null ? r.total_volume_um3 : 0;
+        })
+      };
+    });
+  } else {
+    volTraces = [{ type:'bar',
+      x: entNames,
+      y: entNames.map(function(e){
+        var r = fileRows.find(function(r){ return r.entity_name===e; });
+        return r && r.total_volume_um3 != null ? r.total_volume_um3 : 0;
+      }),
+      marker:{ color: entNames.map(function(e){ return entColor(e); }) }
+    }];
+  }
+  Plotly.newPlot(volEl, volTraces, {
+    barmode:'group',
+    margin:{l:65,r:15,t:10,b:80}, height:260,
+    xaxis:{tickangle:-30}, yaxis:{title:'total vol (μm³)'},
+    showlegend: allCells.length > 1,
+    legend:{orientation:'h', y:-0.38, font:{size:8}},
+    font:{size:9},
+  },{responsive:true, displayModeBar:false});
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Structure
+// ══════════════════════════════════════════════════════════════
+function renderStructure() {
+  var fileRows = filtered('file');
+
+  // Sunburst
+  var ids=['__root__'], lbls=['all'], parents=[''], vals=[0];
+  var seenCells = new Set();
+  fileRows.filter(function(r){ return r.entity_kind!=='source'; }).forEach(function(r){
+    var cid = r.cell_id||'__nocell__';
+    if(!seenCells.has(cid)){ seenCells.add(cid); ids.push(cid); lbls.push(cid||'(no cell)'); parents.push('__root__'); vals.push(0); }
+    var k=cid+'/'+r.entity_name; ids.push(k); lbls.push(r.entity_name); parents.push(cid); vals.push(r.file_size_bytes||0);
+  });
+  Plotly.react('sunburst-chart',[{
+    type:'sunburst', ids:ids, labels:lbls, parents:parents, values:vals, branchvalues:'remainder',
+    hovertemplate:'<b>%{label}</b><br>%{customdata}<extra></extra>',
+    customdata: vals.map(function(v){ return v ? (v/1e6).toFixed(2)+' MB' : ''; }),
+  }],{margin:{l:0,r:0,t:5,b:5},height:430},{responsive:true});
+
+  // File table
+  document.getElementById('file-table-body').innerHTML = fileRows.slice()
+    .sort(function(a,b){ return (a.cell_id||'').localeCompare(b.cell_id||'') || a.entity_name.localeCompare(b.entity_name); })
+    .map(function(r){
+      var sz = r.file_size_bytes ? (r.file_size_bytes/1e6).toFixed(2)+' MB' : '';
+      var mt = r.file_mtime ? r.file_mtime.slice(0,16).replace('T',' ') : '';
+      var kindMap = {source:'bg-secondary', mask:'bg-info text-dark', label:'bg-primary'};
+      var badge = '<span class="badge '+(kindMap[r.entity_kind]||'bg-light text-dark')+' rounded-pill">'+r.entity_kind+'</span>';
+      return '<tr><td>'+(r.cell_id||'')+'</td><td>'+r.entity_name+'</td><td>'+badge+'</td>'
+        +'<td class="text-end">'+(r.instance_count!=null?r.instance_count.toLocaleString():'')+'</td>'
+        +'<td class="text-end">'+(r.total_volume_um3!=null?(+r.total_volume_um3).toFixed(1):'')+'</td>'
+        +'<td class="text-end">'+sz+'</td><td class="text-muted small">'+mt+'</td></tr>';
+    }).join('');
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Entity Stats (one block per entity)
+// ══════════════════════════════════════════════════════════════
+function renderEntityStats() {
+  var container = document.getElementById('entity-stats-container');
+  container.innerHTML = '';
+
+  var allCells   = cells();
+  var multiCell  = allCells.length > 1;
+  var instRows   = filtered('instance');
+  var fileRows   = filtered('file');
+
+  // Label entities where every cell has ≤1 instance are treated as masks.
+  var allLabelFileRows = ALL.filter(function(r){ return r.row_type==='file' && r.entity_kind==='label'; });
+  var singleLabelEnts = new Set(
+    uniq(allLabelFileRows.map(function(r){ return r.entity_name; }))
+      .filter(function(e){
+        return allLabelFileRows.filter(function(r){ return r.entity_name===e; })
+          .every(function(r){ return (r.instance_count||0) <= 1; });
+      })
+  );
+
+  var labelEnts = uniq(instRows.filter(function(r){ return r.entity_kind==='label'; }).map(function(r){ return r.entity_name; }));
+  var maskEnts  = uniq(fileRows.filter(function(r){ return r.entity_kind==='mask'; }).map(function(r){ return r.entity_name; }));
+
+  // ── Label entities ────────────────────────────────────────
+  labelEnts.forEach(function(ent) {
+    var rows = instRows.filter(function(r){ return r.entity_name===ent && r.entity_kind==='label'; });
+    var entCells = multiCell ? allCells : null;
+    var color = entColor(ent);
+
+    var block = document.createElement('div');
+    block.className = 'entity-block';
+    block.style.borderLeftColor = color;
+
+    var badge = '<span class="badge bg-primary rounded-pill" style="font-size:.65rem">label</span>';
+    block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
+      +'<div class="charts-row mb-3" id="mc-'+ent+'"></div>'
+      +'<div class="charts-row" id="dc-'+ent+'"></div>';
+    container.appendChild(block);
+
+    var isSingle = singleLabelEnts.has(ent);
+
+    // Metric charts: box plots for multi-instance, bar plots for single-instance
+    var mCols = nonDistMetricCols(rows);
+    var mcEl = block.querySelector('#mc-'+ent);
+    mCols.slice(0,8).forEach(function(metric) {
+      var valid = rows.filter(function(r){ return r[metric]!=null && isFinite(r[metric]); });
+      if(!valid.length) return;
+      var el = document.createElement('div');
+      el.className = 'chart-cell';
+      el.style.width = '260px';
+      mcEl.appendChild(el);
+      var traces;
+      if(isSingle) {
+        var xs = entCells ? entCells : [ent];
+        var ys = xs.map(function(c){
+          var r = valid.find(function(r){ return entCells ? r.cell_id===c : true; });
+          return r ? r[metric] : null;
+        });
+        traces = [{ type:'bar', x:xs, y:ys, showlegend:false,
+          marker:{color: entCells ? xs.map(function(c){ return cellColor(c); }) : color} }];
+      } else if(entCells && entCells.length > 1) {
+        traces = entCells.map(function(c){
+          return { type:'box', name:c, boxpoints:false, marker:{color:cellColor(c)},
+            y:valid.filter(function(r){ return r.cell_id===c; }).map(function(r){ return r[metric]; }) };
+        });
+      } else {
+        traces = [{ type:'box', name:ent, boxpoints:'suspectedoutliers', marker:{color:color},
+          y:valid.map(function(r){ return r[metric]; }) }];
+      }
+      Plotly.newPlot(el, traces, {
+        margin:{l:50,r:5,t:28,b:50}, height:230,
+        showlegend: !isSingle && !!entCells, font:{size:9},
+        title:{text:metric.replace(/_/g,' '), font:{size:10}},
+        legend:{orientation:'h', y:-0.25, font:{size:8}},
+      },{responsive:true, displayModeBar:false});
+    });
+
+    // Distance charts: box plots for multi-instance, bar plots for single-instance
+    var dCols = distCols(rows);
+    if(!dCols.length) return;
+    var dcEl = block.querySelector('#dc-'+ent);
+    var distEl = document.createElement('div');
+    distEl.className = 'chart-cell';
+    distEl.style.cssText = 'width:500px;max-width:100%';
+    dcEl.appendChild(distEl);
+
+    var distTraces;
+    if(isSingle) {
+      var xLabels = dCols.map(function(c){ return c.replace('distance_to_','').replace('_um',''); });
+      if(entCells && entCells.length > 1) {
+        distTraces = entCells.map(function(c){
+          var cellRow = rows.find(function(r){ return r.cell_id===c; });
+          return { type:'bar', name:c, x:xLabels, marker:{color:cellColor(c)},
+            y:dCols.map(function(col){ return cellRow && cellRow[col]!=null ? cellRow[col] : null; }) };
+        });
+      } else {
+        distTraces = [{ type:'bar', x:xLabels, showlegend:false, marker:{color:color},
+          y:dCols.map(function(col){ var r=rows[0]; return r && r[col]!=null ? r[col] : null; }) }];
+      }
+      Plotly.newPlot(distEl, distTraces, {
+        barmode:'group', margin:{l:65,r:10,t:28,b:80}, height:260,
+        title:{text:'Min distance to other components (μm)', font:{size:10}},
+        xaxis:{tickangle:-30}, yaxis:{title:'dist (μm)'},
+        showlegend:!!(entCells && entCells.length > 1),
+        legend:{orientation:'h', y:-0.38, font:{size:8}},
+      },{responsive:true, displayModeBar:false});
+    } else {
+      if(entCells && entCells.length > 1) {
+        distTraces = entCells.map(function(c){
+          var xs = [], ys = [];
+          dCols.forEach(function(col){
+            var lbl = col.replace('distance_to_','').replace('_um','');
+            rows.filter(function(r){ return r.cell_id===c; }).forEach(function(r){
+              if(r[col]!=null && isFinite(r[col])){ xs.push(lbl); ys.push(r[col]); }
+            });
+          });
+          return { type:'box', name:c, x:xs, y:ys, boxpoints:false, marker:{color:cellColor(c)} };
+        });
+      } else {
+        var xs = [], ys = [];
+        dCols.forEach(function(col){
+          var lbl = col.replace('distance_to_','').replace('_um','');
+          rows.forEach(function(r){
+            if(r[col]!=null && isFinite(r[col])){ xs.push(lbl); ys.push(r[col]); }
+          });
+        });
+        distTraces = [{ type:'box', name:ent, x:xs, y:ys, boxpoints:'suspectedoutliers', marker:{color:color} }];
+      }
+      Plotly.newPlot(distEl, distTraces, {
+        boxmode:'group', margin:{l:65,r:10,t:28,b:80}, height:260,
+        title:{text:'Min distance to other components (μm)', font:{size:10}},
+        xaxis:{tickangle:-30}, yaxis:{title:'dist (μm)'},
+        showlegend:!!(entCells && entCells.length > 1),
+        legend:{orientation:'h', y:-0.38, font:{size:8}},
+      },{responsive:true, displayModeBar:false});
+    }
+  });
+
+  // ── Mask entities ─────────────────────────────────────────
+  maskEnts.forEach(function(ent) {
+    var mRows = fileRows.filter(function(r){ return r.entity_name===ent && r.entity_kind==='mask'; });
+    var color = entColor(ent);
+
+    var block = document.createElement('div');
+    block.className = 'entity-block';
+    block.style.borderLeftColor = color;
+    var badge = '<span class="badge bg-info text-dark rounded-pill" style="font-size:.65rem">mask</span>';
+    block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
+      +'<div class="charts-row" id="mk-'+ent+'"></div>';
+    container.appendChild(block);
+
+    if(!mRows.length) return;
+    var mkEl = block.querySelector('#mk-'+ent);
+
+    // Volume bar across cells
+    var volEl = document.createElement('div');
+    volEl.className = 'chart-cell';
+    volEl.style.width = '320px';
+    mkEl.appendChild(volEl);
+    Plotly.newPlot(volEl, [{
+      type:'bar',
+      x: mRows.map(function(r){ return r.cell_id||'cell'; }),
+      y: mRows.map(function(r){ return r.total_volume_um3; }),
+      marker:{color: mRows.map(function(r){ return cellColor(r.cell_id||'cell'); })},
+    }],{
+      margin:{l:70,r:10,t:28,b:60}, height:220,
+      title:{text:'Volume (μm³)', font:{size:10}},
+      yaxis:{title:'μm³'}, showlegend:false,
+    },{responsive:true, displayModeBar:false});
+  });
+
+  if(!labelEnts.length && !maskEnts.length) {
+    container.innerHTML = '<div class="text-muted small">No component data matches current filters.</div>';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Instance Viewer
+// ══════════════════════════════════════════════════════════════
+function initViewerControls() {
+  if(_viewerInited) return;
+  _viewerInited = true;
+  var numCols = COLS.filter(function(c){
+    return !SKIP.has(c) && ALL.some(function(r){ return r[c]!=null && isFinite(r[c]); });
+  });
+  var sel = document.getElementById('v-sort-col');
+  sel.innerHTML = numCols.map(function(c){
+    return '<option value="'+c+'"'+(c===vSt.sortCol?' selected':'')+'>'+c.replace(/_/g,' ')+'</option>';
+  }).join('');
+  ['v-sort-col','v-sort-dir','v-sample-mode','v-color-by'].forEach(function(id){
+    document.getElementById(id).addEventListener('change', function(){
+      vSt.sortCol    = document.getElementById('v-sort-col').value;
+      vSt.sortAsc    = document.getElementById('v-sort-dir').value === 'asc';
+      vSt.sampleMode = document.getElementById('v-sample-mode').value;
+      vSt.colorBy    = document.getElementById('v-color-by').value;
+      renderViewer();
+    });
+  });
+  document.getElementById('v-n').addEventListener('input', function(e){
+    vSt.sampleN = +e.target.value;
+    document.getElementById('v-n-val').textContent = vSt.sampleN;
+    renderViewer();
+  });
+}
+
+function renderViewer() {
+  initViewerControls();
+  var rows = filtered('instance').filter(function(r){ return r.entity_kind==='label'; });
+  rows.sort(function(a,b){
+    var va=a[vSt.sortCol], vb=b[vSt.sortCol];
+    if(va==null && vb==null) return 0;
+    if(va==null) return 1; if(vb==null) return -1;
+    return vSt.sortAsc ? va-vb : vb-va;
+  });
+  var n = Math.min(vSt.sampleN, rows.length);
+  var sample = vSt.sampleMode==='random'
+    ? (function(){
+        var s=rows.slice().sort(function(){ return Math.random()-.5; }).slice(0,n);
+        s.sort(function(a,b){
+          var va=a[vSt.sortCol], vb=b[vSt.sortCol];
+          if(va==null) return 1; if(vb==null) return -1;
+          return vSt.sortAsc ? va-vb : vb-va;
+        }); return s;
+      })()
+    : rows.slice(0,n);
+
+  document.getElementById('v-count').textContent =
+    'Showing '+sample.length.toLocaleString()+' of '+rows.length.toLocaleString()+' instances';
+
+  var mlabel = vSt.sortCol.replace(/_/g,' ').replace(' um3',' μm³').replace(' um2',' μm²').replace(' um',' μm');
+  document.getElementById('thumb-grid').innerHTML = sample.map(function(r){
+    var val = r[vSt.sortCol];
+    var vs = val==null ? '—' : (typeof val==='number' && !Number.isInteger(val)) ? val.toFixed(2) : String(val);
+    var col = vSt.colorBy==='cell' ? cellColor(r.cell_id||'') : entColor(r.entity_name);
+    var thumb = r.thumbnail_b64
+      ? '<img src="data:image/png;base64,'+r.thumbnail_b64+'">'
+      : '<div class="no-thumb"></div>';
+    return '<div class="thumb-card" style="border-top:3px solid '+col+'" '
+      +'title="'+r.entity_name+' / '+(r.cell_id||'')+' #'+r.label_id+'">'
+      +thumb
+      +'<div class="tc-ent">'+r.entity_name+'</div>'
+      +(r.cell_id ? '<div class="tc-cell">'+r.cell_id+'</div>' : '')
+      +'<div class="tc-val" title="'+mlabel+'">'+vs+'</div>'
+      +'</div>';
+  }).join('');
+}
+</script>
+</body>
+</html>
