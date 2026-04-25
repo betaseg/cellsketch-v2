@@ -49,7 +49,270 @@ body { font-size: .82rem; background: #f0f0f5; margin: 0; }
 .thumb-card .tc-ent  { font-size: .6rem;  color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
 .thumb-card .tc-cell { font-size: .58rem; color: #bbb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thumb-card .tc-val  { font-size: .7rem; font-weight: 500; color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thumb-card.has-mesh { cursor: pointer; }
+
+/* ── 3D Scene ── */
+.legend-grad {
+  height: 9px; border-radius: 3px; margin: 5px 0;
+  background: linear-gradient(to right,#440154,#31688e,#35b779,#fde725); }
+.legend-row { display: flex; justify-content: space-between; font-size: .6rem; color: #777; }
+
+.view-toggle { display: flex; border-radius: 5px; overflow: hidden; border: 1px solid #d0c8f0; }
+.view-toggle button {
+  flex: 1; border: none; background: #f5f0ff; color: #5b21b6;
+  padding: 3px 14px; font-size: .78rem; cursor: pointer; transition: .12s; white-space: nowrap; }
+.view-toggle button.vt-active { background: #7c3aed; color: #fff; }
 </style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+const VIRIDIS = ['#440154','#482878','#3e4989','#31688e','#26828e',
+                 '#1f9e89','#35b779','#6ece58','#b5de2b','#fde725'];
+function viridisAt(t) {
+  t = Math.max(0, Math.min(1, t));
+  const i = Math.min(VIRIDIS.length - 2, Math.floor(t * (VIRIDIS.length - 1)));
+  const f = t * (VIRIDIS.length - 1) - i;
+  return chroma(VIRIDIS[i]).mix(VIRIDIS[i + 1], f).hex();
+}
+
+async function parseMeshB64(b64) {
+  // Decode base64 → Uint8Array (gzip-compressed payload)
+  const bin = atob(b64);
+  const compressed = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) compressed[i] = bin.charCodeAt(i);
+
+  // Decompress gzip
+  const ds = new DecompressionStream('gzip');
+  const w = ds.writable.getWriter();
+  w.write(compressed); w.close();
+  const chunks = [];
+  const reader = ds.readable.getReader();
+  for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); }
+  const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+  const raw = new Uint8Array(totalLen);
+  let off = 0;
+  for (const c of chunks) { raw.set(c, off); off += c.length; }
+  const ab = raw.buffer;
+
+  // Parse header
+  const nV      = new Uint32Array(ab, 0, 1)[0];
+  const nF      = new Uint32Array(ab, 4, 1)[0];
+  const minXYZ  = new Float32Array(ab, 8, 3);
+  const scaXYZ  = new Float32Array(ab, 20, 3);
+  // Slice to get correctly aligned typed arrays
+  const vertsQ  = new Uint16Array(ab.slice(32, 32 + nV * 6));
+  const idxBuf  = new Uint32Array(ab.slice(32 + nV * 6));
+
+  // Dequantise uint16 → float32 µm
+  const pos = new Float32Array(nV * 3);
+  for (let i = 0; i < nV; i++) {
+    pos[i*3]   = minXYZ[0] + (vertsQ[i*3]   / 65535) * scaXYZ[0];
+    pos[i*3+1] = minXYZ[1] + (vertsQ[i*3+1] / 65535) * scaXYZ[1];
+    pos[i*3+2] = minXYZ[2] + (vertsQ[i*3+2] / 65535) * scaXYZ[2];
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setIndex(new THREE.BufferAttribute(idxBuf, 1));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function clearMeshes(scene) {
+  const rm = [];
+  scene.traverse(o => { if (o.isMesh) rm.push(o); });
+  rm.forEach(m => { m.geometry.dispose(); m.material.dispose(); scene.remove(m); });
+}
+
+function fitCamera(scene, camera, controls) {
+  const box = new THREE.Box3().setFromObject(scene);
+  if (box.isEmpty()) return;
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length();
+  camera.position.set(center.x + size * 0.6, center.y + size * 0.4, center.z + size * 0.9);
+  controls.target.copy(center);
+  controls.update();
+}
+
+// ── main 3D scene ────────────────────────────────────────────────────────────
+let _R = null, _S = null, _C = null, _O = null;
+
+function ensureScene() {
+  if (_R) return;
+  const canvas = document.getElementById('c3d-canvas');
+  _R = new THREE.WebGLRenderer({ canvas, antialias: true });
+  _R.setPixelRatio(window.devicePixelRatio);
+  _S = new THREE.Scene();
+  _S.background = new THREE.Color(0xffffff);
+  _C = new THREE.PerspectiveCamera(45, 2, 0.01, 1e6);
+  _O = new OrbitControls(_C, canvas);
+  _O.enableDamping = true; _O.dampingFactor = 0.06;
+  _S.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const d1 = new THREE.DirectionalLight(0xffffff, 0.7); d1.position.set(1, 2, 1.5); _S.add(d1);
+  const d2 = new THREE.DirectionalLight(0xddeeff, 0.25); d2.position.set(-1, -0.5, 0.5); _S.add(d2);
+  (function tick() {
+    requestAnimationFrame(tick);
+    const c = document.getElementById('c3d-canvas');
+    if (!c) return;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (_R.domElement.width !== w * window.devicePixelRatio) {
+      _R.setSize(w, h, false);
+      _C.aspect = w / h; _C.updateProjectionMatrix();
+    }
+    _O.update(); _R.render(_S, _C);
+  })();
+}
+
+window.render3DScene = async function(rows, metricCol, colorBy) {
+  ensureScene();
+  clearMeshes(_S);
+
+  const byEntity = colorBy === 'entity';
+  const byCell   = colorBy === 'cell';
+  const byGroup  = colorBy === 'group';
+  const byMetric = !byEntity && !byCell && !byGroup;
+
+  const vals = byMetric ? rows.map(r => r[metricCol]).filter(v => v != null && isFinite(v)) : [];
+  const minV = vals.length ? Math.min(...vals) : 0;
+  const maxV = vals.length ? Math.max(...vals) : 1;
+  const span = maxV > minV ? maxV - minV : 1;
+  const legendEntries = {};
+
+  const meshRows = rows.filter(r => r.mesh_b64);
+  const geos = await Promise.all(meshRows.map(r => parseMeshB64(r.mesh_b64).catch(() => null)));
+
+  let count = 0;
+  geos.forEach((geo, i) => {
+    if (!geo) return;
+    const r = meshRows[i];
+    let hex;
+    if (byEntity) {
+      hex = window.entColor(r.entity_name);
+      legendEntries[r.entity_name] = hex;
+    } else if (byCell) {
+      hex = window.cellColor(r.cell_id || '');
+      legendEntries[r.cell_id || '?'] = hex;
+    } else if (byGroup) {
+      hex = window.cellColor(r.group_id || '');
+      legendEntries[r.group_id || '?'] = hex;
+    } else {
+      const t = r[metricCol] != null ? (r[metricCol] - minV) / span : 0.5;
+      hex = viridisAt(Math.max(0, Math.min(1, t)));
+    }
+    _S.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+      color: new THREE.Color(hex), side: THREE.DoubleSide,
+      transparent: true, opacity: 0.82, shininess: 25,
+    })));
+    count++;
+  });
+
+  if (count) fitCamera(_S, _C, _O);
+
+  const leg = document.getElementById('c3d-legend');
+  if (!leg) return;
+  leg.style.display = count ? '' : 'none';
+  if (byMetric) {
+    const lbl = metricCol.replace(/_/g,' ').replace(' um3',' μm³').replace(' um2',' μm²').replace(' um',' μm');
+    leg.innerHTML = '<div style="font-weight:600;margin-bottom:3px">'+lbl+'</div>'
+      +'<div class="legend-grad"></div>'
+      +'<div class="legend-row"><span>'+minV.toFixed(2)+'</span><span>'+maxV.toFixed(2)+'</span></div>'
+      +'<div style="color:#666;margin-top:5px">'+count+' meshes</div>';
+  } else {
+    leg.innerHTML = '<div style="font-weight:600;margin-bottom:5px">'+(byEntity?'Entity':byGroup?'Group':'Cell')+'</div>'
+      + Object.entries(legendEntries).map(([k,c]) =>
+          '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">'
+          +'<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:'+c+'"></span>'
+          +'<span style="font-size:.66rem">'+k+'</span></div>'
+        ).join('')
+      +'<div style="color:#666;margin-top:5px">'+count+' meshes</div>';
+  }
+};
+
+// ── gallery 3D thumbnail rendering ──────────────────────────────────────────
+let _TR = null, _TS = null, _TC = null;
+
+function ensureThumbRenderer() {
+  if (_TR) return;
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 128;
+  _TR = new THREE.WebGLRenderer({ canvas: c, antialias: true, preserveDrawingBuffer: true });
+  _TR.setPixelRatio(1);
+  _TS = new THREE.Scene(); _TS.background = new THREE.Color(0xfafafa);
+  _TC = new THREE.PerspectiveCamera(38, 1, 0.001, 1e6);
+  _TS.add(new THREE.AmbientLight(0xffffff, 0.5));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.8); dl.position.set(1, 1.5, 1.2); _TS.add(dl);
+  const dl2 = new THREE.DirectionalLight(0xbbccff, 0.2); dl2.position.set(-1, -0.5, 0.5); _TS.add(dl2);
+}
+
+window.render3DThumbs = async function(sample, colorFn) {
+  ensureThumbRenderer();
+  for (let i = 0; i < sample.length; i++) {
+    const r = sample[i];
+    if (!r.mesh_b64) continue;
+    const img = document.querySelector('#thumb-grid img[data-midx="'+i+'"]');
+    if (!img) continue;
+    const geo = await parseMeshB64(r.mesh_b64).catch(() => null);
+    if (!geo) continue;
+    const rm = []; _TS.traverse(o => { if (o.isMesh) rm.push(o); });
+    rm.forEach(m => { m.geometry.dispose(); m.material.dispose(); _TS.remove(m); });
+    geo.computeBoundingBox();
+    const ctr = geo.boundingBox.getCenter(new THREE.Vector3());
+    geo.translate(-ctr.x, -ctr.y, -ctr.z);
+    const hex = colorFn ? colorFn(r) : (window.entColor(r.entity_name) || '#888');
+    _TS.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+      color: new THREE.Color(hex), side: THREE.DoubleSide, shininess: 35,
+    })));
+    geo.computeBoundingSphere();
+    const rad = (geo.boundingSphere.radius || 1) * 1.9;
+    _TC.position.set(rad * 0.75, rad * 0.55, rad * 1.2);
+    _TC.lookAt(0, 0, 0);
+    _TR.render(_TS, _TC);
+    img.src = _TR.domElement.toDataURL('image/png');
+  }
+};
+
+// ── single-instance modal scene ──────────────────────────────────────────────
+let _MR = null, _MS = null, _MC = null, _MO = null;
+
+window.showMesh3D = function(b64, title) {
+  document.getElementById('mesh-modal-title').textContent = title || '';
+  bootstrap.Modal.getOrCreateInstance(document.getElementById('mesh-modal')).show();
+  document.getElementById('mesh-modal').addEventListener('shown.bs.modal', async function init() {
+    document.getElementById('mesh-modal').removeEventListener('shown.bs.modal', init);
+    const canvas = document.getElementById('mesh-modal-canvas');
+    if (!_MR) {
+      _MR = new THREE.WebGLRenderer({ canvas, antialias: true });
+      _MR.setPixelRatio(window.devicePixelRatio);
+      _MS = new THREE.Scene(); _MS.background = new THREE.Color(0x0e0e18);
+      _MC = new THREE.PerspectiveCamera(45, 2, 0.001, 1e6);
+      _MO = new OrbitControls(_MC, canvas);
+      _MO.enableDamping = true; _MO.dampingFactor = 0.06;
+      _MS.add(new THREE.AmbientLight(0xffffff, 0.4));
+      const dl = new THREE.DirectionalLight(0xffffff, 1.0); dl.position.set(1, 2, 1.5); _MS.add(dl);
+      (function tick() {
+        requestAnimationFrame(tick);
+        const c = document.getElementById('mesh-modal-canvas');
+        if (!c) return;
+        const w = c.clientWidth, h = c.clientHeight;
+        _MR.setSize(w, h, false); _MC.aspect = w / h; _MC.updateProjectionMatrix();
+        _MO.update(); _MR.render(_MS, _MC);
+      })();
+    }
+    clearMeshes(_MS);
+    const geo = await parseMeshB64(b64);
+    geo.computeBoundingBox();
+    const center = geo.boundingBox.getCenter(new THREE.Vector3());
+    geo.translate(-center.x, -center.y, -center.z);
+    _MS.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({ color: 0x7c3aed, side: THREE.DoubleSide, shininess: 40 })));
+    fitCamera(_MS, _MC, _MO);
+  }, { once: true });
+};
+</script>
 </head>
 <body>
 
@@ -60,6 +323,13 @@ body { font-size: .82rem; background: #f0f0f5; margin: 0; }
   <input type="file" id="file-input" accept=".csv,.tsv" class="d-none">
   <span class="file-info" id="file-info"></span>
   <div id="global-filters" class="d-none d-flex flex-wrap gap-2 ms-auto align-items-center">
+    <select id="flt-group"  class="form-select form-select-sm" style="width:auto;display:none"><option value="">All groups</option></select>
+    <div id="plot-groupby-wrap" style="display:none;align-items:center;gap:.35rem" class="d-flex">
+      <span class="small" style="color:#a0a0c0;white-space:nowrap">Group plots by</span>
+      <select id="plot-groupby" class="form-select form-select-sm" style="width:auto">
+        <option value="cell">Cell</option><option value="group">Group</option>
+      </select>
+    </div>
     <select id="flt-cell"   class="form-select form-select-sm" style="width:auto"><option value="">All cells</option></select>
     <select id="flt-entity" class="form-select form-select-sm" style="width:auto"><option value="">All entities</option></select>
   </div>
@@ -142,24 +412,75 @@ body { font-size: .82rem; background: #f0f0f5; margin: 0; }
       <div>
         <label class="form-label small mb-1">Color by</label>
         <select id="v-color-by" class="form-select form-select-sm" style="width:auto">
-          <option value="entity">Entity</option><option value="cell">Cell</option>
+          <option value="entity">Entity</option><option value="cell">Cell</option><option value="group">Group</option>
         </select>
       </div>
       <span id="v-count" class="small text-muted align-self-end pb-1"></span>
+      <div id="mesh-toggle-wrap" style="display:none" class="align-self-end mb-1">
+        <div class="view-toggle">
+          <button id="btn-thumbnails" class="vt-active" onclick="setMeshMode(false)">Thumbnails</button>
+          <button id="btn-meshes" onclick="setMeshMode(true)">3D Meshes</button>
+        </div>
+      </div>
     </div>
     <div id="thumb-grid" class="thumb-grid"></div>
   </div>
 
+  <!-- Cell 3D View -->
+  <div class="section" id="s-cell3d" style="display:none">
+    <div class="section-title">Cell 3D View</div>
+    <div class="d-flex flex-wrap gap-3 align-items-end mb-3">
+      <div>
+        <label class="form-label small mb-1">Cell</label>
+        <select id="c3d-cell" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <div>
+        <label class="form-label small mb-1">Color by</label>
+        <select id="c3d-color" class="form-select form-select-sm" style="width:auto">
+          <option value="entity">Entity</option>
+          <option value="metric">Metric</option>
+        </select>
+      </div>
+      <div id="c3d-metric-wrap" style="display:none">
+        <label class="form-label small mb-1">Metric</label>
+        <select id="c3d-metric" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <span id="c3d-count" class="small text-muted align-self-end pb-1"></span>
+    </div>
+    <div style="position:relative;width:100%;height:580px;background:#fff;border-radius:6px;overflow:hidden;border:1px solid #e8e8e8">
+      <canvas id="c3d-canvas" style="display:block;width:100%;height:100%"></canvas>
+      <div style="position:absolute;bottom:10px;left:14px;pointer-events:none;color:rgba(0,0,0,.3);font-size:.65rem">drag · scroll · right-drag to pan</div>
+      <div id="c3d-legend" style="position:absolute;top:10px;right:14px;display:none;background:rgba(255,255,255,.88);border:1px solid #e0e0e0;border-radius:5px;padding:8px 11px;color:#222;font-size:.68rem;min-width:140px"></div>
+    </div>
+  </div>
+
 </div><!-- /main -->
+
+<!-- Single-instance 3D modal -->
+<div class="modal fade" id="mesh-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content" style="background:#0e0e18;border:none;border-radius:10px;overflow:hidden">
+      <div class="modal-header border-0 pb-0 px-3 pt-2">
+        <span id="mesh-modal-title" class="text-light small fw-semibold"></span>
+        <button type="button" class="btn-close btn-close-white ms-auto" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-0">
+        <canvas id="mesh-modal-canvas" style="width:100%;height:440px;display:block"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script>
 // ══════════════════════════════════════════════════════════════
 //  Data & state
 // ══════════════════════════════════════════════════════════════
 var ALL = [], COLS = [];
-var st = { cell: '', entity: '' };
-var vSt = { sortCol: 'volume_um3', sortAsc: false, sampleMode: 'first', sampleN: 100, colorBy: 'entity' };
+var st = { group: '', cell: '', entity: '' };
+var plotGroupBy = 'cell';   // 'cell' or 'group' — controls how charts are grouped
+var vSt = { sortCol: 'volume_um3', sortAsc: false, sampleMode: 'first', sampleN: 100, colorBy: 'entity', meshMode: false };
 var _viewerInited = false;
+var _currentSample = [];
 
 // Color caches
 var _cellPal = null, _entPal = null;
@@ -201,7 +522,9 @@ function loadFile(file) {
   reader.onload = function(e) {
     var res = Papa.parse(e.target.result, { header:true, dynamicTyping:true, skipEmptyLines:true });
     ALL = res.data; COLS = res.meta.fields || [];
-    _cellPal = null; _entPal = null; _viewerInited = false;
+    _cellPal = null; _entPal = null; _viewerInited = false; _c3dInited = false;
+    st.group = ''; st.cell = ''; st.entity = '';
+    vSt.meshMode = false;
     onLoaded();
   };
   reader.readAsText(file);
@@ -225,13 +548,14 @@ function ents()    { return uniq(ALL.map(function(r){ return r.entity_name; }));
 function filtered(rowType) {
   return ALL.filter(function(r) {
     return (!rowType    || r.row_type    === rowType)
+        && (!st.group  || r.group_id    === st.group)
         && (!st.cell   || r.cell_id     === st.cell)
         && (!st.entity || r.entity_name === st.entity);
   });
 }
 
-var SKIP = new Set(['cell_id','entity_name','entity_kind','row_type','label_id',
-  'instance_count','total_volume_um3','thumbnail_b64','file_size_bytes','file_mtime','file_name']);
+var SKIP = new Set(['cell_id','group_id','entity_name','entity_kind','row_type','label_id',
+  'instance_count','total_volume_um3','thumbnail_b64','mesh_b64','file_size_bytes','file_mtime','file_name']);
 
 function metricCols(rows) {
   return COLS.filter(function(c){
@@ -249,17 +573,31 @@ function nonDistMetricCols(rows) {
 //  Filters
 // ══════════════════════════════════════════════════════════════
 function initFilters() {
+  var gs = uniq(ALL.map(function(r){ return r.group_id; }).filter(Boolean));
   var cs = cells(), es = ents();
+  var grpSel = document.getElementById('flt-group');
+  grpSel.style.display = gs.length > 1 ? '' : 'none';
+  document.getElementById('plot-groupby-wrap').style.display = gs.length > 1 ? 'flex' : 'none';
+  grpSel.innerHTML = '<option value="">All groups</option>'
+    + gs.map(function(g){ return '<option value="'+g+'">'+g+'</option>'; }).join('');
   document.getElementById('flt-cell').innerHTML =
     '<option value="">All cells</option>' + cs.map(function(c){ return '<option value="'+c+'">'+c+'</option>'; }).join('');
   document.getElementById('flt-entity').innerHTML =
     '<option value="">All entities</option>' + es.map(function(e){ return '<option value="'+e+'">'+e+'</option>'; }).join('');
-  ['flt-cell','flt-entity'].forEach(function(id){
+  document.getElementById('flt-group').value  = st.group;
+  document.getElementById('flt-cell').value   = st.cell;
+  document.getElementById('flt-entity').value = st.entity;
+  ['flt-group','flt-cell','flt-entity'].forEach(function(id){
     document.getElementById(id).addEventListener('change', function(){
+      st.group  = document.getElementById('flt-group').value;
       st.cell   = document.getElementById('flt-cell').value;
       st.entity = document.getElementById('flt-entity').value;
       renderAll();
     });
+  });
+  document.getElementById('plot-groupby').addEventListener('change', function(){
+    plotGroupBy = this.value;
+    renderAll();
   });
 }
 
@@ -268,6 +606,7 @@ function renderAll() {
   renderStructure();
   renderEntityStats();
   renderViewer();
+  initCell3D();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -404,12 +743,17 @@ function renderEntityStats() {
   var container = document.getElementById('entity-stats-container');
   container.innerHTML = '';
 
-  var allCells   = cells();
-  var multiCell  = allCells.length > 1;
-  var instRows   = filtered('instance');
-  var fileRows   = filtered('file');
+  var instRows = filtered('instance');
+  var fileRows = filtered('file');
 
-  // Label entities where every cell has ≤1 instance are treated as masks.
+  // Grouping key: 'group_id' or 'cell_id' depending on plotGroupBy
+  var gKey = plotGroupBy === 'group' ? 'group_id' : 'cell_id';
+  var allGroups = uniq(instRows.map(function(r){ return r[gKey]; }).filter(Boolean));
+  var multiGroup = allGroups.length > 1;
+
+  function gColor(g) { return cellColor(g); }
+
+  // Label entities where every group member has ≤1 instance are shown as bars
   var allLabelFileRows = ALL.filter(function(r){ return r.row_type==='file' && r.entity_kind==='label'; });
   var singleLabelEnts = new Set(
     uniq(allLabelFileRows.map(function(r){ return r.entity_name; }))
@@ -420,120 +764,146 @@ function renderEntityStats() {
   );
 
   var labelEnts = uniq(instRows.filter(function(r){ return r.entity_kind==='label'; }).map(function(r){ return r.entity_name; }));
-  var maskEnts  = uniq(fileRows.filter(function(r){ return r.entity_kind==='mask'; }).map(function(r){ return r.entity_name; }));
+  var maskEnts  = uniq(fileRows.filter(function(r){ return r.entity_kind==='mask';  }).map(function(r){ return r.entity_name; }));
 
   // ── Label entities ────────────────────────────────────────
   labelEnts.forEach(function(ent) {
-    var rows = instRows.filter(function(r){ return r.entity_name===ent && r.entity_kind==='label'; });
-    var entCells = multiCell ? allCells : null;
+    var rows  = instRows.filter(function(r){ return r.entity_name===ent && r.entity_kind==='label'; });
     var color = entColor(ent);
+    var isSingle = singleLabelEnts.has(ent);
 
     var block = document.createElement('div');
     block.className = 'entity-block';
     block.style.borderLeftColor = color;
-
     var badge = '<span class="badge bg-primary rounded-pill" style="font-size:.65rem">label</span>';
     block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
       +'<div class="charts-row mb-3" id="mc-'+ent+'"></div>'
       +'<div class="charts-row" id="dc-'+ent+'"></div>';
     container.appendChild(block);
 
-    var isSingle = singleLabelEnts.has(ent);
-
-    // Metric charts: box plots for multi-instance, bar plots for single-instance
+    // ── Metric charts ──────────────────────────────────────
     var mCols = nonDistMetricCols(rows);
-    var mcEl = block.querySelector('#mc-'+ent);
-    mCols.slice(0,8).forEach(function(metric) {
-      var valid = rows.filter(function(r){ return r[metric]!=null && isFinite(r[metric]); });
-      if(!valid.length) return;
+    var mcEl  = block.querySelector('#mc-'+ent);
+    mCols.slice(0, 8).forEach(function(metric) {
+      var valid = rows.filter(function(r){ return r[metric] != null && isFinite(r[metric]); });
+      if (!valid.length) return;
       var el = document.createElement('div');
-      el.className = 'chart-cell';
-      el.style.width = '260px';
+      el.className = 'chart-cell'; el.style.width = '260px';
       mcEl.appendChild(el);
       var traces;
-      if(isSingle) {
-        var xs = entCells ? entCells : [ent];
-        var ys = xs.map(function(c){
-          var r = valid.find(function(r){ return entCells ? r.cell_id===c : true; });
+      if (isSingle) {
+        var xs = multiGroup ? allGroups : [ent];
+        var ys = xs.map(function(g){
+          var r = valid.find(function(r){ return multiGroup ? r[gKey]===g : true; });
           return r ? r[metric] : null;
         });
         traces = [{ type:'bar', x:xs, y:ys, showlegend:false,
-          marker:{color: entCells ? xs.map(function(c){ return cellColor(c); }) : color} }];
-      } else if(entCells && entCells.length > 1) {
-        traces = entCells.map(function(c){
-          return { type:'box', name:c, boxpoints:false, marker:{color:cellColor(c)},
-            y:valid.filter(function(r){ return r.cell_id===c; }).map(function(r){ return r[metric]; }) };
+          marker:{color: multiGroup ? xs.map(gColor) : color} }];
+      } else if (multiGroup) {
+        traces = allGroups.map(function(g){
+          return { type:'box', name:g, boxpoints:false, marker:{color:gColor(g)},
+            y: valid.filter(function(r){ return r[gKey]===g; }).map(function(r){ return r[metric]; }) };
         });
       } else {
         traces = [{ type:'box', name:ent, boxpoints:'suspectedoutliers', marker:{color:color},
-          y:valid.map(function(r){ return r[metric]; }) }];
+          y: valid.map(function(r){ return r[metric]; }) }];
       }
       Plotly.newPlot(el, traces, {
-        margin:{l:50,r:5,t:28,b:50}, height:230,
-        showlegend: !isSingle && !!entCells, font:{size:9},
+        margin:{l:50,r:5,t:28,b:50}, height:230, font:{size:9},
+        showlegend: !isSingle && multiGroup,
         title:{text:metric.replace(/_/g,' '), font:{size:10}},
         legend:{orientation:'h', y:-0.25, font:{size:8}},
-      },{responsive:true, displayModeBar:false});
+      }, {responsive:true, displayModeBar:false});
     });
 
-    // Distance charts: box plots for multi-instance, bar plots for single-instance
+    // ── Distance charts ────────────────────────────────────
     var dCols = distCols(rows);
-    if(!dCols.length) return;
+    if (!dCols.length) return;
     var dcEl = block.querySelector('#dc-'+ent);
-    var distEl = document.createElement('div');
-    distEl.className = 'chart-cell';
-    distEl.style.cssText = 'width:500px;max-width:100%';
-    dcEl.appendChild(distEl);
 
-    var distTraces;
-    if(isSingle) {
-      var xLabels = dCols.map(function(c){ return c.replace('distance_to_','').replace('_um',''); });
-      if(entCells && entCells.length > 1) {
-        distTraces = entCells.map(function(c){
-          var cellRow = rows.find(function(r){ return r.cell_id===c; });
-          return { type:'bar', name:c, x:xLabels, marker:{color:cellColor(c)},
-            y:dCols.map(function(col){ return cellRow && cellRow[col]!=null ? cellRow[col] : null; }) };
-        });
-      } else {
-        distTraces = [{ type:'bar', x:xLabels, showlegend:false, marker:{color:color},
-          y:dCols.map(function(col){ var r=rows[0]; return r && r[col]!=null ? r[col] : null; }) }];
-      }
-      Plotly.newPlot(distEl, distTraces, {
-        barmode:'group', margin:{l:65,r:10,t:28,b:80}, height:260,
-        title:{text:'Min distance to other components (μm)', font:{size:10}},
-        xaxis:{tickangle:-30}, yaxis:{title:'dist (μm)'},
-        showlegend:!!(entCells && entCells.length > 1),
-        legend:{orientation:'h', y:-0.38, font:{size:8}},
-      },{responsive:true, displayModeBar:false});
+    // When grouping by group (or multiple groups), one compact plot per component
+    var separateDist = multiGroup && plotGroupBy === 'group';
+
+    if (separateDist) {
+      dCols.forEach(function(col) {
+        var el = document.createElement('div');
+        el.className = 'chart-cell'; el.style.width = '200px';
+        dcEl.appendChild(el);
+        var lbl = col.replace(/^distance_to_/,'').replace(/_label_/,' ').replace(/_um$/,'').replace(/_/g,' ');
+        var traces;
+        if (isSingle) {
+          traces = [{ type:'bar', x:allGroups, showlegend:false,
+            marker:{color:allGroups.map(gColor)},
+            y:allGroups.map(function(g){
+              var r = rows.find(function(r){ return r[gKey]===g; });
+              return r && r[col] != null ? r[col] : null;
+            }) }];
+        } else {
+          traces = allGroups.map(function(g){
+            var ys = rows.filter(function(r){ return r[gKey]===g && r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
+            return { type:'box', name:g, y:ys, boxpoints:false, marker:{color:gColor(g)} };
+          });
+        }
+        Plotly.newPlot(el, traces, {
+          margin:{l:50,r:5,t:28,b:30}, height:210, font:{size:9},
+          title:{text:lbl, font:{size:10}},
+          yaxis:{title:'μm'}, showlegend:false,
+        }, {responsive:true, displayModeBar:false});
+      });
     } else {
-      if(entCells && entCells.length > 1) {
-        distTraces = entCells.map(function(c){
+      // Combined chart: all components on x-axis, one trace per group
+      var distEl = document.createElement('div');
+      distEl.className = 'chart-cell';
+      distEl.style.cssText = 'width:500px;max-width:100%';
+      dcEl.appendChild(distEl);
+      var distTraces;
+      if (isSingle) {
+        var xLabels = dCols.map(function(c){ return c.replace('distance_to_','').replace('_um',''); });
+        if (multiGroup) {
+          distTraces = allGroups.map(function(g){
+            var gr = rows.find(function(r){ return r[gKey]===g; });
+            return { type:'bar', name:g, x:xLabels, marker:{color:gColor(g)},
+              y:dCols.map(function(col){ return gr && gr[col]!=null ? gr[col] : null; }) };
+          });
+        } else {
+          distTraces = [{ type:'bar', x:xLabels, showlegend:false, marker:{color:color},
+            y:dCols.map(function(col){ var r=rows[0]; return r && r[col]!=null ? r[col] : null; }) }];
+        }
+        Plotly.newPlot(distEl, distTraces, {
+          barmode:'group', margin:{l:65,r:10,t:28,b:80}, height:260,
+          title:{text:'Min distance to other components (μm)', font:{size:10}},
+          xaxis:{tickangle:-30}, yaxis:{title:'dist (μm)'},
+          showlegend:multiGroup, legend:{orientation:'h', y:-0.38, font:{size:8}},
+        }, {responsive:true, displayModeBar:false});
+      } else {
+        if (multiGroup) {
+          distTraces = allGroups.map(function(g){
+            var xs = [], ys = [];
+            dCols.forEach(function(col){
+              var lbl = col.replace('distance_to_','').replace('_um','');
+              rows.filter(function(r){ return r[gKey]===g; }).forEach(function(r){
+                if (r[col]!=null && isFinite(r[col])){ xs.push(lbl); ys.push(r[col]); }
+              });
+            });
+            return { type:'box', name:g, x:xs, y:ys, boxpoints:false, marker:{color:gColor(g)} };
+          });
+        } else {
           var xs = [], ys = [];
           dCols.forEach(function(col){
             var lbl = col.replace('distance_to_','').replace('_um','');
-            rows.filter(function(r){ return r.cell_id===c; }).forEach(function(r){
-              if(r[col]!=null && isFinite(r[col])){ xs.push(lbl); ys.push(r[col]); }
+            rows.forEach(function(r){
+              if (r[col]!=null && isFinite(r[col])){ xs.push(lbl); ys.push(r[col]); }
             });
           });
-          return { type:'box', name:c, x:xs, y:ys, boxpoints:false, marker:{color:cellColor(c)} };
-        });
-      } else {
-        var xs = [], ys = [];
-        dCols.forEach(function(col){
-          var lbl = col.replace('distance_to_','').replace('_um','');
-          rows.forEach(function(r){
-            if(r[col]!=null && isFinite(r[col])){ xs.push(lbl); ys.push(r[col]); }
-          });
-        });
-        distTraces = [{ type:'box', name:ent, x:xs, y:ys, boxpoints:'suspectedoutliers', marker:{color:color} }];
+          distTraces = [{ type:'box', name:ent, x:xs, y:ys, boxpoints:'suspectedoutliers', marker:{color:color} }];
+        }
+        Plotly.newPlot(distEl, distTraces, {
+          boxmode:'group', margin:{l:65,r:10,t:28,b:80}, height:260,
+          title:{text:'Min distance to other components (μm)', font:{size:10}},
+          xaxis:{tickangle:-30}, yaxis:{title:'dist (μm)'},
+          showlegend:multiGroup, legend:{orientation:'h', y:-0.38, font:{size:8}},
+        }, {responsive:true, displayModeBar:false});
       }
-      Plotly.newPlot(distEl, distTraces, {
-        boxmode:'group', margin:{l:65,r:10,t:28,b:80}, height:260,
-        title:{text:'Min distance to other components (μm)', font:{size:10}},
-        xaxis:{tickangle:-30}, yaxis:{title:'dist (μm)'},
-        showlegend:!!(entCells && entCells.length > 1),
-        legend:{orientation:'h', y:-0.38, font:{size:8}},
-      },{responsive:true, displayModeBar:false});
     }
   });
 
@@ -541,36 +911,29 @@ function renderEntityStats() {
   maskEnts.forEach(function(ent) {
     var mRows = fileRows.filter(function(r){ return r.entity_name===ent && r.entity_kind==='mask'; });
     var color = entColor(ent);
-
     var block = document.createElement('div');
-    block.className = 'entity-block';
-    block.style.borderLeftColor = color;
+    block.className = 'entity-block'; block.style.borderLeftColor = color;
     var badge = '<span class="badge bg-info text-dark rounded-pill" style="font-size:.65rem">mask</span>';
     block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
       +'<div class="charts-row" id="mk-'+ent+'"></div>';
     container.appendChild(block);
-
-    if(!mRows.length) return;
+    if (!mRows.length) return;
     var mkEl = block.querySelector('#mk-'+ent);
-
-    // Volume bar across cells
     var volEl = document.createElement('div');
-    volEl.className = 'chart-cell';
-    volEl.style.width = '320px';
+    volEl.className = 'chart-cell'; volEl.style.width = '320px';
     mkEl.appendChild(volEl);
+    var vx = mRows.map(function(r){ return r[gKey]||'?'; });
     Plotly.newPlot(volEl, [{
-      type:'bar',
-      x: mRows.map(function(r){ return r.cell_id||'cell'; }),
-      y: mRows.map(function(r){ return r.total_volume_um3; }),
-      marker:{color: mRows.map(function(r){ return cellColor(r.cell_id||'cell'); })},
-    }],{
+      type:'bar', x:vx, y:mRows.map(function(r){ return r.total_volume_um3; }),
+      marker:{color:vx.map(gColor)},
+    }], {
       margin:{l:70,r:10,t:28,b:60}, height:220,
       title:{text:'Volume (μm³)', font:{size:10}},
       yaxis:{title:'μm³'}, showlegend:false,
-    },{responsive:true, displayModeBar:false});
+    }, {responsive:true, displayModeBar:false});
   });
 
-  if(!labelEnts.length && !maskEnts.length) {
+  if (!labelEnts.length && !maskEnts.length) {
     container.innerHTML = '<div class="text-muted small">No component data matches current filters.</div>';
   }
 }
@@ -604,6 +967,14 @@ function initViewerControls() {
   });
 }
 
+function setMeshMode(on) {
+  vSt.meshMode = on;
+  document.getElementById('btn-thumbnails').classList.toggle('vt-active', !on);
+  document.getElementById('btn-meshes').classList.toggle('vt-active', on);
+  document.getElementById('s-cell3d').style.display = on ? '' : 'none';
+  renderViewer();
+}
+
 function renderViewer() {
   initViewerControls();
   var rows = filtered('instance').filter(function(r){ return r.entity_kind==='label'; });
@@ -625,26 +996,97 @@ function renderViewer() {
       })()
     : rows.slice(0,n);
 
+  _currentSample = sample;
   document.getElementById('v-count').textContent =
     'Showing '+sample.length.toLocaleString()+' of '+rows.length.toLocaleString()+' instances';
 
+  var hasMesh = ALL.some(function(r){ return r.mesh_b64; });
+  document.getElementById('mesh-toggle-wrap').style.display = hasMesh ? '' : 'none';
+
   var mlabel = vSt.sortCol.replace(/_/g,' ').replace(' um3',' μm³').replace(' um2',' μm²').replace(' um',' μm');
-  document.getElementById('thumb-grid').innerHTML = sample.map(function(r){
+  var colorFn = vSt.colorBy==='cell'  ? function(r){ return cellColor(r.cell_id||''); }
+              : vSt.colorBy==='group' ? function(r){ return cellColor(r.group_id||''); }
+              :                         function(r){ return entColor(r.entity_name); };
+  document.getElementById('thumb-grid').innerHTML = sample.map(function(r, i){
     var val = r[vSt.sortCol];
     var vs = val==null ? '—' : (typeof val==='number' && !Number.isInteger(val)) ? val.toFixed(2) : String(val);
-    var col = vSt.colorBy==='cell' ? cellColor(r.cell_id||'') : entColor(r.entity_name);
+    // Color-by only affects the mesh thumbnail; cards without meshes get a neutral indicator dot
+    var dotCol = colorFn(r);
     var thumb = r.thumbnail_b64
-      ? '<img src="data:image/png;base64,'+r.thumbnail_b64+'">'
-      : '<div class="no-thumb"></div>';
-    return '<div class="thumb-card" style="border-top:3px solid '+col+'" '
-      +'title="'+r.entity_name+' / '+(r.cell_id||'')+' #'+r.label_id+'">'
+      ? '<img'+(r.mesh_b64?' data-midx="'+i+'"':'')+' src="data:image/png;base64,'+r.thumbnail_b64+'">'
+      : (r.mesh_b64 ? '<img data-midx="'+i+'" src="">' : '<div class="no-thumb"></div>');
+    var cls = 'thumb-card' + (r.mesh_b64 ? ' has-mesh' : '');
+    var dot = !r.mesh_b64 ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dotCol+';margin-right:3px;flex-shrink:0"></span>' : '';
+    return '<div class="'+cls+'" data-idx="'+i+'"'
+      +' title="'+r.entity_name+' / '+(r.cell_id||'')+' #'+r.label_id+(r.mesh_b64?' (click for 3D)':'')+'">'
       +thumb
-      +'<div class="tc-ent">'+r.entity_name+'</div>'
+      +'<div class="tc-ent" style="display:flex;align-items:center">'+dot+r.entity_name+'</div>'
       +(r.cell_id ? '<div class="tc-cell">'+r.cell_id+'</div>' : '')
       +'<div class="tc-val" title="'+mlabel+'">'+vs+'</div>'
       +'</div>';
   }).join('');
+
+  if (vSt.meshMode && typeof window.render3DThumbs === 'function') window.render3DThumbs(_currentSample, colorFn);
 }
+
+// ══════════════════════════════════════════════════════════════
+//  Cell 3D View
+// ══════════════════════════════════════════════════════════════
+var _c3dInited = false;
+
+function initCell3D() {
+  var hasMesh = ALL.some(function(r){ return r.mesh_b64; });
+  // Visibility is controlled by setMeshMode; just hide when no mesh data at all
+  if (!hasMesh) { document.getElementById('s-cell3d').style.display = 'none'; return; }
+
+  var cs = uniq(ALL.filter(function(r){ return r.row_type==='instance' && r.mesh_b64; })
+    .map(function(r){ return r.cell_id; }).filter(Boolean));
+  var cellSel = document.getElementById('c3d-cell');
+  var prevCell = cellSel.value;
+  cellSel.innerHTML = cs.map(function(c){ return '<option value="'+c+'">'+c+'</option>'; }).join('');
+  if (prevCell && cs.indexOf(prevCell) !== -1) cellSel.value = prevCell;
+
+  var numCols = COLS.filter(function(c){
+    return !SKIP.has(c) && ALL.some(function(r){ return r[c]!=null && isFinite(r[c]); });
+  });
+  var metSel = document.getElementById('c3d-metric');
+  metSel.innerHTML = numCols.map(function(c){
+    return '<option value="'+c+'"'+(c==='volume_um3'?' selected':'')+'>'+c.replace(/_/g,' ')+'</option>';
+  }).join('');
+
+  if (!_c3dInited) {
+    _c3dInited = true;
+    cellSel.addEventListener('change', renderCell3D);
+    document.getElementById('c3d-color').addEventListener('change', function(){
+      document.getElementById('c3d-metric-wrap').style.display = this.value==='metric' ? '' : 'none';
+      renderCell3D();
+    });
+    document.getElementById('c3d-metric').addEventListener('change', renderCell3D);
+  }
+  renderCell3D();
+}
+
+function renderCell3D() {
+  var cellId   = document.getElementById('c3d-cell').value;
+  var colorBy  = document.getElementById('c3d-color').value;
+  var metricCol = document.getElementById('c3d-metric').value || 'volume_um3';
+  var rows = ALL.filter(function(r){
+    return r.row_type==='instance' && r.entity_kind==='label' && r.cell_id===cellId && r.mesh_b64
+      && (!st.entity || r.entity_name === st.entity);
+  });
+  document.getElementById('c3d-count').textContent = rows.length+' instances';
+  if (typeof window.render3DScene === 'function') window.render3DScene(rows, metricCol, colorBy);
+}
+
+// Click-to-3D on individual thumbnails
+document.getElementById('thumb-grid').addEventListener('click', function(e) {
+  var card = e.target.closest('.thumb-card.has-mesh');
+  if (!card) return;
+  var row = _currentSample[+card.dataset.idx];
+  if (vSt.meshMode && row && row.mesh_b64 && typeof window.showMesh3D === 'function') {
+    window.showMesh3D(row.mesh_b64, row.entity_name + ' · ' + (row.cell_id||'') + ' #' + row.label_id);
+  }
+});
 </script>
 </body>
 </html>

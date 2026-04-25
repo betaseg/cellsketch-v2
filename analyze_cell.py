@@ -9,6 +9,7 @@
 #   "tifffile>=2024.5.0",
 #   "matplotlib>=3.9.0",
 #   "edt>=2.4.0",
+#   "fast-simplification>=0.1.6",
 # ]
 # ///
 
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
 import io
 import json
 import math
@@ -33,7 +35,8 @@ import numpy as np
 import pandas as pd
 import tifffile
 from scipy.ndimage import convolve, distance_transform_edt, gaussian_filter, label as nd_label
-from skimage.measure import regionprops
+import fast_simplification
+from skimage.measure import marching_cubes, regionprops
 from skimage.morphology import skeletonize
 
 matplotlib.use("Agg")
@@ -62,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generated-masks-dirname", default="masks_for_analysis")
     parser.add_argument("--num-threads", type=int, default=0)
     parser.add_argument("--skip-plots", action="store_true", help="Skip thumbnail generation (faster processing).")
+    parser.add_argument("--with-mesh", action="store_true", help="Generate 3D mesh (marching cubes) per instance for the interactive 3D viewer.")
     parser.add_argument("--force-reprocess", action="store_true", help="Re-process cells even if report.csv already exists.")
     parser.add_argument(
         "--max-skeleton-voxels",
@@ -132,10 +136,29 @@ def discover_dataset(cell_dir: Path) -> Dataset:
     source = max(source_candidates, key=source_score)
     source_norm = normalize_name(source.stem)
 
+    # Adaptive prefix matching:
+    # 1. Find the longest shared prefix any entity has with the source name.
+    # 2. Accept only entities whose shared length equals that maximum.
+    # 3. When names fully exhaust the shorter string (clean match), additionally
+    #    require a word-boundary in the longer one to reject "c1" ↔ "c10" style
+    #    false positives.  When names diverge mid-string (e.g. source has extra
+    #    tokens the entity files don't), skip the boundary check — the max-shared
+    #    filter is sufficient.
+    shared_lens = {p: shared_prefix_len(source_norm, pref) for p, (pref, _, _) in parsed.items()}
+    max_shared = max(shared_lens.values()) if shared_lens else 0
+
     entities: Dict[str, Entity] = {}
     for p, (pref, name, kind) in parsed.items():
-        if shared_prefix_len(source_norm, pref) < 12:
+        sl = shared_lens[p]
+        if sl < max_shared:
             continue
+        min_len = min(len(source_norm), len(pref))
+        if sl >= min_len:
+            # Names match all the way to the end of the shorter one: apply
+            # word-boundary guard so "c1" does not match a "c10" prefix.
+            longer = source_norm if len(source_norm) >= len(pref) else pref
+            if sl < len(longer) and longer[sl] != "_":
+                continue
         key = f"{kind}:{name}"
         entities[key] = Entity(name=name, kind=kind, path=p)
 
@@ -260,62 +283,75 @@ def aspect_ratio_from_coords(coords_zyx: np.ndarray, voxel_size_zyx: Tuple[float
     return float(lengths.max() / lengths.min())
 
 
-def count_branch_points(binary_mask: np.ndarray, max_voxels: int | None = None) -> int | float:
+def skeleton_metrics(
+    binary_mask: np.ndarray,
+    voxel_size_zyx: Tuple[float, float, float],
+    max_voxels: int | None = None,
+) -> dict:
+    """Run skeletonise once and return branches, length_um, and tortuosity.
+
+    Length: sum of physical edge lengths in the 26-connected skeleton graph.
+    Tortuosity: length / straight-line end-to-end distance (only for simple
+    filaments with exactly two endpoints; NaN for branching structures).
+    """
+    nan_row = {"branches": float("nan"), "length_um": float("nan"), "tortuosity": float("nan")}
     n = int(binary_mask.sum())
     if n == 0:
-        return 0
+        return {"branches": 0, "length_um": 0.0, "tortuosity": float("nan")}
     if max_voxels is not None and n > max_voxels:
-        return float("nan")
+        return nan_row
+
     skel = skeletonize(binary_mask.astype(bool))
-    if skel.sum() == 0:
-        return 0
+    if not skel.any():
+        return {"branches": 0, "length_um": 0.0, "tortuosity": float("nan")}
+
+    vz, vy, vx = voxel_size_zyx
+
+    # ── Skeleton length ────────────────────────────────────────────────────
+    # Precompute the 26 neighbour offsets and their physical distances.
+    neighbour_steps: list[tuple[tuple[int, int, int], float]] = []
+    for dz in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dz == dy == dx == 0:
+                    continue
+                neighbour_steps.append(
+                    ((dz, dy, dx), math.sqrt((dz * vz) ** 2 + (dy * vy) ** 2 + (dx * vx) ** 2))
+                )
+
+    coords = np.argwhere(skel)
+    coord_set = set(map(tuple, coords.tolist()))
+    length_um = 0.0
+    for z, y, x in coords:
+        for (dz, dy, dx), dist in neighbour_steps:
+            if (z + dz, y + dy, x + dx) in coord_set:
+                length_um += dist
+    length_um /= 2.0  # each edge is traversed from both endpoints
+
+    # ── Branch count ───────────────────────────────────────────────────────
     kernel = np.ones((3, 3, 3), dtype=np.int16)
     kernel[1, 1, 1] = 0
     degree = convolve(skel.astype(np.int16), kernel, mode="constant", cval=0)
-
-    endpoint_mask = skel & (degree == 1)
     junction_mask = skel & (degree >= 3)
-
-    # Merge adjacent junction voxels into single graph nodes.
     connectivity = np.ones((3, 3, 3), dtype=np.uint8)
-    junction_cc, n_junction_cc = nd_label(junction_mask.astype(np.uint8), structure=connectivity)
-
-    # Branch segments are skeleton components with junction voxels removed.
     segment_mask = skel & ~junction_mask
-    segment_cc, n_segments = nd_label(segment_mask.astype(np.uint8), structure=connectivity)
-    if n_segments == 0:
-        return 0
+    _, n_segments = nd_label(segment_mask.astype(np.uint8), structure=connectivity)
+    branches = int(n_segments)
 
-    branch_count = 0
-    for seg_id in range(1, n_segments + 1):
-        seg = segment_cc == seg_id
-        seg_coords = np.argwhere(seg)
-        attached_nodes: set[tuple[str, int]] = set()
+    # ── Tortuosity ─────────────────────────────────────────────────────────
+    # Defined only for simple filaments (exactly two endpoints), matching
+    # tortuosity = length / straight_line_distance.
+    endpoint_mask = skel & (degree == 1)
+    ep_coords = np.argwhere(endpoint_mask)
+    tortuosity = float("nan")
+    if len(ep_coords) == 2:
+        p1 = ep_coords[0].astype(float) * np.array([vz, vy, vx])
+        p2 = ep_coords[1].astype(float) * np.array([vz, vy, vx])
+        end_to_end = float(np.linalg.norm(p2 - p1))
+        if end_to_end > 0:
+            tortuosity = length_um / end_to_end
 
-        for z, y, x in seg_coords:
-            z0, z1 = max(0, z - 1), min(skel.shape[0], z + 2)
-            y0, y1 = max(0, y - 1), min(skel.shape[1], y + 2)
-            x0, x1 = max(0, x - 1), min(skel.shape[2], x + 2)
-
-            j_patch = junction_cc[z0:z1, y0:y1, x0:x1]
-            for j in np.unique(j_patch):
-                if j > 0:
-                    attached_nodes.add(("junction", int(j)))
-
-            e_patch = endpoint_mask[z0:z1, y0:y1, x0:x1]
-            if np.any(e_patch):
-                endpoint_coords = np.argwhere(e_patch)
-                for ez, ey, ex in endpoint_coords:
-                    # Encode local endpoint coordinates into stable global IDs.
-                    attached_nodes.add(("endpoint", int((z0 + ez) * 10**12 + (y0 + ey) * 10**6 + (x0 + ex))))
-
-        # Closed loops can have no junctions/endpoints but still represent one branch.
-        if len(attached_nodes) == 0:
-            branch_count += 1
-        else:
-            branch_count += 1
-
-    return int(branch_count)
+    return {"branches": branches, "length_um": length_um, "tortuosity": tortuosity}
 
 
 def per_label_metrics(
@@ -329,12 +365,15 @@ def per_label_metrics(
     props = regionprops(labels)
     centroids = []
     for rp in props:
+        skel = skeleton_metrics(rp.image, voxel_size_zyx, max_voxels=max_skeleton_voxels)
         row = {
             "label": int(rp.label),
             "volume_um3": float(rp.area * voxel_um3),
             "surface_area_um2": estimate_surface_area_um2(rp.image, voxel_size_zyx),
             "aspect_ratio_major_minor": aspect_ratio_from_coords(rp.coords, voxel_size_zyx),
-            "branches": count_branch_points(rp.image, max_voxels=max_skeleton_voxels),
+            "branches": skel["branches"],
+            "length_um": skel["length_um"],
+            "tortuosity": skel["tortuosity"],
         }
         row["sphericity"] = sphericity(row["volume_um3"], row["surface_area_um2"])
         for key, dt in distance_transforms.items():
@@ -424,6 +463,63 @@ def _thumbnail_b64(binary: np.ndarray, rgb: Tuple[float, float, float], size: in
     return _to_png_b64(square)
 
 
+def _generate_mesh_b64(
+    binary: np.ndarray,
+    bbox_origin_zyx: Tuple[int, int, int],
+    voxel_size_zyx: Tuple[float, float, float],
+    step_size: int = 2,
+) -> str:
+    """Mesh a (Z,Y,X) binary mask via marching cubes on a Gaussian-smoothed volume.
+
+    Binary payload (gzip-compressed, then base64):
+      [uint32 nV][uint32 nF]
+      [float32×3 min_xyz][float32×3 scale_xyz]   ← dequantisation params
+      [uint16 × nV×3 quantised XYZ vertices]
+      [uint32 × nF×3 face indices]
+    """
+    if binary.sum() < 8:
+        return ""
+    try:
+        # 1-voxel pad so marching cubes sees closed surfaces at every boundary,
+        # then Gaussian blur to smooth staircase artefacts.
+        # sigma=0.7 smooths steps without over-blurring thin (1-2 voxel) structures.
+        # level=0.25: after blur a 1-voxel-wide structure peaks well below 0.5,
+        # so 0.5 would erase it; 0.25 captures fine filaments while still rejecting noise.
+        padded = np.pad(binary.astype(np.float32), pad_width=1)
+        smoothed = gaussian_filter(padded, sigma=0.7)
+        verts, faces, _, _ = marching_cubes(smoothed, level=0.25, step_size=step_size)
+        verts = verts - 1.0  # undo padding offset → local voxel coords
+        oz, oy, ox = bbox_origin_zyx
+        sz, sy, sx = voxel_size_zyx
+        # Reorder ZYX → XYZ in µm (Three.js convention)
+        verts_xyz = np.column_stack([
+            (verts[:, 2] + ox) * sx,
+            (verts[:, 1] + oy) * sy,
+            (verts[:, 0] + oz) * sz,
+        ]).astype(np.float32)
+        # QEM decimation — reduce faces by ~80 % while preserving shape
+        if len(faces) > 100:
+            verts_xyz, faces_s = fast_simplification.simplify(
+                verts_xyz, faces.astype(int), target_reduction=0.8, verbose=False,
+            )
+            verts_xyz = verts_xyz.astype(np.float32)
+            faces = faces_s
+        # Quantise to uint16 to halve vertex storage
+        min_xyz = verts_xyz.min(axis=0)
+        scale_xyz = verts_xyz.max(axis=0) - min_xyz
+        scale_xyz[scale_xyz == 0] = 1.0
+        verts_q = np.clip(
+            (verts_xyz - min_xyz) / scale_xyz * 65535 + 0.5, 0, 65535
+        ).astype(np.uint16)
+        faces32 = faces.astype(np.uint32)
+        quant_params = np.concatenate([min_xyz, scale_xyz]).astype(np.float32)
+        header = np.array([len(verts_xyz), len(faces32)], dtype=np.uint32)
+        payload = header.tobytes() + quant_params.tobytes() + verts_q.tobytes() + faces32.tobytes()
+        return base64.b64encode(gzip.compress(payload, compresslevel=6)).decode()
+    except Exception:
+        return ""
+
+
 def resolve_voxel_size_zyx(args: argparse.Namespace, source_path: Path) -> Tuple[float, float, float]:
     if args.voxel_size_um:
         voxel_size_zyx = tuple(float(x) for x in args.voxel_size_um.split(","))
@@ -452,18 +548,88 @@ def apply_membrane_clipping(volumes: Dict[str, np.ndarray], membrane_key: str, e
     print("Clipping done.", flush=True)
 
 
-def write_generated_masks(
-    volumes: Dict[str, np.ndarray],
-    entities: Dict[str, Entity],
+def load_or_generate_masks(
+    dataset: Dataset,
     generated_masks_dir: Path,
-) -> None:
+    membrane_key: str,
+    auto_clip: bool,
+) -> Dict[str, np.ndarray]:
+    """Return per-entity volumes, auto-promoting multi-component masks to label entities.
+
+    For every non-membrane mask with >1 connected component, connected-component
+    analysis is run and the result is stored in the cache as int32 labels.  On the
+    next run the cache detects stored labels via max > 1 and skips recomputation.
+    Single-component masks are stored as binary uint8 and kept as masks.
+    """
     generated_masks_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Writing generated masks to {generated_masks_dir} ...", flush=True)
-    for key, arr in volumes.items():
-        entity = entities[key]
-        out = arr if entity.kind == "label" else (arr > 0).astype(np.uint8)
-        tifffile.imwrite(generated_masks_dir / entity.path.name, out, compression="zlib")
-    print("Generated masks written.", flush=True)
+    cached_paths = {key: generated_masks_dir / entity.path.name for key, entity in dataset.entities.items()}
+    all_cached = all(p.exists() for p in cached_paths.values())
+
+    if all_cached:
+        print(f"Generated masks cache hit — loading from {generated_masks_dir.name}/", flush=True)
+        volumes = {key: load_volume(path) for key, path in cached_paths.items()}
+    else:
+        print("Generated masks cache miss — loading originals...", flush=True)
+        volumes = load_entity_volumes(dataset)
+        apply_membrane_clipping(volumes, membrane_key, auto_clip)
+
+    # Auto-promote multi-component masks to label entities.
+    # Cache stores int32 CC labels when n>1, uint8 binary when n==1;
+    # on cache-hit, max>1 signals that labels were previously detected.
+    cc_struct = np.ones((3, 3, 3), dtype=np.uint8)
+    for key in list(volumes.keys()):
+        entity = dataset.entities[key]
+        if entity.kind != "mask" or key == membrane_key:
+            if not all_cached and entity.kind == "label":
+                # Write original label entity to cache
+                path = cached_paths.get(key)
+                if path and not path.exists():
+                    tifffile.imwrite(path, volumes[key], compression="zlib")
+            continue
+
+        arr = volumes[key]
+        cache_path = cached_paths[key]
+
+        if all_cached and int(arr.max()) > 1:
+            # Cache already holds CC labels from a previous run
+            labeled, n = arr.astype(np.int32), int(arr.max())
+        else:
+            binary = arr > 0
+            if not binary.any():
+                if not all_cached:
+                    tifffile.imwrite(cache_path, binary.astype(np.uint8), compression="zlib")
+                continue
+            labeled, n = nd_label(binary, structure=cc_struct)
+            labeled = labeled.astype(np.int32)
+            if not all_cached:
+                out = labeled if n > 1 else binary.astype(np.uint8)
+                tifffile.imwrite(cache_path, out, compression="zlib")
+
+        if n <= 1:
+            continue
+
+        # Multi-component: promote to label entity.
+        # The mask key remains pointing to the CC array; build_distance_targets
+        # already applies > 0 on both mask and label volumes, so no explicit binary
+        # copy is needed.
+        label_key = f"label:{entity.name}"
+        volumes[label_key] = labeled
+        dataset.entities[label_key] = Entity(name=entity.name, kind="label", path=entity.path)
+        print(f"  Auto-label: '{entity.name}' — {n} components → label entity.", flush=True)
+
+    # Write cache for non-mask entities not yet written
+    if not all_cached:
+        for key, arr in volumes.items():
+            entity = dataset.entities.get(key)
+            if entity is None:
+                continue  # auto-added label keys share cache path with their mask
+            path = cached_paths.get(key)
+            if path and not path.exists():
+                out = arr if entity.kind == "label" else (arr > 0).astype(np.uint8)
+                tifffile.imwrite(path, out, compression="zlib")
+        print("Generated masks written.", flush=True)
+
+    return volumes
 
 
 
@@ -563,6 +729,7 @@ def _sanitize(v: object) -> object:
 
 def build_report_rows(
     cell_id: str,
+    group_id: str,
     volumes: Dict[str, np.ndarray],
     entities: Dict[str, Entity],
     label_keys: list[str],
@@ -571,6 +738,7 @@ def build_report_rows(
     voxel_size_zyx: Tuple[float, float, float],
     voxel_um3: float,
     skip_thumbnails: bool = False,
+    with_mesh: bool = False,
     source_path: Path | None = None,
     generated_masks_dir: Path | None = None,
 ) -> list[dict]:
@@ -594,7 +762,7 @@ def build_report_rows(
 
     if source_path is not None:
         rows.append({
-            "cell_id": cell_id, "entity_name": "source",
+            "cell_id": cell_id, "group_id": group_id, "entity_name": "source",
             "entity_kind": "source", "row_type": "file",
             "label_id": None, "instance_count": None, "total_volume_um3": None,
             **_file_meta(source_path),
@@ -603,7 +771,7 @@ def build_report_rows(
     for mk in mask_keys:
         ent = entities[mk]
         rows.append({
-            "cell_id": cell_id, "entity_name": ent.name, "entity_kind": ent.kind,
+            "cell_id": cell_id, "group_id": group_id, "entity_name": ent.name, "entity_kind": ent.kind,
             "row_type": "file", "label_id": None, "instance_count": None,
             "total_volume_um3": float((volumes[mk] > 0).sum() * voxel_um3),
             **_file_meta(ent.path),
@@ -615,7 +783,7 @@ def build_report_rows(
         df = label_dfs.get(lk, pd.DataFrame())
         n_inst = int(len(np.unique(labels[labels > 0]))) if (labels > 0).any() else 0
         rows.append({
-            "cell_id": cell_id, "entity_name": ent.name, "entity_kind": ent.kind,
+            "cell_id": cell_id, "group_id": group_id, "entity_name": ent.name, "entity_kind": ent.kind,
             "row_type": "file", "label_id": None, "instance_count": n_inst,
             "total_volume_um3": float((labels > 0).sum() * voxel_um3),
             **_file_meta(ent.path),
@@ -631,18 +799,32 @@ def build_report_rows(
             thumb_ids = set(df["label"].astype(int).tolist())
             print(f"  Rendering {len(thumb_ids)} thumbnails for {ent.name}...", flush=True)
 
+        if with_mesh:
+            mesh_ids = set(df["label"].astype(int).tolist())
+            print(f"  Generating {len(mesh_ids)} meshes for {ent.name}...", flush=True)
+        else:
+            mesh_ids: set[int] = set()
+
         for _, irow in df.iterrows():
             lbl = int(irow["label"])
             rp = props_map.get(lbl)
             thumb_b64 = ""
             if lbl in thumb_ids and rp is not None:
                 thumb_b64 = _thumbnail_b64(rp.image.astype(bool), (0.65, 0.65, 0.65))
+            mesh_b64 = ""
+            if lbl in mesh_ids and rp is not None:
+                mesh_b64 = _generate_mesh_b64(
+                    rp.image.astype(bool),
+                    bbox_origin_zyx=(rp.bbox[0], rp.bbox[1], rp.bbox[2]),
+                    voxel_size_zyx=voxel_size_zyx,
+                )
             row_dict: dict = {
-                "cell_id": cell_id, "entity_name": ent.name, "entity_kind": ent.kind,
+                "cell_id": cell_id, "group_id": group_id, "entity_name": ent.name, "entity_kind": ent.kind,
                 "row_type": "instance", "label_id": lbl,
                 "instance_count": None, "total_volume_um3": None,
                 "file_size_bytes": None, "file_mtime": None, "file_name": ent.path.name,
                 "thumbnail_b64": thumb_b64,
+                "mesh_b64": mesh_b64,
             }
             for col in df.columns:
                 if col != "label":
@@ -656,29 +838,43 @@ def write_report_csv(out_path: Path, rows: list[dict]) -> None:
     if not rows:
         return
     df = pd.DataFrame([{k: _sanitize(v) for k, v in r.items()} for r in rows])
-    cols = [c for c in df.columns if c != "thumbnail_b64"] + (
-        ["thumbnail_b64"] if "thumbnail_b64" in df.columns else []
-    )
+    _last = {"thumbnail_b64", "mesh_b64"}
+    cols = [c for c in df.columns if c not in _last] + [c for c in ("thumbnail_b64", "mesh_b64") if c in df.columns]
     df[cols].to_csv(out_path, index=False)
     print(f"Wrote {out_path.name} ({len(df)} rows, {out_path.stat().st_size // 1024} KB)", flush=True)
 
 
-def collect_cell_dirs(cell_dir: Path) -> list[Path]:
-    has_tiffs = any(cell_dir.glob("*.tif*"))
-    if has_tiffs:
-        return [cell_dir]
-    if not cell_dir.exists():
-        raise FileNotFoundError(f"Input folder does not exist: {cell_dir}")
-    subdirs = [p for p in sorted(cell_dir.iterdir()) if p.is_dir()]
-    cell_dirs = [d for d in subdirs if any(d.glob("*.tif*"))]
-    if not cell_dirs:
+def collect_cell_dirs(root: Path) -> list[tuple[Path, str]]:
+    """Return (cell_dir, group_name) pairs, supporting up to two levels of nesting.
+
+    root/               → single cell, group=""
+    root/cell/          → flat batch, group=""
+    root/group/cell/    → grouped batch, group=group-folder-name
+    """
+    if not root.exists():
+        raise FileNotFoundError(f"Input folder does not exist: {root}")
+    if any(root.glob("*.tif*")):
+        return [(root, "")]
+
+    entries: list[tuple[Path, str]] = []
+    for sub in sorted(root.iterdir()):
+        if not sub.is_dir():
+            continue
+        if any(sub.glob("*.tif*")):
+            entries.append((sub, ""))          # flat: root/cell/
+        else:
+            for subsub in sorted(sub.iterdir()):
+                if subsub.is_dir() and any(subsub.glob("*.tif*")):
+                    entries.append((subsub, sub.name))  # grouped: root/group/cell/
+
+    if not entries:
         raise FileNotFoundError(
-            f"No TIFF files in {cell_dir} and no TIFF-containing cell subdirectories found."
+            f"No TIFF files found in {root} or its immediate subdirectories."
         )
-    return cell_dirs
+    return entries
 
 
-def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path) -> None:
+def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, group_id: str = "") -> None:
     report_csv = out_dir / "report.csv"
     if report_csv.exists() and not args.force_reprocess:
         print(f"  Skipping {cell_dir.name} — report.csv exists (--force-reprocess to re-run)", flush=True)
@@ -690,11 +886,13 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path) -> 
     print(f"Detected entities: {len(dataset.entities)}", flush=True)
 
     voxel_size_zyx = resolve_voxel_size_zyx(args, dataset.source)
-    volumes = load_entity_volumes(dataset)
-
     membrane_key = f"mask:{dataset.membrane_name}"
-    apply_membrane_clipping(volumes, membrane_key, args.auto_clip_to_pm)
-    write_generated_masks(volumes, dataset.entities, out_dir / args.generated_masks_dirname)
+    volumes = load_or_generate_masks(
+        dataset=dataset,
+        generated_masks_dir=out_dir / args.generated_masks_dirname,
+        membrane_key=membrane_key,
+        auto_clip=args.auto_clip_to_pm,
+    )
 
     volumes = crop_to_membrane_bbox(volumes, membrane_key)
     voxel_um3 = float(np.prod(voxel_size_zyx))
@@ -724,6 +922,7 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path) -> 
     print("Building report...", flush=True)
     rows = build_report_rows(
         cell_id=cell_dir.name,
+        group_id=group_id,
         volumes=volumes,
         entities=dataset.entities,
         label_keys=label_keys,
@@ -732,6 +931,7 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path) -> 
         voxel_size_zyx=voxel_size_zyx,
         voxel_um3=voxel_um3,
         skip_thumbnails=args.skip_plots,
+        with_mesh=args.with_mesh,
         source_path=dataset.source,
         generated_masks_dir=out_dir / args.generated_masks_dirname,
     )
@@ -741,18 +941,24 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path) -> 
 
 def main() -> None:
     args = parse_args()
-    cell_dirs = collect_cell_dirs(args.cell_dir)
-    batch = len(cell_dirs) > 1
+    cell_entries = collect_cell_dirs(args.cell_dir)
+    batch = len(cell_entries) > 1
     if batch:
-        print(f"Batch mode: {len(cell_dirs)} cell folders.", flush=True)
+        print(f"Batch mode: {len(cell_entries)} cell folders.", flush=True)
 
     out_dirs: list[Path] = []
-    for idx, cell_dir in enumerate(cell_dirs, start=1):
-        out_dir = args.out_dir if not batch else (args.out_dir / cell_dir.name)
+    for idx, (cell_dir, group_id) in enumerate(cell_entries, start=1):
+        if not batch:
+            out_dir = args.out_dir
+        elif group_id:
+            out_dir = args.out_dir / group_id / cell_dir.name
+        else:
+            out_dir = args.out_dir / cell_dir.name
         out_dir.mkdir(parents=True, exist_ok=True)
         out_dirs.append(out_dir)
-        print(f"===== [{idx}/{len(cell_dirs)}] {cell_dir.name} =====", flush=True)
-        run_single_cell(args, cell_dir, out_dir)
+        label = f"{group_id}/{cell_dir.name}" if group_id else cell_dir.name
+        print(f"===== [{idx}/{len(cell_entries)}] {label} =====", flush=True)
+        run_single_cell(args, cell_dir, out_dir, group_id=group_id)
 
     if batch:
         dfs = [pd.read_csv(od / "report.csv") for od in out_dirs if (od / "report.csv").exists()]
