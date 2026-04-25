@@ -168,7 +168,7 @@ function ensureScene() {
   })();
 }
 
-window.render3DScene = async function(rows, metricCol, colorBy) {
+window.render3DScene = async function(rows, metricCol, colorBy, maskRows) {
   ensureScene();
   clearMeshes(_S);
 
@@ -176,6 +176,8 @@ window.render3DScene = async function(rows, metricCol, colorBy) {
   const byCell   = colorBy === 'cell';
   const byGroup  = colorBy === 'group';
   const byMetric = !byEntity && !byCell && !byGroup;
+  const visibleEntities = new Set(rows.map(r => r.entity_name));
+  const singleEntity = byEntity && visibleEntities.size <= 1;
 
   const vals = byMetric ? rows.map(r => r[metricCol]).filter(v => v != null && isFinite(v)) : [];
   const minV = vals.length ? Math.min(...vals) : 0;
@@ -183,6 +185,7 @@ window.render3DScene = async function(rows, metricCol, colorBy) {
   const span = maxV > minV ? maxV - minV : 1;
   const legendEntries = {};
 
+  // ── Instance meshes (labels) ────────────────────────────────────────────
   const meshRows = rows.filter(r => r.mesh_b64);
   const geos = await Promise.all(meshRows.map(r => parseMeshB64(r.mesh_b64).catch(() => null)));
 
@@ -192,8 +195,8 @@ window.render3DScene = async function(rows, metricCol, colorBy) {
     const r = meshRows[i];
     let hex;
     if (byEntity) {
-      hex = window.entColor(r.entity_name);
-      legendEntries[r.entity_name] = hex;
+      hex = singleEntity ? '#eeeeee' : window.entColor(r.entity_name);
+      if (!singleEntity) legendEntries[r.entity_name] = hex;
     } else if (byCell) {
       hex = window.cellColor(r.cell_id || '');
       legendEntries[r.cell_id || '?'] = hex;
@@ -206,10 +209,26 @@ window.render3DScene = async function(rows, metricCol, colorBy) {
     }
     _S.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
       color: new THREE.Color(hex), side: THREE.DoubleSide,
-      transparent: true, opacity: 0.82, shininess: 25,
+      transparent: false, shininess: 25,
     })));
     count++;
   });
+
+  // ── Mask meshes (context surfaces) ─────────────────────────────────────
+  if (maskRows && maskRows.length) {
+    const maskGeos = await Promise.all(
+      maskRows.map(r => r.mesh_b64 ? parseMeshB64(r.mesh_b64).catch(() => null) : Promise.resolve(null))
+    );
+    maskGeos.forEach((geo, i) => {
+      if (!geo) return;
+      const r = maskRows[i];
+      _S.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+        color: new THREE.Color(window.entColor(r.entity_name) || '#aaa'),
+        side: THREE.DoubleSide,
+        transparent: true, opacity: 0.07, shininess: 5, depthWrite: false,
+      })));
+    });
+  }
 
   if (count) fitCamera(_S, _C, _O);
 
@@ -332,6 +351,13 @@ window.showMesh3D = function(b64, title) {
     </div>
     <select id="flt-cell"   class="form-select form-select-sm" style="width:auto"><option value="">All cells</option></select>
     <select id="flt-entity" class="form-select form-select-sm" style="width:auto"><option value="">All entities</option></select>
+    <div id="mesh-toggle-wrap" style="display:none;align-items:center;gap:.35rem" class="d-flex">
+      <span class="small" style="color:#a0a0c0;white-space:nowrap">View</span>
+      <div class="view-toggle">
+        <button id="btn-thumbnails" class="vt-active" onclick="setMeshMode(false)">Thumbnails</button>
+        <button id="btn-meshes" onclick="setMeshMode(true)">3D Meshes</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -370,7 +396,7 @@ window.showMesh3D = function(b64, title) {
         <div style="max-height:400px;overflow-y:auto">
           <table class="table table-sm table-hover mb-0">
             <thead class="table-light sticky-top">
-              <tr><th>cell</th><th>entity</th><th>kind</th><th class="text-end">instances</th><th class="text-end">vol (&#956;m&#179;)</th><th class="text-end">size</th><th>modified</th></tr>
+              <tr><th>cell</th><th>entity</th><th>kind</th><th class="text-end">instances</th><th class="text-end">vol (μm³)</th><th class="text-end">area (μm²)</th><th class="text-end">sphericity</th><th class="text-end">aspect ratio</th><th class="text-end">size</th><th>modified</th></tr>
             </thead>
             <tbody id="file-table-body"></tbody>
           </table>
@@ -416,12 +442,6 @@ window.showMesh3D = function(b64, title) {
         </select>
       </div>
       <span id="v-count" class="small text-muted align-self-end pb-1"></span>
-      <div id="mesh-toggle-wrap" style="display:none" class="align-self-end mb-1">
-        <div class="view-toggle">
-          <button id="btn-thumbnails" class="vt-active" onclick="setMeshMode(false)">Thumbnails</button>
-          <button id="btn-meshes" onclick="setMeshMode(true)">3D Meshes</button>
-        </div>
-      </div>
     </div>
     <div id="thumb-grid" class="thumb-grid"></div>
   </div>
@@ -483,7 +503,7 @@ var _viewerInited = false;
 var _currentSample = [];
 
 // Color caches
-var _cellPal = null, _entPal = null;
+var _cellPal = null, _entPal = null, _grpPal = null;
 function cellPalette() {
   if (!_cellPal) {
     var cs = uniq(ALL.map(function(r){ return r.cell_id; }).filter(Boolean));
@@ -493,17 +513,29 @@ function cellPalette() {
   }
   return _cellPal;
 }
+var _ENT_COLORS = ['#FF8080','#80AAFF','#80DD99','#FFB366','#CC88FF','#FF88BB','#66DDCC','#AABB55','#FFD966','#FF99EE'];
 function entPalette() {
   if (!_entPal) {
     var es = uniq(ALL.map(function(r){ return r.entity_name; }));
-    var p = chroma.scale('Paired').colors(Math.max(es.length, 3));
     _entPal = {};
-    es.forEach(function(e,i){ _entPal[e] = p[i % p.length]; });
+    es.forEach(function(e,i){ _entPal[e] = _ENT_COLORS[i % _ENT_COLORS.length]; });
   }
   return _entPal;
 }
-function cellColor(c){ return (cellPalette()[c] || '#aaa'); }
-function entColor(e) { return (entPalette()[e]  || '#aaa'); }
+function groupPalette() {
+  if (!_grpPal) {
+    var gs = uniq(ALL.map(function(r){ return r.group_id; }).filter(Boolean));
+    var p = chroma.scale('Dark2').colors(Math.max(gs.length, 3));
+    _grpPal = {};
+    gs.forEach(function(g,i){ _grpPal[g] = p[i % p.length]; });
+  }
+  return _grpPal;
+}
+function cellColor(c)  { return (cellPalette()[c]  || '#aaa'); }
+function entColor(e)   { return (entPalette()[e]   || '#aaa'); }
+function groupColor(g) { return (groupPalette()[g] || '#aaa'); }
+// Returns the right color for the current plot-grouping key value
+function gColor(g) { return plotGroupBy === 'group' ? groupColor(g) : cellColor(g); }
 
 // ══════════════════════════════════════════════════════════════
 //  File loading
@@ -522,7 +554,7 @@ function loadFile(file) {
   reader.onload = function(e) {
     var res = Papa.parse(e.target.result, { header:true, dynamicTyping:true, skipEmptyLines:true });
     ALL = res.data; COLS = res.meta.fields || [];
-    _cellPal = null; _entPal = null; _viewerInited = false; _c3dInited = false;
+    _cellPal = null; _entPal = null; _grpPal = null; _viewerInited = false; _c3dInited = false;
     st.group = ''; st.cell = ''; st.entity = '';
     vSt.meshMode = false;
     onLoaded();
@@ -670,35 +702,46 @@ function renderOverview() {
   if(!entNames.length) return;
   var volEl = document.createElement('div');
   volContainer.appendChild(volEl);
-  var volTraces;
-  if(allCells.length > 1) {
+  var ovGroups = uniq(allFileRows.map(function(r){ return r.group_id; }).filter(Boolean));
+  var byGroup  = plotGroupBy === 'group' && ovGroups.length > 1;
+  var volTraces, volLayout;
+  if (byGroup) {
+    // Box plots showing distribution of per-cell volumes across cells in each group
+    volTraces = ovGroups.map(function(g){
+      var xs = [], ys = [];
+      entNames.forEach(function(e){
+        fileRows.filter(function(r){ return r.group_id===g && r.entity_name===e && r.total_volume_um3!=null; })
+          .forEach(function(r){ xs.push(e); ys.push(r.total_volume_um3); });
+      });
+      return { type:'box', name:g, x:xs, y:ys, marker:{color:groupColor(g)},
+               boxpoints:'all', jitter:0.4, pointpos:0 };
+    });
+    volLayout = { boxmode:'group', margin:{l:65,r:15,t:10,b:80}, height:260,
+      xaxis:{tickangle:-30}, yaxis:{title:'vol per cell (μm³)'},
+      showlegend:true, legend:{orientation:'h', y:-0.38, font:{size:8}}, font:{size:9} };
+  } else if (allCells.length > 1) {
     volTraces = allCells.map(function(c){
       return { type:'bar', name:c, marker:{color:cellColor(c)},
         x: entNames,
         y: entNames.map(function(e){
           var r = fileRows.find(function(r){ return r.cell_id===c && r.entity_name===e; });
           return r && r.total_volume_um3 != null ? r.total_volume_um3 : 0;
-        })
-      };
+        }) };
     });
+    volLayout = { barmode:'group', margin:{l:65,r:15,t:10,b:80}, height:260,
+      xaxis:{tickangle:-30}, yaxis:{title:'total vol (μm³)'},
+      showlegend:true, legend:{orientation:'h', y:-0.38, font:{size:8}}, font:{size:9} };
   } else {
-    volTraces = [{ type:'bar',
-      x: entNames,
-      y: entNames.map(function(e){
+    volTraces = [{ type:'bar', x:entNames, marker:{color:entNames.map(entColor)},
+      y:entNames.map(function(e){
         var r = fileRows.find(function(r){ return r.entity_name===e; });
         return r && r.total_volume_um3 != null ? r.total_volume_um3 : 0;
-      }),
-      marker:{ color: entNames.map(function(e){ return entColor(e); }) }
-    }];
+      }) }];
+    volLayout = { barmode:'group', margin:{l:65,r:15,t:10,b:80}, height:260,
+      xaxis:{tickangle:-30}, yaxis:{title:'total vol (μm³)'},
+      showlegend:false, font:{size:9} };
   }
-  Plotly.newPlot(volEl, volTraces, {
-    barmode:'group',
-    margin:{l:65,r:15,t:10,b:80}, height:260,
-    xaxis:{tickangle:-30}, yaxis:{title:'total vol (μm³)'},
-    showlegend: allCells.length > 1,
-    legend:{orientation:'h', y:-0.38, font:{size:8}},
-    font:{size:9},
-  },{responsive:true, displayModeBar:false});
+  Plotly.newPlot(volEl, volTraces, volLayout, {responsive:true, displayModeBar:false});
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -707,31 +750,58 @@ function renderOverview() {
 function renderStructure() {
   var fileRows = filtered('file');
 
-  // Sunburst
-  var ids=['__root__'], lbls=['all'], parents=[''], vals=[0];
-  var seenCells = new Set();
+  // Sunburst — add group level when grouping by group
+  var sbGroups = uniq(fileRows.filter(function(r){ return r.group_id; }).map(function(r){ return r.group_id; }));
+  var sbByGroup = plotGroupBy === 'group' && sbGroups.length > 1;
+  var ids=['__root__'], lbls=['all'], parents=[''], vals=[0], colors=['rgba(0,0,0,0)'];
+  var seenGroups = new Set(), seenCells = new Set();
   fileRows.filter(function(r){ return r.entity_kind!=='source'; }).forEach(function(r){
     var cid = r.cell_id||'__nocell__';
-    if(!seenCells.has(cid)){ seenCells.add(cid); ids.push(cid); lbls.push(cid||'(no cell)'); parents.push('__root__'); vals.push(0); }
-    var k=cid+'/'+r.entity_name; ids.push(k); lbls.push(r.entity_name); parents.push(cid); vals.push(r.file_size_bytes||0);
+    var gid = r.group_id||'';
+    if (sbByGroup && gid) {
+      if (!seenGroups.has(gid)) {
+        seenGroups.add(gid);
+        ids.push('g:'+gid); lbls.push(gid); parents.push('__root__'); vals.push(0);
+        colors.push(groupColor(gid));
+      }
+      if (!seenCells.has(cid)) {
+        seenCells.add(cid);
+        ids.push(cid); lbls.push(cid||'(no cell)'); parents.push('g:'+gid); vals.push(0);
+        colors.push(chroma(groupColor(gid)).brighten(1).hex());
+      }
+    } else {
+      if (!seenCells.has(cid)) {
+        seenCells.add(cid);
+        ids.push(cid); lbls.push(cid||'(no cell)'); parents.push('__root__'); vals.push(0);
+        colors.push(cellColor(cid));
+      }
+    }
+    var k=cid+'/'+r.entity_name; ids.push(k); lbls.push(r.entity_name); parents.push(cid);
+    vals.push(r.file_size_bytes||0);
+    colors.push(entColor(r.entity_name));
   });
   Plotly.react('sunburst-chart',[{
     type:'sunburst', ids:ids, labels:lbls, parents:parents, values:vals, branchvalues:'remainder',
+    marker:{colors:colors},
     hovertemplate:'<b>%{label}</b><br>%{customdata}<extra></extra>',
     customdata: vals.map(function(v){ return v ? (v/1e6).toFixed(2)+' MB' : ''; }),
   }],{margin:{l:0,r:0,t:5,b:5},height:430},{responsive:true});
 
-  // File table
+  // File table — group colored dot in cell column
   document.getElementById('file-table-body').innerHTML = fileRows.slice()
-    .sort(function(a,b){ return (a.cell_id||'').localeCompare(b.cell_id||'') || a.entity_name.localeCompare(b.entity_name); })
+    .sort(function(a,b){ return (a.group_id||'').localeCompare(b.group_id||'') || (a.cell_id||'').localeCompare(b.cell_id||'') || a.entity_name.localeCompare(b.entity_name); })
     .map(function(r){
       var sz = r.file_size_bytes ? (r.file_size_bytes/1e6).toFixed(2)+' MB' : '';
       var mt = r.file_mtime ? r.file_mtime.slice(0,16).replace('T',' ') : '';
       var kindMap = {source:'bg-secondary', mask:'bg-info text-dark', label:'bg-primary'};
       var badge = '<span class="badge '+(kindMap[r.entity_kind]||'bg-light text-dark')+' rounded-pill">'+r.entity_kind+'</span>';
-      return '<tr><td>'+(r.cell_id||'')+'</td><td>'+r.entity_name+'</td><td>'+badge+'</td>'
+      var grpDot = r.group_id ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+groupColor(r.group_id)+';margin-right:4px;flex-shrink:0"></span>' : '';
+      return '<tr><td style="display:flex;align-items:center">'+grpDot+(r.cell_id||'')+'</td><td>'+r.entity_name+'</td><td>'+badge+'</td>'
         +'<td class="text-end">'+(r.instance_count!=null?r.instance_count.toLocaleString():'')+'</td>'
         +'<td class="text-end">'+(r.total_volume_um3!=null?(+r.total_volume_um3).toFixed(1):'')+'</td>'
+        +'<td class="text-end">'+(r.surface_area_um2!=null?(+r.surface_area_um2).toFixed(1):'')+'</td>'
+        +'<td class="text-end">'+(r.sphericity!=null?(+r.sphericity).toFixed(3):'')+'</td>'
+        +'<td class="text-end">'+(r.aspect_ratio_major_minor!=null?(+r.aspect_ratio_major_minor).toFixed(2):'')+'</td>'
         +'<td class="text-end">'+sz+'</td><td class="text-muted small">'+mt+'</td></tr>';
     }).join('');
 }
@@ -750,8 +820,6 @@ function renderEntityStats() {
   var gKey = plotGroupBy === 'group' ? 'group_id' : 'cell_id';
   var allGroups = uniq(instRows.map(function(r){ return r[gKey]; }).filter(Boolean));
   var multiGroup = allGroups.length > 1;
-
-  function gColor(g) { return cellColor(g); }
 
   // Label entities where every group member has ≤1 instance are shown as bars
   var allLabelFileRows = ALL.filter(function(r){ return r.row_type==='file' && r.entity_kind==='label'; });
@@ -816,95 +884,56 @@ function renderEntityStats() {
       }, {responsive:true, displayModeBar:false});
     });
 
-    // ── Distance charts ────────────────────────────────────
+    // ── Distance charts — one plot per target component ────
     var dCols = distCols(rows);
     if (!dCols.length) return;
     var dcEl = block.querySelector('#dc-'+ent);
 
-    // When grouping by group (or multiple groups), one compact plot per component
-    var separateDist = multiGroup && plotGroupBy === 'group';
-
-    if (separateDist) {
-      dCols.forEach(function(col) {
-        var el = document.createElement('div');
-        el.className = 'chart-cell'; el.style.width = '200px';
-        dcEl.appendChild(el);
-        var lbl = col.replace(/^distance_to_/,'').replace(/_label_/,' ').replace(/_um$/,'').replace(/_/g,' ');
-        var traces;
-        if (isSingle) {
-          traces = [{ type:'bar', x:allGroups, showlegend:false,
-            marker:{color:allGroups.map(gColor)},
-            y:allGroups.map(function(g){
-              var r = rows.find(function(r){ return r[gKey]===g; });
-              return r && r[col] != null ? r[col] : null;
-            }) }];
+    dCols.forEach(function(col) {
+      var el = document.createElement('div');
+      el.className = 'chart-cell'; el.style.width = '250px';
+      dcEl.appendChild(el);
+      var lbl = col.replace(/^distance_to_/,'').replace(/_label_/,' ').replace(/_um$/,'').replace(/_/g,' ');
+      var traces;
+      if (isSingle) {
+        // One value per group/cell → bar
+        if (multiGroup) {
+          traces = allGroups.map(function(g){
+            var r = rows.find(function(r){ return r[gKey]===g; });
+            return { type:'bar', name:g, x:[g], marker:{color:gColor(g)},
+              y:[r && r[col]!=null ? r[col] : null] };
+          });
         } else {
+          traces = [{ type:'bar', x:allGroups.length ? allGroups : [ent], showlegend:false,
+            marker:{color:color},
+            y:(allGroups.length ? allGroups : [null]).map(function(g){
+              var r = g ? rows.find(function(r){ return r[gKey]===g; }) : rows[0];
+              return r && r[col]!=null ? r[col] : null;
+            }) }];
+        }
+        Plotly.newPlot(el, traces, {
+          barmode:'group', margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
+          title:{text:lbl, font:{size:10}}, yaxis:{title:'μm'},
+          showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
+        }, {responsive:true, displayModeBar:false});
+      } else {
+        // Distribution → box plot per group/cell
+        if (multiGroup) {
           traces = allGroups.map(function(g){
             var ys = rows.filter(function(r){ return r[gKey]===g && r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
             return { type:'box', name:g, y:ys, boxpoints:false, marker:{color:gColor(g)} };
           });
+        } else {
+          var ys = rows.filter(function(r){ return r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
+          traces = [{ type:'box', name:ent, y:ys, boxpoints:'suspectedoutliers', marker:{color:color} }];
         }
         Plotly.newPlot(el, traces, {
-          margin:{l:50,r:5,t:28,b:30}, height:210, font:{size:9},
-          title:{text:lbl, font:{size:10}},
-          yaxis:{title:'μm'}, showlegend:false,
-        }, {responsive:true, displayModeBar:false});
-      });
-    } else {
-      // Combined chart: all components on x-axis, one trace per group
-      var distEl = document.createElement('div');
-      distEl.className = 'chart-cell';
-      distEl.style.cssText = 'width:500px;max-width:100%';
-      dcEl.appendChild(distEl);
-      var distTraces;
-      if (isSingle) {
-        var xLabels = dCols.map(function(c){ return c.replace('distance_to_','').replace('_um',''); });
-        if (multiGroup) {
-          distTraces = allGroups.map(function(g){
-            var gr = rows.find(function(r){ return r[gKey]===g; });
-            return { type:'bar', name:g, x:xLabels, marker:{color:gColor(g)},
-              y:dCols.map(function(col){ return gr && gr[col]!=null ? gr[col] : null; }) };
-          });
-        } else {
-          distTraces = [{ type:'bar', x:xLabels, showlegend:false, marker:{color:color},
-            y:dCols.map(function(col){ var r=rows[0]; return r && r[col]!=null ? r[col] : null; }) }];
-        }
-        Plotly.newPlot(distEl, distTraces, {
-          barmode:'group', margin:{l:65,r:10,t:28,b:80}, height:260,
-          title:{text:'Min distance to other components (μm)', font:{size:10}},
-          xaxis:{tickangle:-30}, yaxis:{title:'dist (μm)'},
-          showlegend:multiGroup, legend:{orientation:'h', y:-0.38, font:{size:8}},
-        }, {responsive:true, displayModeBar:false});
-      } else {
-        if (multiGroup) {
-          distTraces = allGroups.map(function(g){
-            var xs = [], ys = [];
-            dCols.forEach(function(col){
-              var lbl = col.replace('distance_to_','').replace('_um','');
-              rows.filter(function(r){ return r[gKey]===g; }).forEach(function(r){
-                if (r[col]!=null && isFinite(r[col])){ xs.push(lbl); ys.push(r[col]); }
-              });
-            });
-            return { type:'box', name:g, x:xs, y:ys, boxpoints:false, marker:{color:gColor(g)} };
-          });
-        } else {
-          var xs = [], ys = [];
-          dCols.forEach(function(col){
-            var lbl = col.replace('distance_to_','').replace('_um','');
-            rows.forEach(function(r){
-              if (r[col]!=null && isFinite(r[col])){ xs.push(lbl); ys.push(r[col]); }
-            });
-          });
-          distTraces = [{ type:'box', name:ent, x:xs, y:ys, boxpoints:'suspectedoutliers', marker:{color:color} }];
-        }
-        Plotly.newPlot(distEl, distTraces, {
-          boxmode:'group', margin:{l:65,r:10,t:28,b:80}, height:260,
-          title:{text:'Min distance to other components (μm)', font:{size:10}},
-          xaxis:{tickangle:-30}, yaxis:{title:'dist (μm)'},
-          showlegend:multiGroup, legend:{orientation:'h', y:-0.38, font:{size:8}},
+          margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
+          title:{text:lbl, font:{size:10}}, yaxis:{title:'μm'},
+          showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
         }, {responsive:true, displayModeBar:false});
       }
-    }
+    });
   });
 
   // ── Mask entities ─────────────────────────────────────────
@@ -919,18 +948,41 @@ function renderEntityStats() {
     container.appendChild(block);
     if (!mRows.length) return;
     var mkEl = block.querySelector('#mk-'+ent);
-    var volEl = document.createElement('div');
-    volEl.className = 'chart-cell'; volEl.style.width = '320px';
-    mkEl.appendChild(volEl);
-    var vx = mRows.map(function(r){ return r[gKey]||'?'; });
-    Plotly.newPlot(volEl, [{
-      type:'bar', x:vx, y:mRows.map(function(r){ return r.total_volume_um3; }),
-      marker:{color:vx.map(gColor)},
-    }], {
-      margin:{l:70,r:10,t:28,b:60}, height:220,
-      title:{text:'Volume (μm³)', font:{size:10}},
-      yaxis:{title:'μm³'}, showlegend:false,
-    }, {responsive:true, displayModeBar:false});
+
+    var maskMetrics = [
+      { col:'total_volume_um3',        label:'Volume (μm³)',    unit:'μm³',  fmt:function(v){return(+v).toFixed(1);} },
+      { col:'surface_area_um2',        label:'Surface area (μm²)', unit:'μm²', fmt:function(v){return(+v).toFixed(1);} },
+      { col:'sphericity',              label:'Sphericity',      unit:'',     fmt:function(v){return(+v).toFixed(3);} },
+      { col:'aspect_ratio_major_minor',label:'Aspect ratio',    unit:'',     fmt:function(v){return(+v).toFixed(2);} },
+    ];
+
+    maskMetrics.forEach(function(m) {
+      var hasData = mRows.some(function(r){ return r[m.col]!=null && isFinite(+r[m.col]); });
+      if (!hasData) return;
+      var el = document.createElement('div');
+      el.className = 'chart-cell'; el.style.width = '280px';
+      mkEl.appendChild(el);
+      var traces, layout;
+      if (multiGroup) {
+        traces = allGroups.map(function(g){
+          var ys = mRows.filter(function(r){ return r[gKey]===g && r[m.col]!=null; })
+                        .map(function(r){ return +r[m.col]; });
+          return { type:'box', name:g, y:ys, marker:{color:gColor(g)},
+                   boxpoints:'all', jitter:0.4, pointpos:0 };
+        });
+        layout = { margin:{l:70,r:10,t:28,b:40}, height:230,
+          title:{text:m.label, font:{size:10}},
+          yaxis:{title:m.unit||null}, showlegend:false };
+      } else {
+        var vx = mRows.map(function(r){ return r[gKey]||'?'; });
+        traces = [{ type:'bar', x:vx, y:mRows.map(function(r){ return r[m.col]!=null?+r[m.col]:null; }),
+          marker:{color:vx.map(gColor)} }];
+        layout = { margin:{l:70,r:10,t:28,b:60}, height:220,
+          title:{text:m.label, font:{size:10}},
+          yaxis:{title:m.unit||null}, showlegend:false };
+      }
+      Plotly.newPlot(el, traces, layout, {responsive:true, displayModeBar:false});
+    });
   });
 
   if (!labelEnts.length && !maskEnts.length) {
@@ -1067,15 +1119,21 @@ function initCell3D() {
 }
 
 function renderCell3D() {
-  var cellId   = document.getElementById('c3d-cell').value;
-  var colorBy  = document.getElementById('c3d-color').value;
+  var cellId    = document.getElementById('c3d-cell').value;
+  var colorBy   = document.getElementById('c3d-color').value;
   var metricCol = document.getElementById('c3d-metric').value || 'volume_um3';
-  var rows = ALL.filter(function(r){
+  var instRows = ALL.filter(function(r){
     return r.row_type==='instance' && r.entity_kind==='label' && r.cell_id===cellId && r.mesh_b64
       && (!st.entity || r.entity_name === st.entity);
   });
-  document.getElementById('c3d-count').textContent = rows.length+' instances';
-  if (typeof window.render3DScene === 'function') window.render3DScene(rows, metricCol, colorBy);
+  var maskRows = ALL.filter(function(r){
+    return r.row_type==='file' && r.entity_kind==='mask' && r.cell_id===cellId && r.mesh_b64
+      && (!st.entity || r.entity_name === st.entity);
+  });
+  document.getElementById('c3d-count').textContent =
+    instRows.length + ' instances · ' + maskRows.length + ' masks';
+  if (typeof window.render3DScene === 'function')
+    window.render3DScene(instRows, metricCol, colorBy, maskRows);
 }
 
 // Click-to-3D on individual thumbnails

@@ -66,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-threads", type=int, default=0)
     parser.add_argument("--skip-plots", action="store_true", help="Skip thumbnail generation (faster processing).")
     parser.add_argument("--with-mesh", action="store_true", help="Generate 3D mesh (marching cubes) per instance for the interactive 3D viewer.")
+    parser.add_argument("--mesh-smooth-sigma", type=float, default=0.7, metavar="SIGMA", help="Gaussian sigma for mesh smoothing before marching cubes (default: 0.7). Set to 0 to disable.")
+    parser.add_argument("--mesh-step-size", type=int, default=2, metavar="N", help="Marching cubes step size — controls mesh resolution (default: 2). 1 = full resolution, higher = coarser.")
+    parser.add_argument("--mesh-target-reduction", type=float, default=0.8, metavar="F", help="QEM decimation target reduction fraction (default: 0.8 = keep 20%% of faces). Set to 0 to disable.")
+    parser.add_argument("--mesh-level", type=float, default=None, metavar="L", help="Marching cubes iso-surface level (default: 0.25 with smoothing, 0.5 without). Lower values capture finer structures.")
     parser.add_argument("--force-reprocess", action="store_true", help="Re-process cells even if report.csv already exists.")
     parser.add_argument(
         "--max-skeleton-voxels",
@@ -463,13 +467,36 @@ def _thumbnail_b64(binary: np.ndarray, rgb: Tuple[float, float, float], size: in
     return _to_png_b64(square)
 
 
+def _mesh_sigma_for_shape(sphericity: float, fill_ratio: float,
+                          sigma_min: float = 0.3, sigma_max: float = 1.5) -> float:
+    """Choose Gaussian sigma based on shape: blobs get more smoothing, thin structures less.
+
+    Uses two complementary metrics:
+    - sphericity [0,1]: how sphere-like the shape is (surface/volume ratio)
+    - fill_ratio [0,1]: voxels / bbox_voxels — how densely the shape fills its
+      bounding box. Captures curved filaments that fold back on themselves and
+      therefore appear compact in PCA but are actually sparse.
+
+    Falls back to the midpoint when metrics are NaN.
+    """
+    _SPHERE_FILL = math.pi / 6.0  # theoretical fill ratio of a perfect sphere (~0.524)
+    if math.isnan(sphericity) or math.isnan(fill_ratio):
+        return (sigma_min + sigma_max) / 2.0
+    fill_score = min(1.0, fill_ratio / _SPHERE_FILL)
+    blob_score = math.sqrt(sphericity * fill_score)  # geometric mean of both
+    return sigma_min + (sigma_max - sigma_min) * blob_score
+
+
 def _generate_mesh_b64(
     binary: np.ndarray,
     bbox_origin_zyx: Tuple[int, int, int],
     voxel_size_zyx: Tuple[float, float, float],
     step_size: int = 2,
+    smooth_sigma: float = 0.7,
+    target_reduction: float = 0.8,
+    level: float | None = None,
 ) -> str:
-    """Mesh a (Z,Y,X) binary mask via marching cubes on a Gaussian-smoothed volume.
+    """Mesh a (Z,Y,X) binary mask via marching cubes.
 
     Binary payload (gzip-compressed, then base64):
       [uint32 nV][uint32 nF]
@@ -480,14 +507,13 @@ def _generate_mesh_b64(
     if binary.sum() < 8:
         return ""
     try:
-        # 1-voxel pad so marching cubes sees closed surfaces at every boundary,
-        # then Gaussian blur to smooth staircase artefacts.
-        # sigma=0.7 smooths steps without over-blurring thin (1-2 voxel) structures.
-        # level=0.25: after blur a 1-voxel-wide structure peaks well below 0.5,
-        # so 0.5 would erase it; 0.25 captures fine filaments while still rejecting noise.
         padded = np.pad(binary.astype(np.float32), pad_width=1)
-        smoothed = gaussian_filter(padded, sigma=0.7)
-        verts, faces, _, _ = marching_cubes(smoothed, level=0.25, step_size=step_size)
+        if smooth_sigma > 0:
+            padded = gaussian_filter(padded, sigma=smooth_sigma)
+            iso_level = level if level is not None else 0.25
+        else:
+            iso_level = level if level is not None else 0.5
+        verts, faces, _, _ = marching_cubes(padded, level=iso_level, step_size=step_size)
         verts = verts - 1.0  # undo padding offset → local voxel coords
         oz, oy, ox = bbox_origin_zyx
         sz, sy, sx = voxel_size_zyx
@@ -497,10 +523,9 @@ def _generate_mesh_b64(
             (verts[:, 1] + oy) * sy,
             (verts[:, 0] + oz) * sz,
         ]).astype(np.float32)
-        # QEM decimation — reduce faces by ~80 % while preserving shape
-        if len(faces) > 100:
+        if target_reduction > 0 and len(faces) > 100:
             verts_xyz, faces_s = fast_simplification.simplify(
-                verts_xyz, faces.astype(int), target_reduction=0.8, verbose=False,
+                verts_xyz, faces.astype(int), target_reduction=target_reduction, verbose=False,
             )
             verts_xyz = verts_xyz.astype(np.float32)
             faces = faces_s
@@ -554,12 +579,11 @@ def load_or_generate_masks(
     membrane_key: str,
     auto_clip: bool,
 ) -> Dict[str, np.ndarray]:
-    """Return per-entity volumes, auto-promoting multi-component masks to label entities.
+    """Load or cache per-entity volumes after membrane clipping.
 
-    For every non-membrane mask with >1 connected component, connected-component
-    analysis is run and the result is stored in the cache as int32 labels.  On the
-    next run the cache detects stored labels via max > 1 and skips recomputation.
-    Single-component masks are stored as binary uint8 and kept as masks.
+    CCA-based promotion of multi-component masks to label entities happens
+    separately, after cropping to the cell bounding box, via
+    promote_multicomponent_masks().
     """
     generated_masks_dir.mkdir(parents=True, exist_ok=True)
     cached_paths = {key: generated_masks_dir / entity.path.name for key, entity in dataset.entities.items()}
@@ -567,70 +591,58 @@ def load_or_generate_masks(
 
     if all_cached:
         print(f"Generated masks cache hit — loading from {generated_masks_dir.name}/", flush=True)
-        volumes = {key: load_volume(path) for key, path in cached_paths.items()}
-    else:
-        print("Generated masks cache miss — loading originals...", flush=True)
-        volumes = load_entity_volumes(dataset)
-        apply_membrane_clipping(volumes, membrane_key, auto_clip)
+        return {key: load_volume(path) for key, path in cached_paths.items()}
 
-    # Auto-promote multi-component masks to label entities.
-    # Cache stores int32 CC labels when n>1, uint8 binary when n==1;
-    # on cache-hit, max>1 signals that labels were previously detected.
-    cc_struct = np.ones((3, 3, 3), dtype=np.uint8)
-    for key in list(volumes.keys()):
-        entity = dataset.entities[key]
-        if entity.kind != "mask" or key == membrane_key:
-            if not all_cached and entity.kind == "label":
-                # Write original label entity to cache
-                path = cached_paths.get(key)
-                if path and not path.exists():
-                    tifffile.imwrite(path, volumes[key], compression="zlib")
+    print("Generated masks cache miss — loading originals...", flush=True)
+    volumes = load_entity_volumes(dataset)
+    apply_membrane_clipping(volumes, membrane_key, auto_clip)
+
+    for key, arr in volumes.items():
+        entity = dataset.entities.get(key)
+        if entity is None:
             continue
-
-        arr = volumes[key]
-        cache_path = cached_paths[key]
-
-        if all_cached and int(arr.max()) > 1:
-            # Cache already holds CC labels from a previous run
-            labeled, n = arr.astype(np.int32), int(arr.max())
-        else:
-            binary = arr > 0
-            if not binary.any():
-                if not all_cached:
-                    tifffile.imwrite(cache_path, binary.astype(np.uint8), compression="zlib")
-                continue
-            labeled, n = nd_label(binary, structure=cc_struct)
-            labeled = labeled.astype(np.int32)
-            if not all_cached:
-                out = labeled if n > 1 else binary.astype(np.uint8)
-                tifffile.imwrite(cache_path, out, compression="zlib")
-
-        if n <= 1:
-            continue
-
-        # Multi-component: promote to label entity.
-        # The mask key remains pointing to the CC array; build_distance_targets
-        # already applies > 0 on both mask and label volumes, so no explicit binary
-        # copy is needed.
-        label_key = f"label:{entity.name}"
-        volumes[label_key] = labeled
-        dataset.entities[label_key] = Entity(name=entity.name, kind="label", path=entity.path)
-        print(f"  Auto-label: '{entity.name}' — {n} components → label entity.", flush=True)
-
-    # Write cache for non-mask entities not yet written
-    if not all_cached:
-        for key, arr in volumes.items():
-            entity = dataset.entities.get(key)
-            if entity is None:
-                continue  # auto-added label keys share cache path with their mask
-            path = cached_paths.get(key)
-            if path and not path.exists():
-                out = arr if entity.kind == "label" else (arr > 0).astype(np.uint8)
-                tifffile.imwrite(path, out, compression="zlib")
-        print("Generated masks written.", flush=True)
+        path = cached_paths.get(key)
+        if path and not path.exists():
+            out = arr if entity.kind == "label" else (arr > 0).astype(np.uint8)
+            tifffile.imwrite(path, out, compression="zlib")
+    print("Generated masks written.", flush=True)
 
     return volumes
 
+
+def promote_multicomponent_masks(
+    volumes: Dict[str, np.ndarray],
+    dataset: Dataset,
+    membrane_key: str,
+) -> None:
+    """Promote masks with >1 connected component (in the cropped volume) to label entities.
+
+    Must be called after crop_to_membrane_bbox so the component count reflects
+    what is actually inside the cell, not the full image.
+    """
+    cc_struct = np.ones((3, 3, 3), dtype=np.uint8)
+    for key in list(volumes.keys()):
+        entity = dataset.entities[key]
+        if key == membrane_key:
+            continue
+        # Skip label entities that already have multiple distinct labels — already segmented.
+        if entity.kind == "label" and int(volumes[key].max()) > 1:
+            continue
+
+        binary = volumes[key] > 0
+        if not binary.any():
+            continue
+
+        labeled, n = nd_label(binary, structure=cc_struct)
+        if n <= 1:
+            continue
+
+        labeled = labeled.astype(np.int32)
+        label_key = f"label:{entity.name}"
+        volumes[label_key] = labeled
+        volumes[key] = labeled
+        dataset.entities[label_key] = Entity(name=entity.name, kind="label", path=entity.path)
+        print(f"  Auto-label: '{entity.name}' — {n} components → label entity.", flush=True)
 
 
 
@@ -739,6 +751,10 @@ def build_report_rows(
     voxel_um3: float,
     skip_thumbnails: bool = False,
     with_mesh: bool = False,
+    mesh_smooth_sigma: float = 0.7,
+    mesh_step_size: int = 2,
+    mesh_target_reduction: float = 0.8,
+    mesh_level: float | None = None,
     source_path: Path | None = None,
     generated_masks_dir: Path | None = None,
 ) -> list[dict]:
@@ -770,10 +786,46 @@ def build_report_rows(
 
     for mk in mask_keys:
         ent = entities[mk]
+        binary = (volumes[mk] > 0)
+        vol_um3 = float(binary.sum() * voxel_um3)
+        area_um2 = estimate_surface_area_um2(binary, voxel_size_zyx)
+        sph = sphericity(vol_um3, area_um2)
+        rps = regionprops(binary.astype(np.uint8))
+        if rps:
+            rp0 = rps[0]
+            coords = np.argwhere(binary)
+            ar = aspect_ratio_from_coords(coords, voxel_size_zyx)
+            bb = rp0.bbox
+            bb_vol = (bb[3]-bb[0]) * (bb[4]-bb[1]) * (bb[5]-bb[2])
+            fill_ratio = rp0.area / bb_vol if bb_vol > 0 else float("nan")
+        else:
+            ar = float("nan")
+            fill_ratio = float("nan")
+
+        mask_mesh_b64 = ""
+        if with_mesh:
+            print(f"  Generating mesh for mask '{ent.name}'...", flush=True)
+            mask_sigma = _mesh_sigma_for_shape(sph, fill_ratio,
+                                               sigma_min=0.3,
+                                               sigma_max=mesh_smooth_sigma * 2)
+            mask_mesh_b64 = _generate_mesh_b64(
+                binary.astype(bool),
+                bbox_origin_zyx=(0, 0, 0),
+                voxel_size_zyx=voxel_size_zyx,
+                smooth_sigma=mask_sigma,
+                step_size=mesh_step_size,
+                target_reduction=mesh_target_reduction,
+                level=mesh_level,
+            )
         rows.append({
             "cell_id": cell_id, "group_id": group_id, "entity_name": ent.name, "entity_kind": ent.kind,
             "row_type": "file", "label_id": None, "instance_count": None,
-            "total_volume_um3": float((volumes[mk] > 0).sum() * voxel_um3),
+            "total_volume_um3": vol_um3,
+            "volume_um3": vol_um3,
+            "surface_area_um2": area_um2,
+            "sphericity": sph,
+            "aspect_ratio_major_minor": ar,
+            "mesh_b64": mask_mesh_b64,
             **_file_meta(ent.path),
         })
 
@@ -813,10 +865,21 @@ def build_report_rows(
                 thumb_b64 = _thumbnail_b64(rp.image.astype(bool), (0.65, 0.65, 0.65))
             mesh_b64 = ""
             if lbl in mesh_ids and rp is not None:
+                bbox_vol = (rp.bbox[3]-rp.bbox[0]) * (rp.bbox[4]-rp.bbox[1]) * (rp.bbox[5]-rp.bbox[2])
+                fill_ratio = rp.area / bbox_vol if bbox_vol > 0 else float("nan")
+                sph = irow.get("sphericity", float("nan"))
+                sph = float(sph) if sph is not None and not math.isnan(float(sph)) else float("nan")
+                sigma = _mesh_sigma_for_shape(sph, fill_ratio,
+                                              sigma_min=0.3,
+                                              sigma_max=mesh_smooth_sigma * 2)
                 mesh_b64 = _generate_mesh_b64(
                     rp.image.astype(bool),
                     bbox_origin_zyx=(rp.bbox[0], rp.bbox[1], rp.bbox[2]),
                     voxel_size_zyx=voxel_size_zyx,
+                    smooth_sigma=sigma,
+                    step_size=mesh_step_size,
+                    target_reduction=mesh_target_reduction,
+                    level=mesh_level,
                 )
             row_dict: dict = {
                 "cell_id": cell_id, "group_id": group_id, "entity_name": ent.name, "entity_kind": ent.kind,
@@ -895,6 +958,7 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
     )
 
     volumes = crop_to_membrane_bbox(volumes, membrane_key)
+    promote_multicomponent_masks(volumes, dataset, membrane_key)
     voxel_um3 = float(np.prod(voxel_size_zyx))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -932,6 +996,10 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
         voxel_um3=voxel_um3,
         skip_thumbnails=args.skip_plots,
         with_mesh=args.with_mesh,
+        mesh_smooth_sigma=args.mesh_smooth_sigma,
+        mesh_step_size=args.mesh_step_size,
+        mesh_target_reduction=args.mesh_target_reduction,
+        mesh_level=args.mesh_level,
         source_path=dataset.source,
         generated_masks_dir=out_dir / args.generated_masks_dirname,
     )
