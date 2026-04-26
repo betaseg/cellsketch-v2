@@ -86,6 +86,15 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
         <div class="mt-2 fw-semibold fs-6">Drop <code>report.csv</code> here or click to browse</div>
         <span class="file-info"><i class="bi bi-shield-lock me-1"></i>Your data stays local, nothing is uploaded.</span>
       </div>
+      <div style="border-top:1px solid #ddd;margin-top:1.2rem;padding-top:1rem">
+        <div class="small text-muted mb-1">Or load from a URL</div>
+        <div class="d-flex gap-2">
+          <input type="url" id="url-input" class="form-control form-control-sm"
+                 placeholder="https://example.com/report.csv" style="font-size:.78rem">
+          <button class="btn btn-sm btn-outline-dark flex-shrink-0" id="url-load-btn">Load</button>
+        </div>
+        <div id="url-status" class="small mt-1" style="min-height:1.2em;color:#c00"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -201,18 +210,61 @@ var dz = document.getElementById('drop-zone');
 ['dragleave','drop'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.remove('drag-over'); }); });
 dz.addEventListener('drop', function(e){ if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
 
+function parseAndLoad(text, label) {
+  var res = Papa.parse(text, { header:true, dynamicTyping:true, skipEmptyLines:true });
+  ALL = res.data; COLS = res.meta.fields || [];
+  _cellPal = null; _entPal = null; _grpPal = null;
+  st.group = ''; st.cell = ''; st.entity = '';
+  document.getElementById('file-info').textContent = label;
+  onLoaded();
+}
+
 function loadFile(file) {
-  document.getElementById('file-info').textContent = file.name + ' (' + (file.size/1024).toFixed(0) + ' KB)';
   var reader = new FileReader();
   reader.onload = function(e) {
-    var res = Papa.parse(e.target.result, { header:true, dynamicTyping:true, skipEmptyLines:true });
-    ALL = res.data; COLS = res.meta.fields || [];
-    _cellPal = null; _entPal = null; _grpPal = null;
-    st.group = ''; st.cell = ''; st.entity = '';
-    onLoaded();
+    history.replaceState(null, '', window.location.pathname);
+    parseAndLoad(e.target.result, file.name + ' (' + (file.size/1024).toFixed(0) + ' KB)');
   };
   reader.readAsText(file);
 }
+
+function loadFromUrl(url) {
+  var status = document.getElementById('url-status');
+  status.textContent = 'Loading…';
+  status.style.color = '#555';
+  fetch(url)
+    .then(function(r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+      return r.text();
+    })
+    .then(function(text) {
+      status.textContent = '';
+      history.replaceState(null, '', '?data=' + encodeURIComponent(url));
+      parseAndLoad(text, url.split('/').pop() + ' (remote)');
+    })
+    .catch(function(err) {
+      status.style.color = '#c00';
+      status.textContent = 'Failed: ' + err.message + '. The server may not allow cross-origin requests.';
+    });
+}
+
+document.getElementById('url-load-btn').addEventListener('click', function() {
+  var url = document.getElementById('url-input').value.trim();
+  if (url) loadFromUrl(url);
+});
+document.getElementById('url-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { var url = this.value.trim(); if (url) loadFromUrl(url); }
+});
+
+// Auto-load from ?data= URL parameter
+(function() {
+  var params = new URLSearchParams(window.location.search);
+  var dataUrl = params.get('data');
+  if (dataUrl) {
+    document.getElementById('url-input').value = dataUrl;
+    loadFromUrl(dataUrl);
+  }
+})();
 
 function onLoaded() {
   document.getElementById('landing').classList.add('d-none');
