@@ -1,4 +1,4 @@
-# AlphaCells Spatial Analysis
+# CellSketch V2 - Cell Component Spatial Analysis
 
 Tools for 3D spatial analysis of segmented cell components. Given a set of TIFF label/mask volumes (one per structure), the pipeline computes per-instance morphology metrics and inter-component distances, and writes the results to CSV files that can be explored interactively.
 
