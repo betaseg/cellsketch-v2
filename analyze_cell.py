@@ -7,7 +7,6 @@
 #   "scipy>=1.13.0",
 #   "scikit-image>=0.23.0",
 #   "tifffile>=2024.5.0",
-#   "matplotlib>=3.9.0",
 #   "edt>=2.4.0",
 #   "fast-simplification>=0.1.6",
 # ]
@@ -18,8 +17,6 @@ from __future__ import annotations
 import argparse
 import base64
 import gzip
-import io
-import json
 import math
 import os
 import re
@@ -29,8 +26,6 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import edt
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tifffile
@@ -38,8 +33,6 @@ from scipy.ndimage import convolve, distance_transform_edt, gaussian_filter, lab
 import fast_simplification
 from skimage.measure import marching_cubes, regionprops
 from skimage.morphology import skeletonize
-
-matplotlib.use("Agg")
 
 
 @dataclass
@@ -62,10 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--voxel-size-um", default=None, help="Optional z,y,x um. If omitted, infer from source TIFF.")
     parser.add_argument("--auto-clip-to-pm", action="store_true")
-    parser.add_argument("--generated-masks-dirname", default="masks_for_analysis")
     parser.add_argument("--num-threads", type=int, default=0)
-    parser.add_argument("--skip-plots", action="store_true", help="Skip thumbnail generation (faster processing).")
-    parser.add_argument("--with-mesh", action="store_true", help="Generate 3D mesh (marching cubes) per instance for the interactive 3D viewer.")
+    parser.add_argument("--with-mesh", action="store_true", help="Generate a 3D mesh per instance (required for mesh_viewer.html and Blender export).")
     parser.add_argument("--mesh-smooth-sigma", type=float, default=0.7, metavar="SIGMA", help="Gaussian sigma for mesh smoothing before marching cubes (default: 0.7). Set to 0 to disable.")
     parser.add_argument("--mesh-step-size", type=int, default=2, metavar="N", help="Marching cubes step size — controls mesh resolution (default: 2). 1 = full resolution, higher = coarser.")
     parser.add_argument("--mesh-target-reduction", type=float, default=0.8, metavar="F", help="QEM decimation target reduction fraction (default: 0.8 = keep 20%% of faces). Set to 0 to disable.")
@@ -282,7 +273,10 @@ def aspect_ratio_from_coords(coords_zyx: np.ndarray, voxel_size_zyx: Tuple[float
     evals = np.linalg.eigvalsh(cov)
     evals = np.clip(evals, 0, None)
     lengths = np.sqrt(evals)
-    if lengths.min() <= 0:
+    # Return NaN when the smallest axis is negligible relative to the largest —
+    # happens for flat/planar structures (e.g. ER) where one PCA eigenvalue is
+    # near-zero due to floating point, not a true physical dimension.
+    if lengths.max() <= 0 or lengths.min() < lengths.max() * 1e-8:
         return float("nan")
     return float(lengths.max() / lengths.min())
 
@@ -399,74 +393,6 @@ def per_label_metrics(
 
 
 
-def _render_depth_shaded(binary: np.ndarray, rgb: Tuple[float, float, float]) -> np.ndarray:
-    """
-    Project a (Z,Y,X) binary volume along Z and shade by surface depth.
-    Returns an (Y, X, 4) uint8 RGBA image.
-    """
-    occupied = binary.any(axis=0)  # (Y, X)
-    if not occupied.any():
-        return np.zeros((binary.shape[1], binary.shape[2], 4), dtype=np.uint8)
-
-    depth = binary.argmax(axis=0).astype(float)
-    depth[~occupied] = float(np.nanmean(depth[occupied]))
-
-    if binary.shape[1] < 2 or binary.shape[2] < 2:
-        shading = np.where(occupied, 0.85, 0.0)
-        r, g, b = rgb
-        img = np.zeros((binary.shape[1], binary.shape[2], 4), dtype=np.float32)
-        img[occupied, 0] = np.clip(r * shading[occupied], 0.0, 1.0)
-        img[occupied, 1] = np.clip(g * shading[occupied], 0.0, 1.0)
-        img[occupied, 2] = np.clip(b * shading[occupied], 0.0, 1.0)
-        img[occupied, 3] = 1.0
-        return (img * 255).astype(np.uint8)
-
-    sigma = float(np.clip(min(binary.shape[1], binary.shape[2]) * 0.04, 0.5, 3.0))
-    depth_s = gaussian_filter(depth, sigma=sigma)
-
-    gy, gx = np.gradient(depth_s)
-    norm_len = np.sqrt(gx**2 + gy**2 + 1.0)
-    # light from upper-left, elevated ~45°
-    lx, ly, lz = -0.5, -0.5, 1.0
-    llen = math.sqrt(lx**2 + ly**2 + lz**2)
-    diffuse = np.clip((-gx * lx - gy * ly + lz) / (norm_len * llen), 0.0, 1.0)
-    shading = 0.25 + 0.75 * diffuse
-
-    r, g, b = rgb
-    img = np.zeros((binary.shape[1], binary.shape[2], 4), dtype=np.float32)
-    img[occupied, 0] = np.clip(r * shading[occupied], 0.0, 1.0)
-    img[occupied, 1] = np.clip(g * shading[occupied], 0.0, 1.0)
-    img[occupied, 2] = np.clip(b * shading[occupied], 0.0, 1.0)
-    img[occupied, 3] = 1.0
-    return (img * 255).astype(np.uint8)
-
-
-
-
-def _to_png_b64(rgba: np.ndarray) -> str:
-    buf = io.BytesIO()
-    plt.imsave(buf, rgba.astype(np.float32) / 255.0, format="png")
-    return base64.b64encode(buf.getvalue()).decode()
-
-
-def _thumbnail_b64(binary: np.ndarray, rgb: Tuple[float, float, float], size: int = 64) -> str:
-    arr = _render_depth_shaded(binary, rgb)  # (H, W, 4) uint8
-    H, W = arr.shape[:2]
-    if H == 0 or W == 0:
-        return ""
-    scale = size / max(H, W)
-    nH = max(1, round(H * scale))
-    nW = max(1, round(W * scale))
-    ri = (np.arange(nH) * H / nH).astype(int)
-    ci = (np.arange(nW) * W / nW).astype(int)
-    resized = arr[np.ix_(ri, ci)]
-    square = np.zeros((size, size, 4), dtype=np.uint8)
-    y0 = (size - nH) // 2
-    x0 = (size - nW) // 2
-    square[y0:y0 + nH, x0:x0 + nW] = resized
-    return _to_png_b64(square)
-
-
 def _mesh_sigma_for_shape(sphericity: float, fill_ratio: float,
                           sigma_min: float = 0.3, sigma_max: float = 1.5) -> float:
     """Choose Gaussian sigma based on shape: blobs get more smoothing, thin structures less.
@@ -540,7 +466,7 @@ def _generate_mesh_b64(
         quant_params = np.concatenate([min_xyz, scale_xyz]).astype(np.float32)
         header = np.array([len(verts_xyz), len(faces32)], dtype=np.uint32)
         payload = header.tobytes() + quant_params.tobytes() + verts_q.tobytes() + faces32.tobytes()
-        return base64.b64encode(gzip.compress(payload, compresslevel=6)).decode()
+        return base64.b64encode(gzip.compress(payload, compresslevel=9)).decode()
     except Exception:
         return ""
 
@@ -638,10 +564,8 @@ def promote_multicomponent_masks(
             continue
 
         labeled = labeled.astype(np.int32)
-        label_key = f"label:{entity.name}"
-        volumes[label_key] = labeled
         volumes[key] = labeled
-        dataset.entities[label_key] = Entity(name=entity.name, kind="label", path=entity.path)
+        dataset.entities[key] = Entity(name=entity.name, kind="label", path=entity.path)
         print(f"  Auto-label: '{entity.name}' — {n} components → label entity.", flush=True)
 
 
@@ -749,7 +673,6 @@ def build_report_rows(
     label_dfs: Dict[str, pd.DataFrame],
     voxel_size_zyx: Tuple[float, float, float],
     voxel_um3: float,
-    skip_thumbnails: bool = False,
     with_mesh: bool = False,
     mesh_smooth_sigma: float = 0.7,
     mesh_step_size: int = 2,
@@ -845,12 +768,6 @@ def build_report_rows(
 
         props_map = {rp.label: rp for rp in regionprops(labels)}
 
-        if skip_thumbnails:
-            thumb_ids: set[int] = set()
-        else:
-            thumb_ids = set(df["label"].astype(int).tolist())
-            print(f"  Rendering {len(thumb_ids)} thumbnails for {ent.name}...", flush=True)
-
         if with_mesh:
             mesh_ids = set(df["label"].astype(int).tolist())
             print(f"  Generating {len(mesh_ids)} meshes for {ent.name}...", flush=True)
@@ -860,9 +777,6 @@ def build_report_rows(
         for _, irow in df.iterrows():
             lbl = int(irow["label"])
             rp = props_map.get(lbl)
-            thumb_b64 = ""
-            if lbl in thumb_ids and rp is not None:
-                thumb_b64 = _thumbnail_b64(rp.image.astype(bool), (0.65, 0.65, 0.65))
             mesh_b64 = ""
             if lbl in mesh_ids and rp is not None:
                 bbox_vol = (rp.bbox[3]-rp.bbox[0]) * (rp.bbox[4]-rp.bbox[1]) * (rp.bbox[5]-rp.bbox[2])
@@ -886,7 +800,6 @@ def build_report_rows(
                 "row_type": "instance", "label_id": lbl,
                 "instance_count": None, "total_volume_um3": None,
                 "file_size_bytes": None, "file_mtime": None, "file_name": ent.path.name,
-                "thumbnail_b64": thumb_b64,
                 "mesh_b64": mesh_b64,
             }
             for col in df.columns:
@@ -901,10 +814,19 @@ def write_report_csv(out_path: Path, rows: list[dict]) -> None:
     if not rows:
         return
     df = pd.DataFrame([{k: _sanitize(v) for k, v in r.items()} for r in rows])
-    _last = {"thumbnail_b64", "mesh_b64"}
-    cols = [c for c in df.columns if c not in _last] + [c for c in ("thumbnail_b64", "mesh_b64") if c in df.columns]
-    df[cols].to_csv(out_path, index=False)
+    _MESH = "mesh_b64"
+    cols_stats = [c for c in df.columns if c != _MESH]
+    cols_full  = cols_stats + ([_MESH] if _MESH in df.columns else [])
+
+    # Stats-only CSV — no mesh data, small enough to load in browser for multi-cell reports
+    df[cols_stats].to_csv(out_path, index=False)
     print(f"Wrote {out_path.name} ({len(df)} rows, {out_path.stat().st_size // 1024} KB)", flush=True)
+
+    # Full CSV with mesh_b64 — for the 3D mesh viewer (per-cell only)
+    if _MESH in df.columns:
+        mesh_path = out_path.parent / (out_path.stem + "_meshes" + out_path.suffix)
+        df[cols_full].to_csv(mesh_path, index=False)
+        print(f"Wrote {mesh_path.name} ({len(df)} rows, {mesh_path.stat().st_size // 1024} KB)", flush=True)
 
 
 def collect_cell_dirs(root: Path) -> list[tuple[Path, str]]:
@@ -952,7 +874,7 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
     membrane_key = f"mask:{dataset.membrane_name}"
     volumes = load_or_generate_masks(
         dataset=dataset,
-        generated_masks_dir=out_dir / args.generated_masks_dirname,
+        generated_masks_dir=out_dir / "masks_for_analysis",
         membrane_key=membrane_key,
         auto_clip=args.auto_clip_to_pm,
     )
@@ -994,14 +916,13 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
         label_dfs=label_dfs,
         voxel_size_zyx=voxel_size_zyx,
         voxel_um3=voxel_um3,
-        skip_thumbnails=args.skip_plots,
         with_mesh=args.with_mesh,
         mesh_smooth_sigma=args.mesh_smooth_sigma,
         mesh_step_size=args.mesh_step_size,
         mesh_target_reduction=args.mesh_target_reduction,
         mesh_level=args.mesh_level,
         source_path=dataset.source,
-        generated_masks_dir=out_dir / args.generated_masks_dirname,
+        generated_masks_dir=out_dir / "masks_for_analysis",
     )
     write_report_csv(report_csv, rows)
     print("Cell analysis complete.", flush=True)
@@ -1029,6 +950,7 @@ def main() -> None:
         run_single_cell(args, cell_dir, out_dir, group_id=group_id)
 
     if batch:
+        # Joint stats CSV — concatenate per-cell report.csv (no b64, safe to load in browser)
         dfs = [pd.read_csv(od / "report.csv") for od in out_dirs if (od / "report.csv").exists()]
         if dfs:
             joint = pd.concat(dfs, ignore_index=True)
@@ -1037,7 +959,9 @@ def main() -> None:
             kb = joint_path.stat().st_size // 1024
             print(f"Joint report.csv: {len(joint)} rows, {kb} KB → {joint_path}", flush=True)
 
-    print("Done. Open viewer.html in a browser and load report.csv to explore.", flush=True)
+    print("Done.", flush=True)
+    print("  Stats viewer  → open stats_viewer.html, load report.csv", flush=True)
+    print("  3D mesh viewer → open mesh_viewer.html, load a per-cell report_meshes.csv", flush=True)
 
 
 if __name__ == "__main__":

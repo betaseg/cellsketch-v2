@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CellSketch 3D</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chroma-js@2.4.2/chroma.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; }
+body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direction: column; min-height: 100vh; }
+
+.topbar { background: #fff; color: #111; padding: .5rem 1.2rem;
+  display: flex; flex-wrap: wrap; gap: .6rem; align-items: center;
+  position: sticky; top: 0; z-index: 300; border-bottom: 1.5px solid #111; }
+.topbar .brand { font-weight: 700; font-size: 1rem; color: #111; margin-right: .4rem; white-space: nowrap; }
+.topbar .file-info { font-size: .72rem; color: #555; }
+
+.main { max-width: 1600px; margin: 0 auto; padding: 1.5rem 1rem 3rem; flex: 1; }
+
+.section { background: #fff; border-radius: 0; border: 1px solid #ddd;
+  padding: 1.2rem 1.4rem; margin-bottom: 1.4rem; }
+.section-title { font-size: .9rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; color: #111; border-bottom: 2px solid #111; padding-bottom: .5rem; margin-bottom: 1rem; }
+
+#drop-zone { border: 2px dashed #111; border-radius: 0; padding: 4rem 2rem;
+  cursor: pointer; transition: .2s; text-align: center; background: #fff; }
+#drop-zone:hover, #drop-zone.drag-over { background: #f5f5f5; }
+
+
+.thumb-grid { display: flex; flex-wrap: wrap; gap: 7px; }
+.thumb-card { width: 92px; border: 1px solid #ddd; border-radius: 0;
+  background: #fff; text-align: center; padding: 4px; cursor: default; transition: .12s; }
+.thumb-card:hover { border-color: #111; box-shadow: 0 0 0 1px #111; }
+.thumb-card img, .thumb-card .no-thumb { width: 64px; height: 64px; object-fit: contain; display: block; margin: 0 auto; }
+.thumb-card .no-thumb { background: #f0f0f0; border-radius: 0; }
+.thumb-card .tc-ent  { font-size: .6rem;  color: #888; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+.thumb-card .tc-cell { font-size: .58rem; color: #aaa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thumb-card .tc-val  { font-size: .7rem; font-weight: 500; color: #111; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thumb-card.has-mesh { cursor: pointer; }
+
+.legend-grad {
+  height: 9px; border-radius: 0; margin: 5px 0;
+  background: linear-gradient(to right,#440154,#31688e,#35b779,#fde725); }
+.legend-row { display: flex; justify-content: space-between; font-size: .6rem; color: #777; }
+
+
+/* ── Footer ── */
+.cs-footer { background: #212529; color: #adb5bd; font-size: .75rem; margin-top: auto; }
+.cs-footer-inner { max-width: 1600px; margin: 0 auto; padding: 1rem 1.2rem;
+  display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: .75rem; }
+.cs-footer-left { display: flex; align-items: center; gap: .9rem; }
+.cs-footer-logo { height: 36px; width: auto; }
+.cs-footer-right { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.cs-footer a { color: #adb5bd; text-decoration: none; }
+.cs-footer a:hover { color: #dee2e6; text-decoration: underline; }
+.cs-footer-link-light { color: #dee2e6 !important; }
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const VIRIDIS = ['#440154','#482878','#3e4989','#31688e','#26828e',
+                 '#1f9e89','#35b779','#6ece58','#b5de2b','#fde725'];
+function viridisAt(t) {
+  t = Math.max(0, Math.min(1, t));
+  const i = Math.min(VIRIDIS.length - 2, Math.floor(t * (VIRIDIS.length - 1)));
+  const f = t * (VIRIDIS.length - 1) - i;
+  return chroma(VIRIDIS[i]).mix(VIRIDIS[i + 1], f).hex();
+}
+
+async function parseMeshB64(b64) {
+  const bin = atob(b64);
+  const compressed = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) compressed[i] = bin.charCodeAt(i);
+  const ds = new DecompressionStream('gzip');
+  const w = ds.writable.getWriter();
+  w.write(compressed); w.close();
+  const chunks = [];
+  const reader = ds.readable.getReader();
+  for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); }
+  const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+  const raw = new Uint8Array(totalLen);
+  let off = 0;
+  for (const c of chunks) { raw.set(c, off); off += c.length; }
+  const ab = raw.buffer;
+  const nV      = new Uint32Array(ab, 0, 1)[0];
+  const nF      = new Uint32Array(ab, 4, 1)[0];
+  const minXYZ  = new Float32Array(ab, 8, 3);
+  const scaXYZ  = new Float32Array(ab, 20, 3);
+  const vertsQ  = new Uint16Array(ab.slice(32, 32 + nV * 6));
+  const idxBuf  = new Uint32Array(ab.slice(32 + nV * 6));
+  const pos = new Float32Array(nV * 3);
+  for (let i = 0; i < nV; i++) {
+    pos[i*3]   = minXYZ[0] + (vertsQ[i*3]   / 65535) * scaXYZ[0];
+    pos[i*3+1] = minXYZ[1] + (vertsQ[i*3+1] / 65535) * scaXYZ[1];
+    pos[i*3+2] = minXYZ[2] + (vertsQ[i*3+2] / 65535) * scaXYZ[2];
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setIndex(new THREE.BufferAttribute(idxBuf, 1));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function clearMeshes(scene) {
+  const rm = [];
+  scene.traverse(o => { if (o.isMesh) rm.push(o); });
+  rm.forEach(m => { m.geometry.dispose(); m.material.dispose(); scene.remove(m); });
+}
+
+function fitCamera(scene, camera, controls) {
+  const box = new THREE.Box3().setFromObject(scene);
+  if (box.isEmpty()) return;
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length();
+  camera.position.set(center.x + size * 0.6, center.y + size * 0.4, center.z + size * 0.9);
+  controls.target.copy(center);
+  controls.update();
+}
+
+let _R = null, _S = null, _C = null, _O = null;
+
+function ensureScene() {
+  if (_R) return;
+  const canvas = document.getElementById('c3d-canvas');
+  _R = new THREE.WebGLRenderer({ canvas, antialias: true });
+  _R.setPixelRatio(window.devicePixelRatio);
+  _S = new THREE.Scene();
+  _S.background = new THREE.Color(0xffffff);
+  _C = new THREE.PerspectiveCamera(45, 2, 0.01, 1e6);
+  _O = new OrbitControls(_C, canvas);
+  _O.enableDamping = true; _O.dampingFactor = 0.06;
+  _S.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const d1 = new THREE.DirectionalLight(0xffffff, 0.7); d1.position.set(1, 2, 1.5); _S.add(d1);
+  const d2 = new THREE.DirectionalLight(0xddeeff, 0.25); d2.position.set(-1, -0.5, 0.5); _S.add(d2);
+  (function tick() {
+    requestAnimationFrame(tick);
+    const c = document.getElementById('c3d-canvas');
+    if (!c) return;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (_R.domElement.width !== w * window.devicePixelRatio) {
+      _R.setSize(w, h, false);
+      _C.aspect = w / h; _C.updateProjectionMatrix();
+    }
+    _O.update(); _R.render(_S, _C);
+  })();
+}
+
+window.render3DScene = async function(rows, metricCol, colorBy, maskRows) {
+  ensureScene();
+  clearMeshes(_S);
+
+  const byEntity = colorBy === 'entity';
+  const byCell   = colorBy === 'cell';
+  const byGroup  = colorBy === 'group';
+  const byMetric = !byEntity && !byCell && !byGroup;
+  const visibleEntities = new Set(rows.map(r => r.entity_name));
+  const singleEntity = byEntity && visibleEntities.size <= 1;
+
+  const distMatch = byMetric && metricCol.match(/^distance_to_(?:label_)?(.+?)_um$/);
+  const distTarget = distMatch ? distMatch[1] : null;
+  const isSelfDist = r => distTarget && r.entity_name === distTarget;
+  const vals = byMetric ? rows.filter(r => {
+    const v = r[metricCol]; return v != null && isFinite(v) && !isSelfDist(r);
+  }).map(r => r[metricCol]) : [];
+  const minV = vals.length ? Math.min(...vals) : 0;
+  const maxV = vals.length ? Math.max(...vals) : 1;
+  const span = maxV > minV ? maxV - minV : 1;
+  const legendEntries = {};
+
+  const meshRows = rows.filter(r => r.mesh_b64);
+  const geos = await Promise.all(meshRows.map(r => parseMeshB64(r.mesh_b64).catch(() => null)));
+
+  let count = 0;
+  geos.forEach((geo, i) => {
+    if (!geo) return;
+    const r = meshRows[i];
+    let hex;
+    if (byEntity) {
+      hex = singleEntity ? '#eeeeee' : window.entColor(r.entity_name);
+      if (!singleEntity) legendEntries[r.entity_name] = hex;
+    } else if (byCell) {
+      hex = window.cellColor(r.cell_id || '');
+      legendEntries[r.cell_id || '?'] = hex;
+    } else if (byGroup) {
+      hex = window.cellColor(r.group_id || '');
+      legendEntries[r.group_id || '?'] = hex;
+    } else {
+      const v = r[metricCol];
+      if (v == null || !isFinite(v) || isSelfDist(r)) {
+        hex = '#888888';
+      } else {
+        hex = viridisAt(Math.max(0, Math.min(1, (v - minV) / span)));
+      }
+    }
+    _S.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+      color: new THREE.Color(hex), side: THREE.DoubleSide,
+      transparent: false, shininess: 25,
+    })));
+    count++;
+  });
+
+  if (maskRows && maskRows.length) {
+    const maskGeos = await Promise.all(
+      maskRows.map(r => r.mesh_b64 ? parseMeshB64(r.mesh_b64).catch(() => null) : Promise.resolve(null))
+    );
+    maskGeos.forEach((geo, i) => {
+      if (!geo) return;
+      const r = maskRows[i];
+      _S.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+        color: new THREE.Color(window.entColor(r.entity_name) || '#aaa'),
+        side: THREE.DoubleSide,
+        transparent: true, opacity: 0.07, shininess: 5, depthWrite: false,
+      })));
+    });
+  }
+
+  if (count) fitCamera(_S, _C, _O);
+
+  const leg = document.getElementById('c3d-legend');
+  if (!leg) return;
+  leg.style.display = count ? '' : 'none';
+  if (byMetric) {
+    const lbl = metricCol.replace(/_/g,' ').replace(' um3',' μm³').replace(' um2',' μm²').replace(' um',' μm');
+    const hasGray = rows.some(r => { const v = r[metricCol]; return v == null || !isFinite(v) || isSelfDist(r); });
+    leg.innerHTML = '<div style="font-weight:600;margin-bottom:3px">'+lbl+'</div>'
+      +'<div class="legend-grad"></div>'
+      +'<div class="legend-row"><span>'+minV.toFixed(2)+'</span><span>'+maxV.toFixed(2)+'</span></div>'
+      +(hasGray ? '<div style="display:flex;align-items:center;gap:5px;margin-top:5px">'
+          +'<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#888"></span>'
+          +'<span style="font-size:.66rem;color:#444">n/a</span></div>' : '')
+      +'<div style="color:#666;margin-top:5px">'+count+' meshes</div>';
+  } else {
+    leg.innerHTML = '<div style="font-weight:600;margin-bottom:5px">'+(byEntity?'Entity':byGroup?'Group':'Cell')+'</div>'
+      + Object.entries(legendEntries).map(([k,c]) =>
+          '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">'
+          +'<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:'+c+'"></span>'
+          +'<span style="font-size:.66rem">'+k+'</span></div>'
+        ).join('')
+      +'<div style="color:#666;margin-top:5px">'+count+' meshes</div>';
+  }
+};
+
+// ── Gallery 3D thumbnail rendering ──────────────────────────
+let _TR = null, _TS = null, _TC = null;
+
+function ensureThumbRenderer() {
+  if (_TR) return;
+  const c = document.createElement('canvas');
+  c.width = 128; c.height = 128;
+  _TR = new THREE.WebGLRenderer({ canvas: c, antialias: true, preserveDrawingBuffer: true });
+  _TR.setPixelRatio(1);
+  _TS = new THREE.Scene(); _TS.background = new THREE.Color(0xfafafa);
+  _TC = new THREE.PerspectiveCamera(38, 1, 0.001, 1e6);
+  _TS.add(new THREE.AmbientLight(0xffffff, 0.5));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.8); dl.position.set(1, 1.5, 1.2); _TS.add(dl);
+  const dl2 = new THREE.DirectionalLight(0xbbccff, 0.2); dl2.position.set(-1, -0.5, 0.5); _TS.add(dl2);
+}
+
+window.render3DThumbs = async function(sample, colorFn) {
+  ensureThumbRenderer();
+  for (let i = 0; i < sample.length; i++) {
+    const r = sample[i];
+    if (!r.mesh_b64) continue;
+    const img = document.querySelector('#thumb-grid img[data-midx="'+i+'"]');
+    if (!img) continue;
+    const geo = await parseMeshB64(r.mesh_b64).catch(() => null);
+    if (!geo) continue;
+    const rm = []; _TS.traverse(o => { if (o.isMesh) rm.push(o); });
+    rm.forEach(m => { m.geometry.dispose(); m.material.dispose(); _TS.remove(m); });
+    geo.computeBoundingBox();
+    const ctr = geo.boundingBox.getCenter(new THREE.Vector3());
+    geo.translate(-ctr.x, -ctr.y, -ctr.z);
+    const hex = colorFn ? colorFn(r) : (window.entColor(r.entity_name) || '#888');
+    _TS.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+      color: new THREE.Color(hex), side: THREE.DoubleSide, shininess: 35,
+    })));
+    geo.computeBoundingSphere();
+    const rad = (geo.boundingSphere.radius || 1) * 1.9;
+    _TC.position.set(rad * 0.75, rad * 0.55, rad * 1.2);
+    _TC.lookAt(0, 0, 0);
+    _TR.render(_TS, _TC);
+    img.src = _TR.domElement.toDataURL('image/png');
+  }
+};
+
+// ── Single-instance modal scene ──────────────────────────────
+let _MR = null, _MS = null, _MC = null, _MO = null;
+
+window.showMesh3D = function(b64, title) {
+  document.getElementById('mesh-modal-title').textContent = title || '';
+  bootstrap.Modal.getOrCreateInstance(document.getElementById('mesh-modal')).show();
+  document.getElementById('mesh-modal').addEventListener('shown.bs.modal', async function init() {
+    document.getElementById('mesh-modal').removeEventListener('shown.bs.modal', init);
+    const canvas = document.getElementById('mesh-modal-canvas');
+    if (!_MR) {
+      _MR = new THREE.WebGLRenderer({ canvas, antialias: true });
+      _MR.setPixelRatio(window.devicePixelRatio);
+      _MS = new THREE.Scene(); _MS.background = new THREE.Color(0x0e0e18);
+      _MC = new THREE.PerspectiveCamera(45, 2, 0.001, 1e6);
+      _MO = new OrbitControls(_MC, canvas);
+      _MO.enableDamping = true; _MO.dampingFactor = 0.06;
+      _MS.add(new THREE.AmbientLight(0xffffff, 0.4));
+      const dl = new THREE.DirectionalLight(0xffffff, 1.0); dl.position.set(1, 2, 1.5); _MS.add(dl);
+      (function tick() {
+        requestAnimationFrame(tick);
+        const c = document.getElementById('mesh-modal-canvas');
+        if (!c) return;
+        const w = c.clientWidth, h = c.clientHeight;
+        _MR.setSize(w, h, false); _MC.aspect = w / h; _MC.updateProjectionMatrix();
+        _MO.update(); _MR.render(_MS, _MC);
+      })();
+    }
+    clearMeshes(_MS);
+    const geo = await parseMeshB64(b64);
+    geo.computeBoundingBox();
+    const center = geo.boundingBox.getCenter(new THREE.Vector3());
+    geo.translate(-center.x, -center.y, -center.z);
+    _MS.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({ color: 0x888888, side: THREE.DoubleSide, shininess: 40 })));
+    fitCamera(_MS, _MC, _MO);
+  }, { once: true });
+};
+</script>
+</head>
+<body>
+
+<!-- ── Top bar ──────────────────────────────────────────────── -->
+<div class="topbar">
+  <span class="brand">CellSketch 3D</span>
+  <button class="btn btn-sm btn-outline-dark" id="load-btn">&#128194; Open CSV</button>
+  <input type="file" id="file-input" accept=".csv,.tsv" class="d-none">
+  <span class="file-info" id="file-info"></span>
+  <span class="file-info"><i class="bi bi-shield-lock me-1"></i>Your data stays local — nothing is uploaded.</span>
+  <div id="global-filters" class="d-none d-flex flex-wrap gap-2 ms-auto align-items-center">
+    <select id="flt-entity" class="form-select form-select-sm" style="width:auto"><option value="">All entities</option></select>
+  </div>
+</div>
+
+<!-- ── Landing ─────────────────────────────────────────────── -->
+<div id="landing" class="container py-5">
+  <div class="row justify-content-center">
+    <div class="col-md-5">
+      <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+        <div style="font-size:3.5rem">&#127757;</div>
+        <div class="mt-2 fw-semibold fs-6">Drop <code>report_meshes.csv</code> here or click to browse</div>
+        <div class="small text-muted mt-1">Per-cell 3D mesh report — use <strong>stats_viewer.html</strong> for multi-cell stats</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Main ────────────────────────────────────────────────── -->
+<div id="main-content" class="d-none main">
+
+  <!-- Cell 3D View — primary section for this viewer -->
+  <div class="section" id="s-cell3d">
+    <div class="section-title">Cell 3D View</div>
+    <div class="d-flex flex-wrap gap-3 align-items-end mb-3">
+      <div>
+        <label class="form-label small mb-1">Cell</label>
+        <select id="c3d-cell" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <div>
+        <label class="form-label small mb-1">Color by</label>
+        <select id="c3d-color" class="form-select form-select-sm" style="width:auto">
+          <option value="entity">Entity</option>
+          <option value="metric">Metric</option>
+        </select>
+      </div>
+      <div id="c3d-metric-wrap" style="display:none">
+        <label class="form-label small mb-1">Metric</label>
+        <select id="c3d-metric" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <span id="c3d-count" class="small text-muted align-self-end pb-1"></span>
+    </div>
+    <div style="position:relative;width:100%;height:620px;background:#fff;border-radius:6px;overflow:hidden;border:1px solid #e8e8e8">
+      <canvas id="c3d-canvas" style="display:block;width:100%;height:100%"></canvas>
+      <div style="position:absolute;bottom:10px;left:14px;pointer-events:none;color:rgba(0,0,0,.3);font-size:.65rem">drag · scroll · right-drag to pan</div>
+      <div id="c3d-legend" style="position:absolute;top:10px;right:14px;display:none;background:rgba(255,255,255,.88);border:1px solid #e0e0e0;border-radius:5px;padding:8px 11px;color:#222;font-size:.68rem;min-width:140px"></div>
+    </div>
+  </div>
+
+  <!-- Instance Viewer -->
+  <div class="section" id="s-viewer">
+    <div class="section-title">Instance Viewer</div>
+    <div class="d-flex flex-wrap gap-3 align-items-end mb-3">
+      <div>
+        <label class="form-label small mb-1">Sort by</label>
+        <select id="v-sort-col" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <div>
+        <label class="form-label small mb-1">Direction</label>
+        <select id="v-sort-dir" class="form-select form-select-sm" style="width:auto">
+          <option value="desc">Highest first</option><option value="asc">Lowest first</option>
+        </select>
+      </div>
+      <div>
+        <label class="form-label small mb-1">Sample</label>
+        <select id="v-sample-mode" class="form-select form-select-sm" style="width:auto">
+          <option value="first">First N</option><option value="random">Random N</option>
+        </select>
+      </div>
+      <div style="width:190px">
+        <label class="form-label small mb-1">N = <span id="v-n-val">100</span></label>
+        <input type="range" id="v-n" class="form-range" min="10" max="500" step="10" value="100">
+      </div>
+      <div>
+        <label class="form-label small mb-1">Color by</label>
+        <select id="v-color-by" class="form-select form-select-sm" style="width:auto">
+          <option value="entity">Entity</option><option value="cell">Cell</option>
+        </select>
+      </div>
+      <span id="v-count" class="small text-muted align-self-end pb-1"></span>
+    </div>
+    <div id="thumb-grid" class="thumb-grid"></div>
+  </div>
+
+</div><!-- /main -->
+
+<!-- ── Footer ── -->
+<footer class="cs-footer">
+  <div class="cs-footer-inner">
+    <div class="cs-footer-left">
+      <a href="https://helmholtz-imaging.de" target="_blank">
+        <img src="https://ida-mdc.github.io/pixel-patrol/Helmholtz-Imaging_Mark.png" alt="Helmholtz Imaging" class="cs-footer-logo">
+      </a>
+      <span>CellSketch V2 is a derivate of <a href="https://github.com/ida-mdc/pixel-patrol" target="_blank" class="cs-footer-link-light">Pixel Patrol</a> and is developed by <a href="https://helmholtz-imaging.de" target="_blank" class="cs-footer-link-light">Helmholtz Imaging</a>.</span>
+    </div>
+    <div class="cs-footer-right">
+      <a href="mailto:support@helmholtz-imaging.de">support@helmholtz-imaging.de</a>
+      <a href="https://github.com/betaseg/cellsketch-v2" target="_blank"><i class="bi bi-github me-1"></i>GitHub</a>
+    </div>
+  </div>
+</footer>
+
+<!-- Single-instance 3D modal -->
+<div class="modal fade" id="mesh-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content" style="background:#0e0e18;border:none;border-radius:10px;overflow:hidden">
+      <div class="modal-header border-0 pb-0 px-3 pt-2">
+        <span id="mesh-modal-title" class="text-light small fw-semibold"></span>
+        <button type="button" class="btn-close btn-close-white ms-auto" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-0">
+        <canvas id="mesh-modal-canvas" style="width:100%;height:440px;display:block"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════════
+//  Data & state
+// ══════════════════════════════════════════════════════════════
+var ALL = [], COLS = [];
+var st = { entity: '' };
+var vSt = { sortCol: 'volume_um3', sortAsc: false, sampleMode: 'first', sampleN: 100, colorBy: 'entity' };
+var _viewerInited = false;
+var _currentSample = [];
+var _c3dInited = false;
+
+var _cellPal = null, _entPal = null;
+function cellPalette() {
+  if (!_cellPal) {
+    var cs = uniq(ALL.map(function(r){ return r.cell_id; }).filter(Boolean));
+    var p = chroma.scale('Set2').colors(Math.max(cs.length, 3));
+    _cellPal = {};
+    cs.forEach(function(c,i){ _cellPal[c] = p[i % p.length]; });
+  }
+  return _cellPal;
+}
+var _ENT_COLORS = ['#FF8080','#80AAFF','#80DD99','#FFB366','#CC88FF','#FF88BB','#66DDCC','#AABB55','#FFD966','#FF99EE'];
+function entPalette() {
+  if (!_entPal) {
+    var es = uniq(ALL.map(function(r){ return r.entity_name; }));
+    _entPal = {};
+    es.forEach(function(e,i){ _entPal[e] = _ENT_COLORS[i % _ENT_COLORS.length]; });
+  }
+  return _entPal;
+}
+function cellColor(c) { return (cellPalette()[c] || '#aaa'); }
+function entColor(e)  { return (entPalette()[e]  || '#aaa'); }
+// expose for THREE.js module
+window.cellColor = cellColor;
+window.entColor  = entColor;
+
+// ══════════════════════════════════════════════════════════════
+//  File loading
+// ══════════════════════════════════════════════════════════════
+document.getElementById('load-btn').addEventListener('click', function(){ document.getElementById('file-input').click(); });
+document.getElementById('file-input').addEventListener('change', function(e){ if(e.target.files[0]) loadFile(e.target.files[0]); });
+
+var dz = document.getElementById('drop-zone');
+['dragenter','dragover'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.add('drag-over'); }); });
+['dragleave','drop'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.remove('drag-over'); }); });
+dz.addEventListener('drop', function(e){ if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+
+function loadFile(file) {
+  document.getElementById('file-info').textContent = file.name + ' (' + (file.size/1024/1024).toFixed(1) + ' MB)';
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var res = Papa.parse(e.target.result, { header:true, dynamicTyping:true, skipEmptyLines:true });
+    ALL = res.data; COLS = res.meta.fields || [];
+    _cellPal = null; _entPal = null; _viewerInited = false; _c3dInited = false;
+    st.entity = '';
+    onLoaded();
+  };
+  reader.readAsText(file);
+}
+
+function onLoaded() {
+  document.getElementById('landing').classList.add('d-none');
+  document.getElementById('main-content').classList.remove('d-none');
+  document.getElementById('global-filters').classList.remove('d-none');
+  initFilters();
+  renderAll();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Helpers
+// ══════════════════════════════════════════════════════════════
+function uniq(arr) { return [...new Set(arr)].sort(); }
+function cells()   { return uniq(ALL.map(function(r){ return r.cell_id; }).filter(Boolean)); }
+function ents()    { return uniq(ALL.map(function(r){ return r.entity_name; })); }
+
+function filtered(rowType) {
+  return ALL.filter(function(r) {
+    return (!rowType    || r.row_type    === rowType)
+        && (!st.entity || r.entity_name === st.entity);
+  });
+}
+
+var SKIP = new Set(['cell_id','group_id','entity_name','entity_kind','row_type','label_id',
+  'instance_count','total_volume_um3','mesh_b64','file_size_bytes','file_mtime','file_name']);
+
+// ══════════════════════════════════════════════════════════════
+//  Filters
+// ══════════════════════════════════════════════════════════════
+function initFilters() {
+  var es = ents();
+  document.getElementById('flt-entity').innerHTML =
+    '<option value="">All entities</option>' + es.map(function(e){ return '<option value="'+e+'">'+e+'</option>'; }).join('');
+  document.getElementById('flt-entity').value = st.entity;
+  document.getElementById('flt-entity').addEventListener('change', function(){
+    st.entity = this.value;
+    renderAll();
+  });
+}
+
+function renderAll() {
+  renderViewer();
+  initCell3D();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Instance Viewer
+// ══════════════════════════════════════════════════════════════
+function initViewerControls() {
+  if(_viewerInited) return;
+  _viewerInited = true;
+  var numCols = COLS.filter(function(c){
+    return !SKIP.has(c) && ALL.some(function(r){ return r[c]!=null && isFinite(r[c]); });
+  });
+  var sel = document.getElementById('v-sort-col');
+  sel.innerHTML = numCols.map(function(c){
+    return '<option value="'+c+'"'+(c===vSt.sortCol?' selected':'')+'>'+c.replace(/_/g,' ')+'</option>';
+  }).join('');
+  ['v-sort-col','v-sort-dir','v-sample-mode','v-color-by'].forEach(function(id){
+    document.getElementById(id).addEventListener('change', function(){
+      vSt.sortCol    = document.getElementById('v-sort-col').value;
+      vSt.sortAsc    = document.getElementById('v-sort-dir').value === 'asc';
+      vSt.sampleMode = document.getElementById('v-sample-mode').value;
+      vSt.colorBy    = document.getElementById('v-color-by').value;
+      renderViewer();
+    });
+  });
+  document.getElementById('v-n').addEventListener('input', function(e){
+    vSt.sampleN = +e.target.value;
+    document.getElementById('v-n-val').textContent = vSt.sampleN;
+    renderViewer();
+  });
+}
+
+
+function renderViewer() {
+  initViewerControls();
+  var rows = filtered('instance').filter(function(r){ return r.entity_kind==='label'; });
+  rows.sort(function(a,b){
+    var va=a[vSt.sortCol], vb=b[vSt.sortCol];
+    if(va==null && vb==null) return 0;
+    if(va==null) return 1; if(vb==null) return -1;
+    return vSt.sortAsc ? va-vb : vb-va;
+  });
+  var n = Math.min(vSt.sampleN, rows.length);
+  var sample = vSt.sampleMode==='random'
+    ? (function(){
+        var s=rows.slice().sort(function(){ return Math.random()-.5; }).slice(0,n);
+        s.sort(function(a,b){
+          var va=a[vSt.sortCol], vb=b[vSt.sortCol];
+          if(va==null) return 1; if(vb==null) return -1;
+          return vSt.sortAsc ? va-vb : vb-va;
+        }); return s;
+      })()
+    : rows.slice(0,n);
+
+  _currentSample = sample;
+  document.getElementById('v-count').textContent =
+    'Showing '+sample.length.toLocaleString()+' of '+rows.length.toLocaleString()+' instances';
+
+  var mlabel = vSt.sortCol.replace(/_/g,' ').replace(' um3',' μm³').replace(' um2',' μm²').replace(' um',' μm');
+  var colorFn = vSt.colorBy==='cell' ? function(r){ return cellColor(r.cell_id||''); }
+                                     : function(r){ return entColor(r.entity_name); };
+
+  document.getElementById('thumb-grid').innerHTML = sample.map(function(r, i){
+    var val = r[vSt.sortCol];
+    var vs = val==null ? '—' : (typeof val==='number' && !Number.isInteger(val)) ? val.toFixed(2) : String(val);
+    var dotCol = colorFn(r);
+    // Thumbnails are always rendered from mesh_b64 via render3DThumbs
+    var thumb = r.mesh_b64 ? '<img data-midx="'+i+'" src="">' : '<div class="no-thumb"></div>';
+    var cls = 'thumb-card' + (r.mesh_b64 ? ' has-mesh' : '');
+    var dot = !r.mesh_b64 ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dotCol+';margin-right:3px;flex-shrink:0"></span>' : '';
+    return '<div class="'+cls+'" data-idx="'+i+'"'
+      +' title="'+r.entity_name+' / '+(r.cell_id||'')+' #'+r.label_id+' (click for 3D)">'
+      +thumb
+      +'<div class="tc-ent" style="display:flex;align-items:center">'+dot+r.entity_name+'</div>'
+      +(r.cell_id ? '<div class="tc-cell">'+r.cell_id+'</div>' : '')
+      +'<div class="tc-val" title="'+mlabel+'">'+vs+'</div>'
+      +'</div>';
+  }).join('');
+
+  if (typeof window.render3DThumbs === 'function') window.render3DThumbs(_currentSample, colorFn);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Cell 3D View
+// ══════════════════════════════════════════════════════════════
+function initCell3D() {
+  var hasMesh = ALL.some(function(r){ return r.mesh_b64; });
+  if (!hasMesh) { document.getElementById('s-cell3d').style.display = 'none'; return; }
+  document.getElementById('s-cell3d').style.display = '';
+
+  var cs = uniq(ALL.filter(function(r){ return r.row_type==='instance' && r.mesh_b64; })
+    .map(function(r){ return r.cell_id; }).filter(Boolean));
+  var cellSel = document.getElementById('c3d-cell');
+  var prevCell = cellSel.value;
+  cellSel.innerHTML = cs.map(function(c){ return '<option value="'+c+'">'+c+'</option>'; }).join('');
+  if (prevCell && cs.indexOf(prevCell) !== -1) cellSel.value = prevCell;
+
+  var numCols = COLS.filter(function(c){
+    return !SKIP.has(c) && ALL.some(function(r){ return r[c]!=null && isFinite(r[c]); });
+  });
+  var metSel = document.getElementById('c3d-metric');
+  metSel.innerHTML = numCols.map(function(c){
+    return '<option value="'+c+'"'+(c==='volume_um3'?' selected':'')+'>'+c.replace(/_/g,' ')+'</option>';
+  }).join('');
+
+  if (!_c3dInited) {
+    _c3dInited = true;
+    cellSel.addEventListener('change', renderCell3D);
+    document.getElementById('c3d-color').addEventListener('change', function(){
+      document.getElementById('c3d-metric-wrap').style.display = this.value==='metric' ? '' : 'none';
+      renderCell3D();
+    });
+    document.getElementById('c3d-metric').addEventListener('change', renderCell3D);
+  }
+  renderCell3D();
+}
+
+function renderCell3D() {
+  var cellId    = document.getElementById('c3d-cell').value;
+  var colorBy   = document.getElementById('c3d-color').value;
+  var metricCol = document.getElementById('c3d-metric').value || 'volume_um3';
+  var instRows = ALL.filter(function(r){
+    return r.row_type==='instance' && r.entity_kind==='label' && r.cell_id===cellId && r.mesh_b64
+      && (!st.entity || r.entity_name === st.entity);
+  });
+  var maskRows = ALL.filter(function(r){
+    return r.row_type==='file' && r.entity_kind==='mask' && r.cell_id===cellId && r.mesh_b64
+      && (!st.entity || r.entity_name === st.entity);
+  });
+  document.getElementById('c3d-count').textContent =
+    instRows.length + ' instances · ' + maskRows.length + ' masks';
+  if (typeof window.render3DScene === 'function')
+    window.render3DScene(instRows, metricCol, colorBy, maskRows);
+}
+
+
+// Click on thumbnail → open 3D modal
+document.getElementById('thumb-grid').addEventListener('click', function(e) {
+  var card = e.target.closest('.thumb-card.has-mesh');
+  if (!card) return;
+  var row = _currentSample[+card.dataset.idx];
+  if (row && row.mesh_b64 && typeof window.showMesh3D === 'function') {
+    window.showMesh3D(row.mesh_b64, row.entity_name + ' · ' + (row.cell_id||'') + ' #' + row.label_id);
+  }
+});
+</script>
+</body>
+</html>
