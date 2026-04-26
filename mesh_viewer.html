@@ -514,8 +514,8 @@ dz.addEventListener('drop', function(e){ if(e.dataTransfer.files[0]) loadFile(e.
 function parseAndLoad(text, label) {
   var res = Papa.parse(text, { header:true, dynamicTyping:true, skipEmptyLines:true });
   ALL = res.data; COLS = res.meta.fields || [];
-  _cellPal = null; _entPal = null; _grpPal = null;
-  st.group = ''; st.cell = ''; st.entity = '';
+  _cellPal = null; _entPal = null; _viewerInited = false; _c3dInited = false;
+  st.entity = '';
   document.getElementById('file-info').textContent = label;
   onLoaded();
 }
@@ -524,7 +524,7 @@ function loadFile(file) {
   var reader = new FileReader();
   reader.onload = function(e) {
     history.replaceState(null, '', window.location.pathname);
-    parseAndLoad(e.target.result, file.name + ' (' + (file.size/1024).toFixed(0) + ' KB)');
+    parseAndLoad(e.target.result, file.name + ' (' + (file.size/1024/1024).toFixed(1) + ' MB)');
   };
   reader.readAsText(file);
 }

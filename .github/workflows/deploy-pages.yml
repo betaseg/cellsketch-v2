@@ -1,9 +1,12 @@
-name: Deploy viewer to GitHub Pages
+name: Deploy viewers to GitHub Pages
 
 on:
   push:
     branches: [main]
-    paths: [viewer.html]
+    paths:
+      - index.html
+      - stats_viewer.html
+      - mesh_viewer.html
   workflow_dispatch:
 
 permissions:
@@ -24,7 +27,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Prepare site
-        run: mkdir _site && cp viewer.html _site/index.html
+        run: |
+          mkdir _site
+          cp index.html _site/index.html
+          cp stats_viewer.html _site/stats_viewer.html
+          cp mesh_viewer.html _site/mesh_viewer.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
