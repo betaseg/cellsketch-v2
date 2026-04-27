@@ -9,6 +9,7 @@
 #   "tifffile>=2024.5.0",
 #   "edt>=2.4.0",
 #   "fast-simplification>=0.1.6",
+#   "imagecodecs"
 # ]
 # ///
 
