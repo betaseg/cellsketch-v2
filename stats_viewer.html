@@ -80,7 +80,9 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
 <!-- ── Landing ─────────────────────────────────────────────── -->
 <div id="landing" class="container py-5">
   <div class="row justify-content-center">
-    <div class="col-md-5">
+
+    <!-- Normal form -->
+    <div class="col-md-5" id="landing-form">
       <div id="drop-zone" onclick="document.getElementById('file-input').click()">
         <div style="font-size:3.5rem">&#128202;</div>
         <div class="mt-2 fw-semibold fs-6">Drop <code>report.csv</code> here or click to browse</div>
@@ -93,9 +95,27 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
                  placeholder="https://example.com/report.csv" style="font-size:.78rem">
           <button class="btn btn-sm btn-outline-dark flex-shrink-0" id="url-load-btn">Load</button>
         </div>
-        <div id="url-status" class="small mt-1" style="min-height:1.2em;color:#c00"></div>
       </div>
     </div>
+
+    <!-- Loading state -->
+    <div class="col-md-5 d-none" id="landing-loading"
+         style="border:1px solid #ddd;padding:3rem 2rem;text-align:center">
+      <div class="spinner-border mb-3" role="status"
+           style="width:2.5rem;height:2.5rem;border-width:2px;color:#111;border-right-color:#ddd"></div>
+      <div style="font-weight:600;margin-bottom:.5rem">Loading report…</div>
+      <div id="loading-url" style="font-size:.72rem;color:#888;word-break:break-all"></div>
+    </div>
+
+    <!-- Error state -->
+    <div class="col-md-5 d-none" id="landing-error"
+         style="border:1.5px solid #c00;padding:3rem 2rem;text-align:center">
+      <div style="font-size:2rem;margin-bottom:.8rem;color:#c00"><i class="bi bi-exclamation-triangle"></i></div>
+      <div style="font-weight:700;color:#c00;margin-bottom:.6rem">Failed to load</div>
+      <div id="landing-error-msg" style="font-size:.78rem;color:#555;margin-bottom:1.5rem;word-break:break-word"></div>
+      <button class="btn btn-sm btn-outline-dark" onclick="showLandingForm()">Try again</button>
+    </div>
+
   </div>
 </div>
 
@@ -220,6 +240,10 @@ function parseAndLoad(text, label) {
 }
 
 function loadFile(file) {
+  document.getElementById('landing-form').classList.add('d-none');
+  document.getElementById('landing-loading').classList.remove('d-none');
+  document.getElementById('landing-error').classList.add('d-none');
+  document.getElementById('loading-url').textContent = file.name;
   var reader = new FileReader();
   reader.onload = function(e) {
     history.replaceState(null, '', window.location.pathname);
@@ -228,23 +252,32 @@ function loadFile(file) {
   reader.readAsText(file);
 }
 
+function showLandingForm() {
+  document.getElementById('landing-form').classList.remove('d-none');
+  document.getElementById('landing-loading').classList.add('d-none');
+  document.getElementById('landing-error').classList.add('d-none');
+}
+
 function loadFromUrl(url) {
-  var status = document.getElementById('url-status');
-  status.textContent = 'Loading…';
-  status.style.color = '#555';
+  document.getElementById('landing-form').classList.add('d-none');
+  document.getElementById('landing-loading').classList.remove('d-none');
+  document.getElementById('landing-error').classList.add('d-none');
+  document.getElementById('loading-url').textContent = url;
   fetch(url)
     .then(function(r) {
       if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
       return r.text();
     })
     .then(function(text) {
-      status.textContent = '';
       history.replaceState(null, '', '?data=' + encodeURIComponent(url));
       parseAndLoad(text, url.split('/').pop() + ' (remote)');
     })
     .catch(function(err) {
-      status.style.color = '#c00';
-      status.textContent = 'Failed: ' + err.message + '. The server may not allow cross-origin requests.';
+      document.getElementById('landing-loading').classList.add('d-none');
+      document.getElementById('landing-error').classList.remove('d-none');
+      var msg = err.message;
+      if (msg === 'Failed to fetch') msg = 'Could not reach the server. Check the URL and ensure the server allows cross-origin requests (CORS).';
+      document.getElementById('landing-error-msg').textContent = msg;
     });
 }
 
