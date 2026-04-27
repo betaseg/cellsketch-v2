@@ -2,7 +2,7 @@
 
 CellSketch V2 analyzes 3D TIFF segmentations (labels + masks) for one cell or many cells and produces CSV reports for statistics, interactive mesh viewing, and Blender import.
 
-## Workflow at a glance
+## Workflow
 
 1. Organize your TIFF files in one of the supported input layouts.
 2. Run one command with `analyze_cell.py`.
