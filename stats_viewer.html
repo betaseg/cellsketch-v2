@@ -331,11 +331,103 @@ function metricCols(rows) {
     return !SKIP.has(c) && rows.some(function(r){ return r[c] != null && isFinite(r[c]); });
   });
 }
+
+// Base scalar distance columns (min per instance) — excludes derived histogram columns
 function distCols(rows) {
-  return metricCols(rows).filter(function(c){ return c.startsWith('distance_to_') && !c.includes('closest'); });
+  return COLS.filter(function(c) {
+    return c.startsWith('distance_to_')
+      && !c.includes('closest')
+      && !c.endsWith('_mean_um')
+      && !c.endsWith('_hist_min_um')
+      && !c.endsWith('_hist_max_um')
+      && !c.endsWith('_hist_um')
+      && rows.some(function(r){ return r[c] != null && isFinite(r[c]); });
+  });
 }
+
 function nonDistMetricCols(rows) {
   return metricCols(rows).filter(function(c){ return !c.startsWith('distance_to_'); });
+}
+
+// Distance targets that have per-pixel histogram data in these rows
+function histTargets(rows) {
+  return COLS
+    .filter(function(c) {
+      return c.startsWith('distance_to_') && c.endsWith('_hist_um')
+        && rows.some(function(r){ return r[c] != null; });
+    })
+    .map(function(c) { return c.replace(/^distance_to_/, '').replace(/_hist_um$/, ''); });
+}
+
+// For scatter plots: for each distance target prefer _mean_um over _um when available
+function scatterDistCols(rows) {
+  var base = COLS.filter(function(c) {
+    return c.startsWith('distance_to_')
+      && !c.endsWith('_hist_min_um') && !c.endsWith('_hist_max_um') && !c.endsWith('_hist_um')
+      && rows.some(function(r){ return r[c] != null && isFinite(r[c]); });
+  });
+  var meanSet = new Set(base.filter(function(c){ return c.endsWith('_mean_um'); }));
+  // keep a col unless a _mean_um version of the same target already exists
+  return base.filter(function(c) {
+    if (c.endsWith('_mean_um')) return true;
+    var key = c.replace(/^distance_to_/, '').replace(/_um$/, '');
+    return !meanSet.has('distance_to_' + key + '_mean_um');
+  });
+}
+
+function distColLabel(col) {
+  return col.replace(/^distance_to_/, '')
+    .replace(/_mean_um$/, ' (mean)')
+    .replace(/_um$/, '')
+    .replace(/_label_/g, ' ')
+    .replace(/_/g, ' ')
+    .trim();
+}
+
+// Aggregate per-instance histograms (stored as JSON in rows) onto a common grid
+function aggregateHistograms(rows, key, numBins) {
+  numBins = numBins || 30;
+  var minCol  = 'distance_to_' + key + '_hist_min_um';
+  var maxCol  = 'distance_to_' + key + '_hist_max_um';
+  var histCol = 'distance_to_' + key + '_hist_um';
+  var valid = rows.filter(function(r) {
+    return r[histCol] != null && r[minCol] != null && r[maxCol] != null
+      && isFinite(r[minCol]) && isFinite(r[maxCol]);
+  });
+  if (!valid.length) return null;
+  var gmin = valid.reduce(function(m, r){ return Math.min(m, r[minCol]); }, Infinity);
+  var gmax = valid.reduce(function(m, r){ return Math.max(m, r[maxCol]); }, -Infinity);
+  if (!isFinite(gmin) || gmax <= gmin) return null;
+  var bw = (gmax - gmin) / numBins;
+  var counts = new Array(numBins).fill(0);
+  valid.forEach(function(r) {
+    var hist; try { hist = JSON.parse(r[histCol]); } catch(e){ return; }
+    var hmin = r[minCol], hmax = r[maxCol], n = hist.length;
+    if (n === 0 || hmax <= hmin) return;
+    var sbw = (hmax - hmin) / n;
+    hist.forEach(function(c, i) {
+      if (!c) return;
+      var center = hmin + (i + 0.5) * sbw;
+      var bi = Math.max(0, Math.min(numBins - 1, Math.floor((center - gmin) / bw)));
+      counts[bi] += c;
+    });
+  });
+  var total = counts.reduce(function(a, b){ return a + b; }, 0);
+  return {
+    centers: counts.map(function(_, i){ return gmin + (i + 0.5) * bw; }),
+    counts:  counts,
+    density: counts.map(function(c){ return total > 0 ? c / total / bw : 0; }),
+    width: bw, min: gmin, max: gmax
+  };
+}
+
+function linearRegression(xs, ys) {
+  var n = xs.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (var i = 0; i < n; i++) { sx += xs[i]; sy += ys[i]; sxx += xs[i]*xs[i]; sxy += xs[i]*ys[i]; }
+  var denom = n * sxx - sx * sx;
+  if (!denom) return { slope: 0, intercept: sy / n };
+  var slope = (n * sxy - sx * sy) / denom;
+  return { slope: slope, intercept: (sy - slope * sx) / n };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -576,8 +668,12 @@ function renderEntityStats() {
     block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
       +'<div class="subsection-label">Morphology metrics</div>'
       +'<div class="charts-row mb-3" id="mc-'+ent+'"></div>'
-      +'<div class="subsection-label" id="dc-lbl-'+ent+'" style="display:none">Minimum distance to other structures, one value per instance</div>'
-      +'<div class="charts-row" id="dc-'+ent+'"></div>';
+      +'<div class="subsection-label" id="dc-lbl-'+ent+'" style="display:none">Minimum distance to other structures (one value per instance)</div>'
+      +'<div class="charts-row" id="dc-'+ent+'"></div>'
+      +'<div class="subsection-label mt-3" id="dh-lbl-'+ent+'" style="display:none">Per-pixel distance distributions (aggregated histogram of all pixels within each instance)</div>'
+      +'<div class="charts-row" id="dh-'+ent+'"></div>'
+      +'<div class="subsection-label mt-3" id="dsc-lbl-'+ent+'" style="display:none">Distance correlations (one point per instance)</div>'
+      +'<div class="charts-row" id="dsc-'+ent+'"></div>';
     container.appendChild(block);
 
     var mCols = nonDistMetricCols(rows);
@@ -615,54 +711,194 @@ function renderEntityStats() {
     });
 
     var dCols = distCols(rows);
-    if (!dCols.length) return;
-    var dcLbl = block.querySelector('#dc-lbl-'+ent);
-    if (dcLbl) dcLbl.style.display = '';
-    var dcEl = block.querySelector('#dc-'+ent);
+    if (dCols.length) {
+      var dcLbl = block.querySelector('#dc-lbl-'+ent);
+      if (dcLbl) dcLbl.style.display = '';
+      var dcEl = block.querySelector('#dc-'+ent);
 
-    dCols.forEach(function(col) {
-      var el = document.createElement('div');
-      el.className = 'chart-cell'; el.style.width = '250px';
-      dcEl.appendChild(el);
-      var lbl = col.replace(/^distance_to_/,'').replace(/_label_/,' ').replace(/_um$/,'').replace(/_/g,' ');
-      var traces;
-      if (isSingle) {
+      dCols.forEach(function(col) {
+        var el = document.createElement('div');
+        el.className = 'chart-cell'; el.style.width = '250px';
+        dcEl.appendChild(el);
+        var lbl = distColLabel(col);
+        var traces;
+        if (isSingle) {
+          if (multiGroup) {
+            traces = allGroups.map(function(g){
+              var r = rows.find(function(r){ return r[gKey]===g; });
+              return { type:'bar', name:g, x:[g], marker:{color:gColor(g)},
+                y:[r && r[col]!=null ? r[col] : null] };
+            });
+          } else {
+            traces = [{ type:'bar', x:allGroups.length ? allGroups : [ent], showlegend:false,
+              marker:{color:color},
+              y:(allGroups.length ? allGroups : [null]).map(function(g){
+                var r = g ? rows.find(function(r){ return r[gKey]===g; }) : rows[0];
+                return r && r[col]!=null ? r[col] : null;
+              }) }];
+          }
+          Plotly.newPlot(el, traces, {
+            barmode:'group', margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
+            title:{text:lbl, font:{size:10}}, yaxis:{title:'μm'},
+            showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
+          }, {responsive:true, displayModeBar:false});
+        } else {
+          if (multiGroup) {
+            traces = allGroups.map(function(g){
+              var ys = rows.filter(function(r){ return r[gKey]===g && r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
+              return { type:'box', name:g, y:ys, boxpoints:false, marker:{color:gColor(g)} };
+            });
+          } else {
+            var ys = rows.filter(function(r){ return r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
+            traces = [{ type:'box', name:ent, y:ys, boxpoints:'suspectedoutliers', marker:{color:color} }];
+          }
+          Plotly.newPlot(el, traces, {
+            margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
+            title:{text:lbl, font:{size:10}}, yaxis:{title:'μm'},
+            showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
+          }, {responsive:true, displayModeBar:false});
+        }
+      });
+    }
+
+    // ── Per-pixel distance distribution histograms ────────────────────────────
+    var htargets = histTargets(rows);
+    if (htargets.length) {
+      var dhLbl = block.querySelector('#dh-lbl-'+ent);
+      if (dhLbl) dhLbl.style.display = '';
+      var dhEl = block.querySelector('#dh-'+ent);
+
+      htargets.forEach(function(key) {
+        var el = document.createElement('div');
+        el.className = 'chart-cell'; el.style.width = '320px';
+        dhEl.appendChild(el);
+        var lbl = key.replace(/_label_/g,' ').replace(/_/g,' ').trim();
+        var traces = [];
+
         if (multiGroup) {
-          traces = allGroups.map(function(g){
-            var r = rows.find(function(r){ return r[gKey]===g; });
-            return { type:'bar', name:g, x:[g], marker:{color:gColor(g)},
-              y:[r && r[col]!=null ? r[col] : null] };
+          allGroups.forEach(function(g) {
+            var gRows = rows.filter(function(r){ return r[gKey]===g; });
+            var agg = aggregateHistograms(gRows, key, 30);
+            if (!agg) return;
+            traces.push({
+              type:'bar', name:g,
+              x:agg.centers, y:agg.density,
+              width:agg.width,
+              marker:{color:gColor(g), opacity:0.65},
+              hovertemplate:'%{x:.2f} μm: %{y:.4f}<extra>'+g+'</extra>',
+            });
           });
         } else {
-          traces = [{ type:'bar', x:allGroups.length ? allGroups : [ent], showlegend:false,
-            marker:{color:color},
-            y:(allGroups.length ? allGroups : [null]).map(function(g){
-              var r = g ? rows.find(function(r){ return r[gKey]===g; }) : rows[0];
-              return r && r[col]!=null ? r[col] : null;
-            }) }];
+          var agg = aggregateHistograms(rows, key, 30);
+          if (agg) {
+            traces.push({
+              type:'bar', name:ent,
+              x:agg.centers, y:agg.density,
+              width:agg.width,
+              marker:{color:color, opacity:0.8},
+              hovertemplate:'%{x:.2f} μm: %{y:.4f}<extra></extra>',
+            });
+          }
         }
+
+        if (!traces.length) return;
         Plotly.newPlot(el, traces, {
-          barmode:'group', margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
-          title:{text:lbl, font:{size:10}}, yaxis:{title:'μm'},
-          showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
+          barmode:'overlay',
+          margin:{l:50,r:5,t:30,b:50}, height:270, font:{size:9},
+          title:{text:'→ '+lbl+' (px dist)', font:{size:10}},
+          xaxis:{title:'distance (μm)'},
+          yaxis:{title:'density'},
+          showlegend:multiGroup,
+          legend:{orientation:'h', y:-0.3, font:{size:8}},
         }, {responsive:true, displayModeBar:false});
-      } else {
-        if (multiGroup) {
-          traces = allGroups.map(function(g){
-            var ys = rows.filter(function(r){ return r[gKey]===g && r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
-            return { type:'box', name:g, y:ys, boxpoints:false, marker:{color:gColor(g)} };
-          });
-        } else {
-          var ys = rows.filter(function(r){ return r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
-          traces = [{ type:'box', name:ent, y:ys, boxpoints:'suspectedoutliers', marker:{color:color} }];
+      });
+    }
+
+    // ── Distance correlation scatter plots ────────────────────────────────────
+    var sdCols = scatterDistCols(rows);
+    if (sdCols.length >= 2) {
+      var dscLbl = block.querySelector('#dsc-lbl-'+ent);
+      if (dscLbl) dscLbl.style.display = '';
+      var dscEl = block.querySelector('#dsc-'+ent);
+
+      var pairs = [];
+      for (var pi = 0; pi < sdCols.length; pi++) {
+        for (var qi = pi+1; qi < sdCols.length; qi++) {
+          pairs.push([sdCols[pi], sdCols[qi]]);
         }
-        Plotly.newPlot(el, traces, {
-          margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
-          title:{text:lbl, font:{size:10}}, yaxis:{title:'μm'},
-          showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
-        }, {responsive:true, displayModeBar:false});
       }
-    });
+
+      pairs.slice(0, 20).forEach(function(pair) {
+        var colA = pair[0], colB = pair[1];
+        var lblA = distColLabel(colA), lblB = distColLabel(colB);
+        var el = document.createElement('div');
+        el.className = 'chart-cell'; el.style.width = '280px';
+        dscEl.appendChild(el);
+        var scTraces = [];
+
+        if (multiGroup) {
+          allGroups.forEach(function(g) {
+            var xs = [], ys = [];
+            rows.filter(function(r){ return r[gKey]===g; }).forEach(function(r) {
+              if (r[colA]!=null && isFinite(r[colA]) && r[colB]!=null && isFinite(r[colB])) {
+                xs.push(r[colA]); ys.push(r[colB]);
+              }
+            });
+            if (!xs.length) return;
+            scTraces.push({
+              type:'scatter', mode:'markers', name:g,
+              x:xs, y:ys,
+              marker:{color:gColor(g), size:5, opacity:0.7},
+              hovertemplate:lblA+': %{x:.2f} μm<br>'+lblB+': %{y:.2f} μm<extra>'+g+'</extra>',
+            });
+            if (xs.length >= 3) {
+              var lr = linearRegression(xs, ys);
+              var xlo = Math.min.apply(null,xs), xhi = Math.max.apply(null,xs);
+              scTraces.push({
+                type:'scatter', mode:'lines', showlegend:false,
+                x:[xlo,xhi], y:[lr.intercept+lr.slope*xlo, lr.intercept+lr.slope*xhi],
+                line:{color:gColor(g), width:1.5, dash:'dash'}, hoverinfo:'skip',
+              });
+            }
+          });
+        } else {
+          var xs = [], ys = [], htxts = [];
+          rows.forEach(function(r) {
+            if (r[colA]!=null && isFinite(r[colA]) && r[colB]!=null && isFinite(r[colB])) {
+              xs.push(r[colA]); ys.push(r[colB]);
+              htxts.push('id '+r.label_id);
+            }
+          });
+          if (xs.length) {
+            scTraces.push({
+              type:'scatter', mode:'markers', name:ent,
+              x:xs, y:ys, text:htxts,
+              marker:{color:color, size:5, opacity:0.7},
+              hovertemplate:lblA+': %{x:.2f} μm<br>'+lblB+': %{y:.2f} μm<br>%{text}<extra></extra>',
+            });
+            if (xs.length >= 3) {
+              var lr = linearRegression(xs, ys);
+              var xlo = Math.min.apply(null,xs), xhi = Math.max.apply(null,xs);
+              scTraces.push({
+                type:'scatter', mode:'lines', showlegend:false,
+                x:[xlo,xhi], y:[lr.intercept+lr.slope*xlo, lr.intercept+lr.slope*xhi],
+                line:{color:'#888', width:1.5, dash:'dash'}, hoverinfo:'skip',
+              });
+            }
+          }
+        }
+
+        if (!scTraces.length) return;
+        Plotly.newPlot(el, scTraces, {
+          margin:{l:55,r:5,t:30,b:60}, height:270, font:{size:9},
+          title:{text:lblA+' vs '+lblB, font:{size:10}},
+          xaxis:{title:lblA+' (μm)'},
+          yaxis:{title:lblB+' (μm)'},
+          showlegend:multiGroup,
+          legend:{orientation:'h', y:-0.35, font:{size:8}},
+        }, {responsive:true, displayModeBar:false});
+      });
+    }
   });
 
   maskEnts.forEach(function(ent) {

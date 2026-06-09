@@ -69,6 +69,20 @@ def parse_args() -> argparse.Namespace:
         default=500_000,
         help="Skip branch counting for label instances larger than this voxel count (default: 500000).",
     )
+    parser.add_argument(
+        "--dist-histogram-labels",
+        default="",
+        metavar="NAMES",
+        help="Comma-separated label entity names for which per-pixel distance distributions are computed "
+             "(adds mean/hist_min/hist_max/hist columns). Example: mito,er",
+    )
+    parser.add_argument(
+        "--dist-histogram-bins",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Number of histogram bins for --dist-histogram-labels (default: 20).",
+    )
     return parser.parse_args()
 
 
@@ -358,7 +372,10 @@ def per_label_metrics(
     voxel_size_zyx: Tuple[float, float, float],
     distance_transforms: Dict[str, np.ndarray],
     max_skeleton_voxels: int | None = None,
+    compute_dist_histogram: bool = False,
+    dist_histogram_bins: int = 20,
 ) -> pd.DataFrame:
+    import json
     voxel_um3 = float(np.prod(voxel_size_zyx))
     rows = []
     props = regionprops(labels)
@@ -376,7 +393,26 @@ def per_label_metrics(
         }
         row["sphericity"] = sphericity(row["volume_um3"], row["surface_area_um2"])
         for key, dt in distance_transforms.items():
-            row[f"distance_to_{key}_um"] = float(dt[tuple(rp.coords.T)].min()) if rp.coords.size else float("nan")
+            vals = dt[tuple(rp.coords.T)] if rp.coords.size else np.array([], dtype=np.float32)
+            row[f"distance_to_{key}_um"] = float(vals.min()) if vals.size else float("nan")
+            if compute_dist_histogram:
+                if vals.size:
+                    hist_min = float(vals.min())
+                    hist_max = float(vals.max())
+                    mean_val = float(vals.mean())
+                    if hist_min < hist_max:
+                        counts, _ = np.histogram(vals, bins=dist_histogram_bins, range=(hist_min, hist_max))
+                    else:
+                        counts = np.array([int(vals.size)] + [0] * (dist_histogram_bins - 1), dtype=np.int64)
+                    row[f"distance_to_{key}_mean_um"] = mean_val
+                    row[f"distance_to_{key}_hist_min_um"] = hist_min
+                    row[f"distance_to_{key}_hist_max_um"] = hist_max
+                    row[f"distance_to_{key}_hist_um"] = json.dumps(counts.tolist())
+                else:
+                    row[f"distance_to_{key}_mean_um"] = float("nan")
+                    row[f"distance_to_{key}_hist_min_um"] = float("nan")
+                    row[f"distance_to_{key}_hist_max_um"] = float("nan")
+                    row[f"distance_to_{key}_hist_um"] = None
         rows.append(row)
         centroids.append(np.array(rp.centroid) * np.array(voxel_size_zyx))
 
@@ -646,13 +682,22 @@ def analyze_label_entities(
     all_dts: Dict[str, np.ndarray],
     voxel_size_zyx: Tuple[float, float, float],
 ) -> Dict[str, pd.DataFrame]:
+    hist_names = {normalize_name(n) for n in args.dist_histogram_labels.split(",") if n.strip()} if args.dist_histogram_labels else set()
     label_dfs: Dict[str, pd.DataFrame] = {}
     for src_key in label_keys:
         src_entity = entities[src_key]
         print(f"Analyzing label entity: {src_entity.name}", flush=True)
         src_labels = volumes[src_key].astype(np.int32)
         dts_for_src = distance_transforms_for_source(src_key, label_keys, mask_keys, entities, all_dts)
-        df = per_label_metrics(src_labels, voxel_size_zyx, dts_for_src, max_skeleton_voxels=args.max_skeleton_voxels)
+        compute_hist = src_entity.name in hist_names
+        df = per_label_metrics(
+            src_labels,
+            voxel_size_zyx,
+            dts_for_src,
+            max_skeleton_voxels=args.max_skeleton_voxels,
+            compute_dist_histogram=compute_hist,
+            dist_histogram_bins=args.dist_histogram_bins,
+        )
         label_dfs[src_key] = df
         print(f"  {src_entity.name}: {len(df)} instances", flush=True)
     return label_dfs
