@@ -83,6 +83,13 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Number of histogram bins for --dist-histogram-labels (default: 20).",
     )
+    parser.add_argument(
+        "--polarity-spread-labels",
+        default="",
+        metavar="NAMES",
+        help="Comma-separated label entity names for which per-pixel angular spread on the polarity sphere is computed "
+             "(adds polar_angular_spread_deg). Example: mito,er",
+    )
     return parser.parse_args()
 
 
@@ -367,6 +374,16 @@ def skeleton_metrics(
     return {"branches": branches, "length_um": length_um, "tortuosity": tortuosity}
 
 
+def compute_cell_center_um(membrane_mask: np.ndarray, voxel_size_zyx: Tuple[float, float, float]) -> Tuple[float, float, float] | None:
+    coords = np.argwhere(membrane_mask > 0)
+    if coords.size == 0:
+        return None
+    centroid = coords.mean(axis=0)
+    return (float(centroid[0] * voxel_size_zyx[0]),
+            float(centroid[1] * voxel_size_zyx[1]),
+            float(centroid[2] * voxel_size_zyx[2]))
+
+
 def per_label_metrics(
     labels: np.ndarray,
     voxel_size_zyx: Tuple[float, float, float],
@@ -374,6 +391,8 @@ def per_label_metrics(
     max_skeleton_voxels: int | None = None,
     compute_dist_histogram: bool = False,
     dist_histogram_bins: int = 20,
+    cell_center_zyx_um: Tuple[float, float, float] | None = None,
+    compute_polarity_spread: bool = False,
 ) -> pd.DataFrame:
     import json
     voxel_um3 = float(np.prod(voxel_size_zyx))
@@ -413,6 +432,46 @@ def per_label_metrics(
                     row[f"distance_to_{key}_hist_min_um"] = float("nan")
                     row[f"distance_to_{key}_hist_max_um"] = float("nan")
                     row[f"distance_to_{key}_hist_um"] = None
+
+        # Polarity: direction from cell center to instance centroid on a unit sphere
+        if cell_center_zyx_um is not None:
+            cz, cy, cx = cell_center_zyx_um
+            iz = float(rp.centroid[0]) * voxel_size_zyx[0]
+            iy = float(rp.centroid[1]) * voxel_size_zyx[1]
+            ix = float(rp.centroid[2]) * voxel_size_zyx[2]
+            dz, dy, dx = iz - cz, iy - cy, ix - cx
+            dist_um = math.sqrt(dz**2 + dy**2 + dx**2)
+            row["polar_dist_um"] = dist_um
+            if dist_um > 0:
+                nz, ny, nx_ = dz / dist_um, dy / dist_um, dx / dist_um
+                row["polar_nz"] = nz
+                row["polar_ny"] = ny
+                row["polar_nx"] = nx_
+                row["polar_az_deg"] = math.degrees(math.atan2(ny, nx_))
+                row["polar_el_deg"] = math.degrees(math.asin(max(-1.0, min(1.0, nz))))
+            else:
+                for k in ("polar_nz", "polar_ny", "polar_nx", "polar_az_deg", "polar_el_deg"):
+                    row[k] = float("nan")
+
+            if compute_polarity_spread and rp.coords.size >= 3:
+                pz = rp.coords[:, 0].astype(float) * voxel_size_zyx[0] - cz
+                py = rp.coords[:, 1].astype(float) * voxel_size_zyx[1] - cy
+                px = rp.coords[:, 2].astype(float) * voxel_size_zyx[2] - cx
+                dists_px = np.sqrt(pz**2 + py**2 + px**2)
+                valid = dists_px > 0
+                if valid.sum() >= 3:
+                    pnz = pz[valid] / dists_px[valid]
+                    pny = py[valid] / dists_px[valid]
+                    pnx = px[valid] / dists_px[valid]
+                    mean_dir = np.array([pnz.mean(), pny.mean(), pnx.mean()])
+                    mlen = float(np.linalg.norm(mean_dir))
+                    if mlen > 0:
+                        mean_dir /= mlen
+                    dots = np.clip(pnz * mean_dir[0] + pny * mean_dir[1] + pnx * mean_dir[2], -1.0, 1.0)
+                    row["polar_angular_spread_deg"] = float(np.degrees(np.arccos(dots)).std())
+                else:
+                    row["polar_angular_spread_deg"] = float("nan")
+
         rows.append(row)
         centroids.append(np.array(rp.centroid) * np.array(voxel_size_zyx))
 
@@ -681,22 +740,25 @@ def analyze_label_entities(
     mask_keys: list[str],
     all_dts: Dict[str, np.ndarray],
     voxel_size_zyx: Tuple[float, float, float],
+    cell_center_zyx_um: Tuple[float, float, float] | None = None,
 ) -> Dict[str, pd.DataFrame]:
     hist_names = {normalize_name(n) for n in args.dist_histogram_labels.split(",") if n.strip()} if args.dist_histogram_labels else set()
+    spread_names = {normalize_name(n) for n in args.polarity_spread_labels.split(",") if n.strip()} if args.polarity_spread_labels else set()
     label_dfs: Dict[str, pd.DataFrame] = {}
     for src_key in label_keys:
         src_entity = entities[src_key]
         print(f"Analyzing label entity: {src_entity.name}", flush=True)
         src_labels = volumes[src_key].astype(np.int32)
         dts_for_src = distance_transforms_for_source(src_key, label_keys, mask_keys, entities, all_dts)
-        compute_hist = src_entity.name in hist_names
         df = per_label_metrics(
             src_labels,
             voxel_size_zyx,
             dts_for_src,
             max_skeleton_voxels=args.max_skeleton_voxels,
-            compute_dist_histogram=compute_hist,
+            compute_dist_histogram=src_entity.name in hist_names,
             dist_histogram_bins=args.dist_histogram_bins,
+            cell_center_zyx_um=cell_center_zyx_um,
+            compute_polarity_spread=src_entity.name in spread_names,
         )
         label_dfs[src_key] = df
         print(f"  {src_entity.name}: {len(df)} instances", flush=True)
@@ -933,6 +995,10 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
     label_keys = [k for k, e in dataset.entities.items() if e.kind == "label"]
     mask_keys = [k for k, e in dataset.entities.items() if e.kind == "mask"]
 
+    cell_center_zyx_um = compute_cell_center_um(volumes[membrane_key], voxel_size_zyx)
+    if cell_center_zyx_um is not None:
+        print(f"[polarity] cell center (z,y,x) μm: ({cell_center_zyx_um[0]:.2f}, {cell_center_zyx_um[1]:.2f}, {cell_center_zyx_um[2]:.2f})", flush=True)
+
     target_binary = build_distance_targets(volumes, dataset.entities, label_keys, mask_keys, membrane_key)
     all_dts = build_or_load_dt_cache(
         target_binary=target_binary,
@@ -949,6 +1015,7 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
         mask_keys=mask_keys,
         all_dts=all_dts,
         voxel_size_zyx=voxel_size_zyx,
+        cell_center_zyx_um=cell_center_zyx_um,
     )
 
     print("Building report...", flush=True)

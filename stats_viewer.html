@@ -156,6 +156,13 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
   <div class="section" id="s-entities">
     <div class="section-title">Component Stats</div>
     <p class="section-subtitle">Per-instance distributions for each segmented structure. Box plots show the spread across instances; for multi-cell datasets each box is one cell or group. Hover any plot for exact values.</p>
+    <div id="polarity-ref-bar" class="d-none mb-3 p-2 d-flex flex-wrap align-items-center gap-2" style="background:#f8f8f8;border:1px solid #e0e0e0">
+      <span class="small fw-semibold" style="white-space:nowrap">Polarity reference:</span>
+      <select id="polarity-ref" class="form-select form-select-sm" style="width:auto">
+        <option value="">None (raw orientations)</option>
+      </select>
+      <span class="small text-muted">When set, all polar globes rotate so this entity's mean direction points to the top of the sphere — making polarity comparable across cells.</span>
+    </div>
     <div id="entity-stats-container"></div>
   </div>
 
@@ -303,9 +310,16 @@ function onLoaded() {
   document.getElementById('landing').classList.add('d-none');
   document.getElementById('main-content').classList.remove('d-none');
   document.getElementById('global-filters').classList.remove('d-none');
+  polarRef = ''; _polarRotMap = {};
   initFilters();
   renderAll();
 }
+
+document.getElementById('polarity-ref').addEventListener('change', function() {
+  polarRef = this.value;
+  _polarRotMap = polarRef ? buildPolarRotMap(polarRef) : {};
+  renderEntityStats();
+});
 
 // ══════════════════════════════════════════════════════════════
 //  Helpers
@@ -428,6 +442,64 @@ function linearRegression(xs, ys) {
   if (!denom) return { slope: 0, intercept: sy / n };
   var slope = (n * sxy - sx * sy) / denom;
   return { slope: slope, intercept: (sy - slope * sx) / n };
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Polarity helpers
+// ══════════════════════════════════════════════════════════════
+var polarRef = '';
+var _polarRotMap = {};   // cell_id → {axis:[nz,ny,nx], angle} | null
+
+function cross3(a, b) {
+  return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+}
+function normVec3(v) {
+  var l = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+  return l > 0 ? [v[0]/l, v[1]/l, v[2]/l] : [0, 0, 1];
+}
+// Rodrigues' rotation: rotate v around axis by angle
+function rodrigues(v, axis, angle) {
+  var c = Math.cos(angle), s = Math.sin(angle);
+  var dot = v[0]*axis[0]+v[1]*axis[1]+v[2]*axis[2];
+  var cr = cross3(axis, v);
+  return [c*v[0]+s*cr[0]+(1-c)*dot*axis[0],
+          c*v[1]+s*cr[1]+(1-c)*dot*axis[1],
+          c*v[2]+s*cr[2]+(1-c)*dot*axis[2]];
+}
+
+// Build per-cell rotation map that aligns refEnt's mean direction to north (nz=1)
+function buildPolarRotMap(refEntName) {
+  var map = {};
+  if (!refEntName) return map;
+  var north = [1, 0, 0]; // nz=1 → el=90° in our convention (vector is [nz,ny,nx])
+  uniq(ALL.map(function(r){ return r.cell_id; }).filter(Boolean)).forEach(function(cid) {
+    var rr = ALL.filter(function(r) {
+      return r.row_type==='instance' && r.entity_name===refEntName && r.cell_id===cid
+        && r.polar_nz!=null && isFinite(r.polar_nz);
+    });
+    if (!rr.length) return;
+    var mz=0, my=0, mx=0;
+    rr.forEach(function(r){ mz+=r.polar_nz; my+=r.polar_ny; mx+=r.polar_nx; });
+    var ref = normVec3([mz/rr.length, my/rr.length, mx/rr.length]);
+    var dot = ref[0]*north[0]+ref[1]*north[1]+ref[2]*north[2];
+    if (dot >= 1-1e-8) { map[cid] = null; return; }
+    if (dot <= -1+1e-8) { map[cid] = {axis:[0,1,0], angle:Math.PI}; return; }
+    map[cid] = {axis: normVec3(cross3(ref, north)), angle: Math.acos(Math.max(-1, Math.min(1, dot)))};
+  });
+  return map;
+}
+
+// Get (az, el) in degrees for a row, applying normalization rotation if active
+function getPolarCoords(row) {
+  if (row.polar_nz == null || !isFinite(row.polar_nz)) return null;
+  if (!polarRef) return {az: row.polar_az_deg, el: row.polar_el_deg};
+  var v = [row.polar_nz, row.polar_ny, row.polar_nx];
+  var rot = _polarRotMap[row.cell_id];
+  if (rot) v = rodrigues(v, rot.axis, rot.angle);
+  return {
+    az: Math.atan2(v[1], v[2]) * 180 / Math.PI,
+    el: Math.asin(Math.max(-1, Math.min(1, v[0]))) * 180 / Math.PI,
+  };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -631,6 +703,110 @@ function renderStructure() {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  Polarity section renderer
+// ══════════════════════════════════════════════════════════════
+function renderPolarSection(block, ent, rows, color, multiGroup, allGroups, gKey) {
+  var hasPolar = rows.some(function(r){ return r.polar_az_deg!=null && isFinite(r.polar_az_deg); });
+  if (!hasPolar) return;
+
+  var ppLbl = block.querySelector('#pp-lbl-'+ent);
+  if (ppLbl) ppLbl.style.display = '';
+  var ppEl = block.querySelector('#pp-'+ent);
+
+  // Globe scatter
+  var globeEl = document.createElement('div');
+  globeEl.className = 'chart-cell';
+  globeEl.style.cssText = 'width:320px;height:320px;flex-shrink:0';
+  ppEl.appendChild(globeEl);
+
+  var geoLayout = {
+    showland:false, showocean:false, showlakes:false, showrivers:false, showcoastlines:false,
+    showframe:true, bgcolor:'#f5f5f5', framewidth:1, framecolor:'#999',
+    lataxis:{showgrid:true, gridcolor:'#ddd', gridwidth:0.5, range:[-90,90]},
+    lonaxis:{showgrid:true, gridcolor:'#ddd', gridwidth:0.5, range:[-180,180]},
+    projection:{type:'orthographic'},
+  };
+
+  var traces = [];
+  if (multiGroup) {
+    allGroups.forEach(function(g) {
+      var lons=[], lats=[], txts=[];
+      rows.filter(function(r){ return r[gKey]===g; }).forEach(function(r) {
+        var pc = getPolarCoords(r); if (!pc) return;
+        lons.push(pc.az); lats.push(pc.el);
+        txts.push('id '+r.label_id+(r.polar_dist_um!=null?' '+( +r.polar_dist_um).toFixed(1)+'μm':''));
+      });
+      if (!lons.length) return;
+      traces.push({type:'scattergeo', mode:'markers', name:g,
+        lon:lons, lat:lats, text:txts,
+        marker:{color:gColor(g), size:6, opacity:0.8, line:{width:0}},
+        hovertemplate:'az %{lon:.1f}° el %{lat:.1f}°<br>%{text}<extra>'+g+'</extra>'});
+    });
+  } else {
+    var lons=[], lats=[], txts=[], dists=[];
+    rows.forEach(function(r) {
+      var pc = getPolarCoords(r); if (!pc) return;
+      lons.push(pc.az); lats.push(pc.el);
+      txts.push('id '+r.label_id);
+      dists.push(r.polar_dist_um!=null ? +r.polar_dist_um : null);
+    });
+    var hasDistColor = dists.some(function(d){ return d!=null; });
+    if (lons.length) traces.push({
+      type:'scattergeo', mode:'markers', name:ent,
+      lon:lons, lat:lats, text:txts,
+      marker: hasDistColor ? {
+        color:dists, colorscale:'Viridis', size:7, opacity:0.85, line:{width:0},
+        colorbar:{title:{text:'dist (μm)', font:{size:8}}, thickness:10, len:0.5, x:1.05},
+      } : {color:color, size:7, opacity:0.85, line:{width:0}},
+      hovertemplate:'az %{lon:.1f}° el %{lat:.1f}°<br>%{text}'+(hasDistColor?'<br>%{marker.color:.1f} μm':'')+'<extra></extra>',
+    });
+  }
+
+  if (!traces.length) return;
+  Plotly.newPlot(globeEl, traces, {
+    geo: geoLayout,
+    margin:{l:0,r:50,t:28,b:0}, height:320, width:320,
+    title:{text:'polarity'+(polarRef?' [ref: '+polarRef+']':''), font:{size:10}},
+    showlegend: multiGroup && traces.length > 1,
+    legend:{orientation:'h', y:-0.08, font:{size:8}},
+  }, {responsive:false, displayModeBar:false});
+
+  // Distance from cell center — box plot
+  var dRows = rows.filter(function(r){ return r.polar_dist_um!=null && isFinite(r.polar_dist_um); });
+  if (dRows.length) {
+    var dEl = document.createElement('div');
+    dEl.className = 'chart-cell'; dEl.style.width = '200px';
+    ppEl.appendChild(dEl);
+    var dTraces = multiGroup
+      ? allGroups.map(function(g){ return {type:'box', name:g, boxpoints:false, marker:{color:gColor(g)},
+          y:dRows.filter(function(r){return r[gKey]===g;}).map(function(r){return r.polar_dist_um;})}; })
+      : [{type:'box', name:ent, boxpoints:'suspectedoutliers', marker:{color:color},
+          y:dRows.map(function(r){return r.polar_dist_um;})}];
+    Plotly.newPlot(dEl, dTraces, {
+      margin:{l:50,r:5,t:30,b:40}, height:280, font:{size:9},
+      title:{text:'dist from center', font:{size:10}}, yaxis:{title:'μm'}, showlegend:false,
+    }, {responsive:true, displayModeBar:false});
+  }
+
+  // Angular spread — box plot (only if column present)
+  var sRows = rows.filter(function(r){ return r.polar_angular_spread_deg!=null && isFinite(r.polar_angular_spread_deg); });
+  if (sRows.length) {
+    var sEl = document.createElement('div');
+    sEl.className = 'chart-cell'; sEl.style.width = '200px';
+    ppEl.appendChild(sEl);
+    var sTraces = multiGroup
+      ? allGroups.map(function(g){ return {type:'box', name:g, boxpoints:false, marker:{color:gColor(g)},
+          y:sRows.filter(function(r){return r[gKey]===g;}).map(function(r){return r.polar_angular_spread_deg;})}; })
+      : [{type:'box', name:ent, boxpoints:'suspectedoutliers', marker:{color:color},
+          y:sRows.map(function(r){return r.polar_angular_spread_deg;})}];
+    Plotly.newPlot(sEl, sTraces, {
+      margin:{l:50,r:5,t:30,b:40}, height:280, font:{size:9},
+      title:{text:'angular spread', font:{size:10}}, yaxis:{title:'°'}, showlegend:false,
+    }, {responsive:true, displayModeBar:false});
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
 //  Entity Stats
 // ══════════════════════════════════════════════════════════════
 function renderEntityStats() {
@@ -673,7 +849,9 @@ function renderEntityStats() {
       +'<div class="subsection-label mt-3" id="dh-lbl-'+ent+'" style="display:none">Per-pixel distance distributions (aggregated histogram of all pixels within each instance)</div>'
       +'<div class="charts-row" id="dh-'+ent+'"></div>'
       +'<div class="subsection-label mt-3" id="dsc-lbl-'+ent+'" style="display:none">Distance correlations (one point per instance)</div>'
-      +'<div class="charts-row" id="dsc-'+ent+'"></div>';
+      +'<div class="charts-row" id="dsc-'+ent+'"></div>'
+      +'<div class="subsection-label mt-3" id="pp-lbl-'+ent+'" style="display:none">Spatial polarity — position on sphere around cell center</div>'
+      +'<div class="charts-row" id="pp-'+ent+'"></div>';
     container.appendChild(block);
 
     var mCols = nonDistMetricCols(rows);
@@ -899,7 +1077,27 @@ function renderEntityStats() {
         }, {responsive:true, displayModeBar:false});
       });
     }
-  });
+
+    // ── Spatial polarity ──────────────────────────────────────────────────────
+    renderPolarSection(block, ent, rows, color, multiGroup, allGroups, gKey);
+
+  }); // end labelEnts.forEach
+
+  // Update polarity reference dropdown
+  var polarEnts = uniq(instRows.filter(function(r){
+    return r.entity_kind==='label' && r.polar_az_deg!=null && isFinite(r.polar_az_deg);
+  }).map(function(r){ return r.entity_name; }));
+  var polarBar = document.getElementById('polarity-ref-bar');
+  var polarSel = document.getElementById('polarity-ref');
+  if (polarEnts.length) {
+    polarBar.classList.remove('d-none');
+    polarSel.innerHTML = '<option value="">None (raw orientations)</option>'
+      + polarEnts.map(function(e){
+          return '<option value="'+e+'"'+(polarRef===e?' selected':'')+'>'+e+'</option>';
+        }).join('');
+  } else {
+    polarBar.classList.add('d-none');
+  }
 
   maskEnts.forEach(function(ent) {
     var mRows = fileRows.filter(function(r){ return r.entity_name===ent && r.entity_kind==='mask'; });
