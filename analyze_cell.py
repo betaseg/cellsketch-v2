@@ -59,10 +59,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-clip-to-pm", action="store_true")
     parser.add_argument("--num-threads", type=int, default=0)
     parser.add_argument("--with-mesh", action="store_true", help="Generate a 3D mesh per instance (required for mesh_viewer.html and Blender export).")
-    parser.add_argument("--mesh-smooth-sigma", type=float, default=0.7, metavar="SIGMA", help="Gaussian sigma for mesh smoothing before marching cubes (default: 0.7). Set to 0 to disable.")
+    parser.add_argument("--mesh-smooth-sigma", type=float, default=0.7, metavar="SIGMA", help="Gaussian sigma for smoothing the signed distance field before marching cubes (default: 0.7). Set to 0 to disable.")
     parser.add_argument("--mesh-step-size", type=int, default=2, metavar="N", help="Marching cubes step size — controls mesh resolution (default: 2). 1 = full resolution, higher = coarser.")
     parser.add_argument("--mesh-target-reduction", type=float, default=0.8, metavar="F", help="QEM decimation target reduction fraction (default: 0.8 = keep 20%% of faces). Set to 0 to disable.")
-    parser.add_argument("--mesh-level", type=float, default=None, metavar="L", help="Marching cubes iso-surface level (default: 0.25 with smoothing, 0.5 without). Lower values capture finer structures.")
+    parser.add_argument("--mesh-level", type=float, default=None, metavar="L", help="Marching cubes iso-surface level on the signed distance field (default: 0.0 = true boundary). Negative dilates, positive erodes.")
     parser.add_argument("--force-reprocess", action="store_true", help="Re-process cells even if report.csv already exists.")
     parser.add_argument(
         "--max-skeleton-voxels",
@@ -519,7 +519,11 @@ def _generate_mesh_b64(
     target_reduction: float = 0.8,
     level: float | None = None,
 ) -> str:
-    """Mesh a (Z,Y,X) binary mask via marching cubes.
+    """Mesh a (Z,Y,X) binary mask via marching cubes on a signed distance field.
+
+    The surface is the zero-level set of ``inside_EDT − outside_EDT`` (optionally
+    smoothed), which sits at the true voxel boundary — this preserves thin
+    structures and avoids the volume-inflation of blurring the binary directly.
 
     Binary payload (gzip-compressed, then base64):
       [uint32 nV][uint32 nF]
@@ -530,14 +534,18 @@ def _generate_mesh_b64(
     if binary.sum() < 8:
         return ""
     try:
-        padded = np.pad(binary.astype(np.float32), pad_width=1)
+        # An instance's foreground reaches every face of its own bounding box, so we pad
+        # with background before meshing. With smoothing, pad by ~3σ so the smoothed
+        # field settles to "outside" well before the border → closed watertight mesh.
+        pad = 1 if smooth_sigma <= 0 else int(math.ceil(3.0 * smooth_sigma)) + 1
+        b = np.pad(binary.astype(bool), pad_width=pad)
+        # Signed distance field in voxel-index units: >0 inside, <0 outside, 0 at boundary.
+        sdf = (distance_transform_edt(b) - distance_transform_edt(~b)).astype(np.float32)
         if smooth_sigma > 0:
-            padded = gaussian_filter(padded, sigma=smooth_sigma)
-            iso_level = level if level is not None else 0.25
-        else:
-            iso_level = level if level is not None else 0.5
-        verts, faces, _, _ = marching_cubes(padded, level=iso_level, step_size=step_size)
-        verts = verts - 1.0  # undo padding offset → local voxel coords
+            sdf = gaussian_filter(sdf, sigma=smooth_sigma)
+        iso_level = level if level is not None else 0.0
+        verts, faces, _, _ = marching_cubes(sdf, level=iso_level, step_size=step_size)
+        verts = verts - pad  # undo padding offset → local voxel coords
         oz, oy, ox = bbox_origin_zyx
         sz, sy, sx = voxel_size_zyx
         # Reorder ZYX → XYZ in µm (Three.js convention)
