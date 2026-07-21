@@ -109,6 +109,42 @@ async function parseMeshB64(b64) {
   return geo;
 }
 
+// Decode a skeleton_b64 line-segment payload → indexed BufferGeometry for THREE.LineSegments.
+// Same container format & XYZ-µm coordinates as parseMeshB64, but the index buffer holds
+// edge pairs (2 per segment) rather than triangle faces.
+async function parseSkeletonB64(b64) {
+  const bin = atob(b64);
+  const compressed = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) compressed[i] = bin.charCodeAt(i);
+  const ds = new DecompressionStream('gzip');
+  const w = ds.writable.getWriter();
+  w.write(compressed); w.close();
+  const chunks = [];
+  const reader = ds.readable.getReader();
+  for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); }
+  const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+  const raw = new Uint8Array(totalLen);
+  let off = 0;
+  for (const c of chunks) { raw.set(c, off); off += c.length; }
+  const ab = raw.buffer;
+  const nV      = new Uint32Array(ab, 0, 1)[0];
+  const nE      = new Uint32Array(ab, 4, 1)[0];
+  const minXYZ  = new Float32Array(ab, 8, 3);
+  const scaXYZ  = new Float32Array(ab, 20, 3);
+  const vertsQ  = new Uint16Array(ab.slice(32, 32 + nV * 6));
+  const idxBuf  = new Uint32Array(ab.slice(32 + nV * 6));
+  const pos = new Float32Array(nV * 3);
+  for (let i = 0; i < nV; i++) {
+    pos[i*3]   = minXYZ[0] + (vertsQ[i*3]   / 65535) * scaXYZ[0];
+    pos[i*3+1] = minXYZ[1] + (vertsQ[i*3+1] / 65535) * scaXYZ[1];
+    pos[i*3+2] = minXYZ[2] + (vertsQ[i*3+2] / 65535) * scaXYZ[2];
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setIndex(new THREE.BufferAttribute(idxBuf, 1));
+  return geo;
+}
+
 function clearMeshes(scene) {
   const rm = [];
   scene.traverse(o => { if (o.isMesh) rm.push(o); });
@@ -327,8 +363,32 @@ window.render3DThumbs = async function(sample, colorFn) {
 
 // ── Single-instance modal scene ──────────────────────────────
 let _MR = null, _MS = null, _MC = null, _MO = null;
+let _MGroup = null;                 // current model (mesh + skeleton), recentred at origin
+let _MModel = null;                 // { meshMat, line } refs for the live toggles
+let _mmControlsInited = false;
 
-window.showMesh3D = function(b64, title) {
+function applyModalMeshOpacity(v) {
+  if (!_MModel || !_MModel.meshMat) return;
+  _MModel.meshMat.opacity = v;
+  _MModel.meshMat.transparent = v < 0.999;
+  _MModel.meshMat.depthWrite = v >= 0.999;
+  _MModel.meshMat.needsUpdate = true;
+}
+
+function initModalControls() {
+  if (_mmControlsInited) return;
+  _mmControlsInited = true;
+  document.getElementById('mm-skel').addEventListener('change', function() {
+    if (_MModel && _MModel.line) _MModel.line.visible = this.checked;
+  });
+  document.getElementById('mm-opacity').addEventListener('input', function() {
+    applyModalMeshOpacity(+this.value);
+  });
+}
+
+// row must carry mesh_b64; skeleton_b64 is optional (rendered as an overlay when present).
+window.showMesh3D = function(row, title) {
+  initModalControls();
   document.getElementById('mesh-modal-title').textContent = title || '';
   bootstrap.Modal.getOrCreateInstance(document.getElementById('mesh-modal')).show();
   document.getElementById('mesh-modal').addEventListener('shown.bs.modal', async function init() {
@@ -352,12 +412,55 @@ window.showMesh3D = function(b64, title) {
         _MO.update(); _MR.render(_MS, _MC);
       })();
     }
-    clearMeshes(_MS);
-    const geo = await parseMeshB64(b64);
-    geo.computeBoundingBox();
-    const center = geo.boundingBox.getCenter(new THREE.Vector3());
-    geo.translate(-center.x, -center.y, -center.z);
-    _MS.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({ color: 0x888888, side: THREE.DoubleSide, shininess: 40 })));
+
+    // Dispose the previously shown model.
+    if (_MGroup) {
+      _MGroup.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+      _MS.remove(_MGroup); _MGroup = null;
+    }
+    _MModel = null;
+
+    const grp = new THREE.Group();
+    const hasSkel = !!row.skeleton_b64;
+
+    const meshGeo = await parseMeshB64(row.mesh_b64);
+    const meshMat = new THREE.MeshPhongMaterial({
+      color: 0x9aa4b2, side: THREE.DoubleSide, shininess: 30,
+      transparent: hasSkel, opacity: hasSkel ? 0.35 : 1.0, depthWrite: !hasSkel,
+    });
+    grp.add(new THREE.Mesh(meshGeo, meshMat));
+
+    let line = null;
+    if (hasSkel) {
+      const skelGeo = await parseSkeletonB64(row.skeleton_b64).catch(() => null);
+      if (skelGeo) {
+        line = new THREE.LineSegments(skelGeo, new THREE.LineBasicMaterial({ color: 0x22d3ee }));
+        grp.add(line);
+      }
+    }
+
+    // Recentre the whole model (mesh + skeleton stay aligned — shared µm coordinates).
+    grp.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(grp);
+    if (!box.isEmpty()) {
+      const center = box.getCenter(new THREE.Vector3());
+      grp.position.sub(center);
+    }
+    _MS.add(grp);
+    _MGroup = grp;
+    _MModel = { meshMat, line };
+
+    // Sync the controls to this model's availability/defaults.
+    const skelChk = document.getElementById('mm-skel');
+    const skelWrap = document.getElementById('mm-skel-wrap');
+    const haveLine = !!line;
+    skelWrap.style.display = haveLine ? '' : 'none';
+    skelChk.checked = haveLine;
+    if (line) line.visible = true;
+    const opSlider = document.getElementById('mm-opacity');
+    opSlider.value = haveLine ? 0.35 : 1.0;
+    applyModalMeshOpacity(+opSlider.value);
+
     fitCamera(_MS, _MC, _MO);
   }, { once: true });
 };
@@ -519,7 +622,17 @@ window.showMesh3D = function(b64, title) {
     <div class="modal-content" style="background:#0e0e18;border:none;border-radius:10px;overflow:hidden">
       <div class="modal-header border-0 pb-0 px-3 pt-2">
         <span id="mesh-modal-title" class="text-light small fw-semibold"></span>
-        <button type="button" class="btn-close btn-close-white ms-auto" data-bs-dismiss="modal"></button>
+        <div class="d-flex align-items-center gap-3 ms-auto">
+          <div class="form-check form-switch m-0" id="mm-skel-wrap" style="display:none">
+            <input class="form-check-input" type="checkbox" id="mm-skel" checked>
+            <label class="form-check-label text-light small" for="mm-skel">Skeleton</label>
+          </div>
+          <div class="d-flex align-items-center gap-1">
+            <label class="text-light small mb-0" for="mm-opacity">Mesh</label>
+            <input type="range" id="mm-opacity" class="form-range" min="0" max="1" step="0.05" value="0.35" style="width:90px">
+          </div>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        </div>
       </div>
       <div class="modal-body p-0">
         <canvas id="mesh-modal-canvas" style="width:100%;height:440px;display:block"></canvas>
@@ -730,7 +843,7 @@ function filtered(rowType) {
 }
 
 var SKIP = new Set(['cell_id','group_id','entity_name','entity_kind','row_type','label_id',
-  'instance_count','total_volume_um3','mesh_b64','file_size_bytes','file_mtime','file_name']);
+  'instance_count','total_volume_um3','mesh_b64','skeleton_b64','file_size_bytes','file_mtime','file_name']);
 
 // ══════════════════════════════════════════════════════════════
 //  Filters
@@ -906,7 +1019,7 @@ document.getElementById('thumb-grid').addEventListener('click', function(e) {
   if (!card) return;
   var row = _currentSample[+card.dataset.idx];
   if (row && row.mesh_b64 && typeof window.showMesh3D === 'function') {
-    window.showMesh3D(row.mesh_b64, row.entity_name + ' · ' + (row.cell_id||'') + ' #' + row.label_id);
+    window.showMesh3D(row, row.entity_name + ' · ' + (row.cell_id||'') + ' #' + row.label_id);
   }
 });
 </script>

@@ -124,9 +124,10 @@ Important columns:
 
 - identity: `cell_id`, `group_id`, `entity_name`, `entity_kind`, `row_type`
 - morphology: `volume_um3`, `surface_area_um2`, `sphericity`, `aspect_ratio_major_minor`
-- skeleton metrics: `branches`, `length_um`, `tortuosity`
+- skeleton metrics (from the kimimaro curve skeleton): `branches`, `length_um`, `tortuosity` (length-weighted per-branch arc/chord, ≥1; branch polylines are smoothed first so voxel staircasing does not inflate it)
 - distance metrics: `distance_to_<target>_um`, `distance_to_closest_same_type_um`
 - mesh payload: `mesh_b64` (only in `report_meshes.csv`)
+- skeleton payload: `skeleton_b64` (only in `report_meshes.csv`) — per-instance skeleton as line segments, overlaid on the mesh in `mesh_viewer.html`
 
 ## Viewers and how to use them
 
@@ -140,6 +141,7 @@ Live hosted viewers: [https://betaseg.github.io/cellsketch-v2/](https://betaseg.
   - load: drag/drop a per-cell `report_meshes.csv`
   - requirement: analysis must be run with `--with-mesh`
   - use for: interactive 3D meshes and per-instance inspection
+  - click any instance to open it in 3D; when a `skeleton_b64` is present the skeleton is drawn as an overlay with the mesh shown semi-transparent around it (toggle the skeleton and adjust mesh opacity in the modal header)
 
 ## Blender
 

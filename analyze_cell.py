@@ -10,7 +10,11 @@
 #   "edt>=2.4.0",
 #   "fast-simplification>=0.1.6",
 #   "imagecodecs",
-#   "pyarrow>=14.0.0"
+#   "pyarrow>=14.0.0",
+#   "kimimaro>=4.0.0",
+#   "crackle-codec",
+#   "posix-ipc",
+#   "psutil"
 # ]
 # ///
 
@@ -31,10 +35,10 @@ import edt
 import numpy as np
 import pandas as pd
 import tifffile
-from scipy.ndimage import convolve, distance_transform_edt, gaussian_filter, label as nd_label
+from scipy.ndimage import distance_transform_edt, gaussian_filter, label as nd_label
+from scipy.spatial.distance import cdist
 import fast_simplification
 from skimage.measure import marching_cubes, regionprops
-from skimage.morphology import skeletonize
 
 
 @dataclass
@@ -68,7 +72,8 @@ def parse_args() -> argparse.Namespace:
         "--max-skeleton-voxels",
         type=int,
         default=500_000,
-        help="Skip branch counting for label instances larger than this voxel count (default: 500000).",
+        help="Skip curve-skeleton extraction (branches/length/tortuosity + skeleton overlay) "
+             "for label instances larger than this voxel count (default: 500000).",
     )
     parser.add_argument(
         "--dist-histogram-labels",
@@ -90,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         metavar="NAMES",
         help="Comma-separated label entity names for which per-pixel angular spread on the polarity sphere is computed "
              "(adds polar_angular_spread_deg). Example: mito,er",
+    )
+    parser.add_argument(
+        "--auto-label-masks",
+        action="store_true",
+        help="Automatically promote masks with multiple connected components to label entities "
+             "(off by default — enable explicitly to opt in).",
     )
     return parser.parse_args()
 
@@ -304,73 +315,208 @@ def aspect_ratio_from_coords(coords_zyx: np.ndarray, voxel_size_zyx: Tuple[float
     return float(lengths.max() / lengths.min())
 
 
-def skeleton_metrics(
-    binary_mask: np.ndarray,
+# Minimum component size (voxels) for kimimaro to attempt a skeleton.
+SKELETON_DUST_VOXELS = 2
+
+# TEASAR parameters for curve-skeleton extraction. Distances are in µm (matching the
+# anisotropy we pass). scale/const set the branch-pruning aggressiveness; soma handling
+# is disabled (it targets neurons, not organelles).
+_TEASAR_PARAMS = {
+    "scale": 1.5,
+    "const": 0.05,
+    "pdrf_scale": 100000,
+    "pdrf_exponent": 4,
+    "soma_detection_threshold": 1e9,
+    "soma_acceptance_threshold": 1e9,
+}
+
+
+def compute_curve_skeletons(
+    labels: np.ndarray,
     voxel_size_zyx: Tuple[float, float, float],
     max_voxels: int | None = None,
+    num_threads: int = 0,
 ) -> dict:
-    """Run skeletonise once and return branches, length_um, and tortuosity.
+    """TEASAR curve skeletons for every instance in a label volume (kimimaro).
 
-    Length: sum of physical edge lengths in the 26-connected skeleton graph.
-    Tortuosity: length / straight-line end-to-end distance (only for simple
-    filaments with exactly two endpoints; NaN for branching structures).
+    Returns ``{label_id: cloudvolume.Skeleton}``. Skeletons are true 1-voxel-wide
+    curves (no medial-surface sheets), anisotropy-aware, with vertices in µm in the
+    cropped-volume frame (index × voxel size, axis order ZYX). Instances larger than
+    ``max_voxels`` are skipped to bound runtime. Returns ``{}`` if kimimaro is missing.
     """
-    nan_row = {"branches": float("nan"), "length_um": float("nan"), "tortuosity": float("nan")}
-    n = int(binary_mask.sum())
-    if n == 0:
-        return {"branches": 0, "length_um": 0.0, "tortuosity": float("nan")}
-    if max_voxels is not None and n > max_voxels:
-        return nan_row
+    try:
+        import kimimaro
+    except ImportError:
+        print("[skeleton] kimimaro unavailable — skeleton metrics/geometry disabled.", flush=True)
+        return {}
 
-    skel = skeletonize(binary_mask.astype(bool))
-    if not skel.any():
-        return {"branches": 0, "length_um": 0.0, "tortuosity": float("nan")}
+    lab = np.ascontiguousarray(labels.astype(np.uint32))
+    object_ids = None
+    if max_voxels is not None:
+        ids, counts = np.unique(lab[lab > 0], return_counts=True)
+        object_ids = [int(i) for i, c in zip(ids, counts) if c <= max_voxels]
+        if not object_ids:
+            return {}
 
-    vz, vy, vx = voxel_size_zyx
+    def _run(parallel: int) -> dict:
+        return kimimaro.skeletonize(
+            lab,
+            teasar_params=_TEASAR_PARAMS,
+            anisotropy=tuple(float(v) for v in voxel_size_zyx),
+            object_ids=object_ids,
+            dust_threshold=SKELETON_DUST_VOXELS,
+            fix_branching=True,
+            fix_borders=True,
+            progress=False,
+            parallel=parallel,
+        )
 
-    # ── Skeleton length ────────────────────────────────────────────────────
-    # Precompute the 26 neighbour offsets and their physical distances.
-    neighbour_steps: list[tuple[tuple[int, int, int], float]] = []
-    for dz in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dz == dy == dx == 0:
-                    continue
-                neighbour_steps.append(
-                    ((dz, dy, dx), math.sqrt((dz * vz) ** 2 + (dy * vy) ** 2 + (dx * vx) ** 2))
-                )
+    # kimimaro's multi-process path needs posix_ipc/psutil for shared memory; if anything
+    # about it fails, fall back to single-threaded rather than crashing the whole run.
+    parallel = num_threads if num_threads and num_threads > 0 else 0
+    if parallel == 1:
+        return _run(1)
+    try:
+        return _run(parallel)
+    except Exception as exc:
+        print(f"[skeleton] parallel kimimaro failed ({type(exc).__name__}); retrying single-threaded.", flush=True)
+        return _run(1)
 
-    coords = np.argwhere(skel)
-    coord_set = set(map(tuple, coords.tolist()))
-    length_um = 0.0
-    for z, y, x in coords:
-        for (dz, dy, dx), dist in neighbour_steps:
-            if (z + dz, y + dy, x + dx) in coord_set:
-                length_um += dist
-    length_um /= 2.0  # each edge is traversed from both endpoints
 
-    # ── Branch count ───────────────────────────────────────────────────────
-    kernel = np.ones((3, 3, 3), dtype=np.int16)
-    kernel[1, 1, 1] = 0
-    degree = convolve(skel.astype(np.int16), kernel, mode="constant", cval=0)
-    junction_mask = skel & (degree >= 3)
-    connectivity = np.ones((3, 3, 3), dtype=np.uint8)
-    segment_mask = skel & ~junction_mask
-    _, n_segments = nd_label(segment_mask.astype(np.uint8), structure=connectivity)
-    branches = int(n_segments)
+def _skeleton_to_b64(sk) -> str:
+    """Encode a kimimaro Skeleton as a line-segment payload for the 3D viewer.
 
-    # ── Tortuosity ─────────────────────────────────────────────────────────
-    # Defined only for simple filaments (exactly two endpoints), matching
-    # tortuosity = length / straight_line_distance.
-    endpoint_mask = skel & (degree == 1)
-    ep_coords = np.argwhere(endpoint_mask)
-    tortuosity = float("nan")
-    if len(ep_coords) == 2:
-        p1 = ep_coords[0].astype(float) * np.array([vz, vy, vx])
-        p2 = ep_coords[1].astype(float) * np.array([vz, vy, vx])
-        end_to_end = float(np.linalg.norm(p2 - p1))
-        if end_to_end > 0:
-            tortuosity = length_um / end_to_end
+    kimimaro vertices are µm in the cropped-volume frame, axis order ZYX; we reorder
+    to XYZ to match _generate_mesh_b64 so the skeleton overlays exactly on its mesh.
+
+    Binary payload (gzip-compressed, then base64):
+      [uint32 nV][uint32 nE]
+      [float32×3 min_xyz][float32×3 scale_xyz]   ← dequantisation params
+      [uint16 × nV×3 quantised XYZ vertices]
+      [uint32 × nE×2 edge index pairs]
+    """
+    if sk is None:
+        return ""
+    verts = np.asarray(sk.vertices, dtype=np.float32)
+    edges = np.asarray(sk.edges, dtype=np.uint32)
+    if len(verts) < 2 or len(edges) == 0:
+        return ""
+    verts_xyz = np.column_stack([verts[:, 2], verts[:, 1], verts[:, 0]]).astype(np.float32)
+
+    min_xyz = verts_xyz.min(axis=0)
+    scale_xyz = verts_xyz.max(axis=0) - min_xyz
+    scale_xyz[scale_xyz == 0] = 1.0
+    verts_q = np.clip(
+        (verts_xyz - min_xyz) / scale_xyz * 65535 + 0.5, 0, 65535
+    ).astype(np.uint16)
+    header = np.array([len(verts_xyz), len(edges)], dtype=np.uint32)
+    quant_params = np.concatenate([min_xyz, scale_xyz]).astype(np.float32)
+    payload = header.tobytes() + quant_params.tobytes() + verts_q.tobytes() + edges.tobytes()
+    return base64.b64encode(gzip.compress(payload, compresslevel=9)).decode()
+
+
+def _branch_segments(adj: list[list[int]], deg: np.ndarray) -> list[list[int]]:
+    """Split a skeleton graph into maximal chains between nodes of degree ≠ 2.
+
+    Each returned list is a vertex-index path from one endpoint/junction to the next,
+    passing only through degree-2 nodes — i.e. one anatomical branch.
+    """
+    def ek(a: int, b: int) -> tuple[int, int]:
+        return (a, b) if a < b else (b, a)
+
+    seen: set[tuple[int, int]] = set()
+    segments: list[list[int]] = []
+    breakpoints = [v for v in range(len(adj)) if adj[v] and deg[v] != 2]
+    # A component made entirely of degree-2 nodes (a closed loop) has no breakpoints;
+    # seed from any of its vertices so it still yields one segment.
+    if not breakpoints:
+        nonempty = [v for v in range(len(adj)) if adj[v]]
+        breakpoints = nonempty[:1]
+    for s in breakpoints:
+        for nb in adj[s]:
+            if ek(s, nb) in seen:
+                continue
+            seen.add(ek(s, nb))
+            path = [s, nb]
+            prev, cur = s, nb
+            while deg[cur] == 2:
+                nxt = [x for x in adj[cur] if x != prev]
+                if not nxt or ek(cur, nxt[0]) in seen:
+                    break
+                seen.add(ek(cur, nxt[0]))
+                path.append(nxt[0])
+                prev, cur = cur, nxt[0]
+            segments.append(path)
+    return segments
+
+
+def _smooth_polyline(pts: np.ndarray, window: int = 2, iters: int = 2) -> np.ndarray:
+    """Moving-average smooth a polyline (endpoints fixed).
+
+    Removes the 1-voxel staircase that voxelised skeletons carry, which would otherwise
+    inflate tortuosity and — badly — curvature. Applied to the metric computation only,
+    never to the stored geometry.
+    """
+    if len(pts) <= 2:
+        return pts
+    p = pts.astype(np.float64, copy=True)
+    for _ in range(iters):
+        q = p.copy()
+        for i in range(1, len(p) - 1):
+            lo = max(0, i - window)
+            hi = min(len(p), i + window + 1)
+            q[i] = p[lo:hi].mean(axis=0)
+        p = q
+    return p
+
+
+def skeleton_graph_metrics(sk) -> dict:
+    """Shape metrics from a kimimaro curve skeleton, robust to voxel staircasing.
+
+    Each branch polyline is moving-average smoothed before measurement to suppress the
+    1-voxel staircase, which would otherwise pad the arc length.
+
+    branches: number of anatomical branches (chains between endpoints/junctions).
+    length_um: total cable length (µm; raw skeleton).
+    tortuosity: length-weighted mean of per-branch arc/chord ratio (≥1; 1 = straight).
+      Defined for branched networks, not just simple two-endpoint filaments, and robust
+      to voxelisation (a straight tube reads ~1 at any orientation). Note it measures
+      gross end-to-end detour, so a smooth bend that doesn't move a branch's endpoints
+      reads low — that is inherent to arc/chord tortuosity.
+
+    (An angle-based curvature metric was evaluated and rejected: on voxel skeletons a
+    straight but diagonally-oriented tube accumulates spurious turning and reads as
+    highly curved, so it is not trustworthy here.)
+    """
+    nan = float("nan")
+    empty = {"branches": 0, "length_um": 0.0, "tortuosity": nan}
+    if sk is None or len(sk.vertices) == 0 or len(sk.edges) == 0:
+        return empty
+    verts = np.asarray(sk.vertices, dtype=np.float64)
+    edges = np.asarray(sk.edges)
+    n = len(verts)
+    deg = np.bincount(edges.reshape(-1), minlength=n)
+    length_um = float(sk.cable_length())
+
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for a, b in edges:
+        adj[int(a)].append(int(b))
+        adj[int(b)].append(int(a))
+
+    segments = _branch_segments(adj, deg)
+    branches = len(segments)
+
+    # Tortuosity: length-weighted mean of arc/chord over branches (skip zero-chord loops).
+    tot_arc = 0.0
+    acc = 0.0
+    for path in segments:
+        pts = _smooth_polyline(verts[path])
+        arc = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+        chord = float(np.linalg.norm(pts[-1] - pts[0]))
+        if arc > 0 and chord > 0:
+            acc += arc * (arc / chord)
+            tot_arc += arc
+    tortuosity = acc / tot_arc if tot_arc > 0 else nan
 
     return {"branches": branches, "length_um": length_um, "tortuosity": tortuosity}
 
@@ -385,6 +531,23 @@ def compute_cell_center_um(membrane_mask: np.ndarray, voxel_size_zyx: Tuple[floa
             float(centroid[2] * voxel_size_zyx[2]))
 
 
+def polarity_from_offset(dz: float, dy: float, dx: float) -> dict:
+    """Direction (and distance) from the cell center to a point, as a unit vector on a sphere."""
+    dist_um = math.sqrt(dz**2 + dy**2 + dx**2)
+    row: dict = {"polar_dist_um": dist_um}
+    if dist_um > 0:
+        nz, ny, nx_ = dz / dist_um, dy / dist_um, dx / dist_um
+        row["polar_nz"] = nz
+        row["polar_ny"] = ny
+        row["polar_nx"] = nx_
+        row["polar_az_deg"] = math.degrees(math.atan2(ny, nx_))
+        row["polar_el_deg"] = math.degrees(math.asin(max(-1.0, min(1.0, nz))))
+    else:
+        for k in ("polar_nz", "polar_ny", "polar_nx", "polar_az_deg", "polar_el_deg"):
+            row[k] = float("nan")
+    return row
+
+
 def per_label_metrics(
     labels: np.ndarray,
     voxel_size_zyx: Tuple[float, float, float],
@@ -394,14 +557,25 @@ def per_label_metrics(
     dist_histogram_bins: int = 20,
     cell_center_zyx_um: Tuple[float, float, float] | None = None,
     compute_polarity_spread: bool = False,
+    emit_skeleton: bool = False,
+    num_threads: int = 0,
 ) -> pd.DataFrame:
     import json
     voxel_um3 = float(np.prod(voxel_size_zyx))
     rows = []
     props = regionprops(labels)
     centroids = []
+    # One TEASAR pass over the whole label volume yields a clean curve skeleton per
+    # instance (keyed by label id), used for both metrics and viewer geometry.
+    skels = compute_curve_skeletons(labels, voxel_size_zyx, max_voxels=max_skeleton_voxels, num_threads=num_threads)
     for rp in props:
-        skel = skeleton_metrics(rp.image, voxel_size_zyx, max_voxels=max_skeleton_voxels)
+        sk = skels.get(int(rp.label))
+        if max_skeleton_voxels is not None and rp.area > max_skeleton_voxels:
+            # Skeleton deliberately not computed for oversized instances → report as
+            # not-available (NaN) rather than a misleading zero.
+            skel = {"branches": float("nan"), "length_um": float("nan"), "tortuosity": float("nan")}
+        else:
+            skel = skeleton_graph_metrics(sk)
         row = {
             "label": int(rp.label),
             "volume_um3": float(rp.area * voxel_um3),
@@ -411,6 +585,8 @@ def per_label_metrics(
             "length_um": skel["length_um"],
             "tortuosity": skel["tortuosity"],
         }
+        if emit_skeleton:
+            row["skeleton_b64"] = _skeleton_to_b64(sk)
         row["sphericity"] = sphericity(row["volume_um3"], row["surface_area_um2"])
         for key, dt in distance_transforms.items():
             vals = dt[tuple(rp.coords.T)] if rp.coords.size else np.array([], dtype=np.float32)
@@ -421,7 +597,11 @@ def per_label_metrics(
                     hist_max = float(vals.max())
                     mean_val = float(vals.mean())
                     if hist_min < hist_max:
-                        counts, _ = np.histogram(vals, bins=dist_histogram_bins, range=(hist_min, hist_max))
+                        try:
+                            counts, _ = np.histogram(vals.astype(np.float64), bins=dist_histogram_bins, range=(hist_min, hist_max))
+                        except ValueError:
+                            # Range too small relative to bin count for float precision; lump into one bin.
+                            counts = np.array([int(vals.size)] + [0] * (dist_histogram_bins - 1), dtype=np.int64)
                     else:
                         counts = np.array([int(vals.size)] + [0] * (dist_histogram_bins - 1), dtype=np.int64)
                     row[f"distance_to_{key}_mean_um"] = mean_val
@@ -440,19 +620,7 @@ def per_label_metrics(
             iz = float(rp.centroid[0]) * voxel_size_zyx[0]
             iy = float(rp.centroid[1]) * voxel_size_zyx[1]
             ix = float(rp.centroid[2]) * voxel_size_zyx[2]
-            dz, dy, dx = iz - cz, iy - cy, ix - cx
-            dist_um = math.sqrt(dz**2 + dy**2 + dx**2)
-            row["polar_dist_um"] = dist_um
-            if dist_um > 0:
-                nz, ny, nx_ = dz / dist_um, dy / dist_um, dx / dist_um
-                row["polar_nz"] = nz
-                row["polar_ny"] = ny
-                row["polar_nx"] = nx_
-                row["polar_az_deg"] = math.degrees(math.atan2(ny, nx_))
-                row["polar_el_deg"] = math.degrees(math.asin(max(-1.0, min(1.0, nz))))
-            else:
-                for k in ("polar_nz", "polar_ny", "polar_nx", "polar_az_deg", "polar_el_deg"):
-                    row[k] = float("nan")
+            row.update(polarity_from_offset(iz - cz, iy - cy, ix - cx))
 
             if compute_polarity_spread and rp.coords.size >= 3:
                 pz = rp.coords[:, 0].astype(float) * voxel_size_zyx[0] - cz
@@ -479,12 +647,9 @@ def per_label_metrics(
     df = pd.DataFrame(rows)
     if not df.empty and len(centroids) > 1:
         c = np.vstack(centroids)
-        nearest = np.full((c.shape[0],), np.nan, dtype=float)
-        for i in range(c.shape[0]):
-            d = np.sqrt(np.sum((c - c[i]) ** 2, axis=1))
-            d[i] = np.inf
-            nearest[i] = d.min()
-        df["distance_to_closest_same_type_um"] = nearest
+        dists = cdist(c, c)
+        np.fill_diagonal(dists, np.inf)
+        df["distance_to_closest_same_type_um"] = dists.min(axis=1)
     return df
 
 
@@ -768,6 +933,8 @@ def analyze_label_entities(
             dist_histogram_bins=args.dist_histogram_bins,
             cell_center_zyx_um=cell_center_zyx_um,
             compute_polarity_spread=src_entity.name in spread_names,
+            emit_skeleton=args.with_mesh,
+            num_threads=args.num_threads,
         )
         label_dfs[src_key] = df
         print(f"  {src_entity.name}: {len(df)} instances", flush=True)
@@ -797,6 +964,7 @@ def build_report_rows(
     mesh_level: float | None = None,
     source_path: Path | None = None,
     generated_masks_dir: Path | None = None,
+    cell_center_zyx_um: Tuple[float, float, float] | None = None,
 ) -> list[dict]:
     def _file_meta(path: Path) -> dict:
         resolved = path
@@ -830,14 +998,11 @@ def build_report_rows(
         vol_um3 = float(binary.sum() * voxel_um3)
         area_um2 = estimate_surface_area_um2(binary, voxel_size_zyx)
         sph = sphericity(vol_um3, area_um2)
-        rps = regionprops(binary.astype(np.uint8))
-        if rps:
-            rp0 = rps[0]
-            coords = np.argwhere(binary)
+        coords = np.argwhere(binary)
+        if coords.size > 0:
             ar = aspect_ratio_from_coords(coords, voxel_size_zyx)
-            bb = rp0.bbox
-            bb_vol = (bb[3]-bb[0]) * (bb[4]-bb[1]) * (bb[5]-bb[2])
-            fill_ratio = rp0.area / bb_vol if bb_vol > 0 else float("nan")
+            bb_vol = int(np.prod(coords.max(axis=0) - coords.min(axis=0) + 1))
+            fill_ratio = int(binary.sum()) / bb_vol if bb_vol > 0 else float("nan")
         else:
             ar = float("nan")
             fill_ratio = float("nan")
@@ -857,7 +1022,7 @@ def build_report_rows(
                 target_reduction=mesh_target_reduction,
                 level=mesh_level,
             )
-        rows.append({
+        mask_row = {
             "cell_id": cell_id, "group_id": group_id, "entity_name": ent.name, "entity_kind": ent.kind,
             "row_type": "file", "label_id": None, "instance_count": None,
             "total_volume_um3": vol_um3,
@@ -867,7 +1032,17 @@ def build_report_rows(
             "aspect_ratio_major_minor": ar,
             "mesh_b64": mask_mesh_b64,
             **_file_meta(ent.path),
-        })
+        }
+        # Polarity: direction from cell center to this mask's centroid (e.g. where the
+        # nucleus sits relative to the cell, for comparison with label entity polarity)
+        if cell_center_zyx_um is not None and coords.size > 0:
+            cz, cy, cx = cell_center_zyx_um
+            centroid = coords.mean(axis=0)
+            mz = float(centroid[0]) * voxel_size_zyx[0]
+            my = float(centroid[1]) * voxel_size_zyx[1]
+            mx = float(centroid[2]) * voxel_size_zyx[2]
+            mask_row.update(polarity_from_offset(mz - cz, my - cy, mx - cx))
+        rows.append(mask_row)
 
     for lk in label_keys:
         ent = entities[lk]
@@ -883,15 +1058,15 @@ def build_report_rows(
         if df.empty:
             continue
 
-        props_map = {rp.label: rp for rp in regionprops(labels)}
-
         if with_mesh:
             mesh_ids = set(df["label"].astype(int).tolist())
+            props_map = {rp.label: rp for rp in regionprops(labels)}
             print(f"  Generating {len(mesh_ids)} meshes for {ent.name}...", flush=True)
         else:
             mesh_ids: set[int] = set()
+            props_map: dict = {}
 
-        for _, irow in df.iterrows():
+        for irow in df.to_dict('records'):
             lbl = int(irow["label"])
             rp = props_map.get(lbl)
             mesh_b64 = ""
@@ -919,9 +1094,9 @@ def build_report_rows(
                 "file_size_bytes": None, "file_mtime": None, "file_name": ent.path.name,
                 "mesh_b64": mesh_b64,
             }
-            for col in df.columns:
+            for col, val in irow.items():
                 if col != "label":
-                    row_dict[col] = _sanitize(irow[col])
+                    row_dict[col] = _sanitize(val)
             rows.append(row_dict)
 
     return rows
@@ -931,16 +1106,18 @@ def write_report_csv(out_path: Path, rows: list[dict]) -> None:
     if not rows:
         return
     df = pd.DataFrame([{k: _sanitize(v) for k, v in r.items()} for r in rows])
-    _MESH = "mesh_b64"
-    cols_stats = [c for c in df.columns if c != _MESH]
-    cols_full  = cols_stats + ([_MESH] if _MESH in df.columns else [])
+    # Heavy geometry payloads live only in the *_meshes CSV, never in the stats CSV/parquet.
+    _MESH_COLS = ["mesh_b64", "skeleton_b64"]
+    present_mesh = [c for c in _MESH_COLS if c in df.columns]
+    cols_stats = [c for c in df.columns if c not in present_mesh]
+    cols_full  = cols_stats + present_mesh
 
-    # Stats-only CSV — no mesh data, small enough to load in browser for multi-cell reports
+    # Stats-only CSV — no geometry data, small enough to load in browser for multi-cell reports
     df[cols_stats].to_csv(out_path, index=False)
     print(f"Wrote {out_path.name} ({len(df)} rows, {out_path.stat().st_size // 1024} KB)", flush=True)
 
-    # Full CSV with mesh_b64 — for the 3D mesh viewer (per-cell only)
-    if _MESH in df.columns:
+    # Full CSV with mesh_b64/skeleton_b64 — for the 3D mesh viewer (per-cell only)
+    if present_mesh:
         mesh_path = out_path.parent / (out_path.stem + "_meshes" + out_path.suffix)
         df[cols_full].to_csv(mesh_path, index=False)
         print(f"Wrote {mesh_path.name} ({len(df)} rows, {mesh_path.stat().st_size // 1024} KB)", flush=True)
@@ -997,7 +1174,8 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
     )
 
     volumes = crop_to_membrane_bbox(volumes, membrane_key)
-    promote_multicomponent_masks(volumes, dataset, membrane_key)
+    if args.auto_label_masks:
+        promote_multicomponent_masks(volumes, dataset, membrane_key)
     voxel_um3 = float(np.prod(voxel_size_zyx))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1045,6 +1223,7 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
         mesh_level=args.mesh_level,
         source_path=dataset.source,
         generated_masks_dir=out_dir / "masks_for_analysis",
+        cell_center_zyx_um=cell_center_zyx_um,
     )
     write_report_csv(report_csv, rows)
     print("Cell analysis complete.", flush=True)
