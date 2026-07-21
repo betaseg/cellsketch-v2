@@ -35,7 +35,7 @@ import edt
 import numpy as np
 import pandas as pd
 import tifffile
-from scipy.ndimage import distance_transform_edt, gaussian_filter, label as nd_label
+from scipy.ndimage import distance_transform_edt, find_objects, gaussian_filter, label as nd_label
 from scipy.spatial.distance import cdist
 import fast_simplification
 from skimage.measure import marching_cubes, regionprops
@@ -101,6 +101,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Automatically promote masks with multiple connected components to label entities "
              "(off by default — enable explicitly to opt in).",
+    )
+    parser.add_argument(
+        "--with-contacts",
+        action="store_true",
+        help="Compute a pairwise instance contact list (surface-to-surface gaps up to "
+             "--contact-max-um) for interactive proximity/grouping in the viewers.",
+    )
+    parser.add_argument(
+        "--contact-max-um",
+        type=float,
+        default=0.5,
+        metavar="T",
+        help="Max surface-to-surface gap (µm) recorded for --with-contacts (default: 0.5).",
     )
     return parser.parse_args()
 
@@ -1123,6 +1136,117 @@ def write_report_csv(out_path: Path, rows: list[dict]) -> None:
         print(f"Wrote {mesh_path.name} ({len(df)} rows, {mesh_path.stat().st_size // 1024} KB)", flush=True)
 
 
+def compute_contacts(
+    volumes: Dict[str, np.ndarray],
+    entities: Dict[str, Entity],
+    label_keys: list[str],
+    mask_keys: list[str],
+    voxel_size_zyx: Tuple[float, float, float],
+    max_gap_um: float,
+) -> pd.DataFrame:
+    """Pairwise surface-to-surface gaps between instances, up to ``max_gap_um`` µm.
+
+    Every instance (each label id, and each mask as a whole) gets a global id in a
+    combined volume. One EDT feature transform labels each voxel with its nearest
+    instance; where two instances' territories meet, the summed distance to each
+    approximates their surface gap (0 = touching). Returns an edge list with
+    columns entity_a/label_a/entity_b/label_b/gap_um. The threshold is applied
+    interactively in the viewers — this only bounds what is stored.
+    """
+    empty = pd.DataFrame(columns=["entity_a", "label_a", "entity_b", "label_b", "gap_um"])
+    all_keys = label_keys + mask_keys
+    if not all_keys:
+        return empty
+    shape = volumes[all_keys[0]].shape
+
+    # Assign a global id per instance; record what each id maps back to. Labels go
+    # first and are never overwritten. The plasma membrane is a *filled* volume (the
+    # whole cell), not a discrete object to touch, so it is excluded — membrane
+    # proximity is already captured by distance_to_membrane_um. Other masks are
+    # placed only on still-unclaimed voxels so they cannot clobber label instances.
+    #
+    # Instances are remapped one whole entity at a time (label id + running offset) so
+    # the combined volume is built in a few vectorised passes rather than one
+    # full-volume scan per instance.
+    L = np.zeros(shape, dtype=np.int32)
+    meta: Dict[int, Tuple[str, object]] = {}
+    offset = 0
+    for lk in label_keys:
+        name = entities[lk].name
+        lab = volumes[lk]
+        mask = lab > 0
+        if not mask.any():
+            continue
+        ids = np.unique(lab[mask])
+        L[mask] = lab[mask].astype(np.int32) + offset
+        for lid in ids.tolist():
+            meta[offset + int(lid)] = (name, int(lid))
+        offset += int(ids.max())
+    for mk in mask_keys:
+        name = entities[mk].name
+        if is_membrane_name(name):
+            continue
+        m = (volumes[mk] > 0) & (L == 0)
+        if not m.any():
+            continue
+        offset += 1
+        L[m] = offset
+        meta[offset] = (name, None)
+
+    gid = int(L.max())
+    if gid < 2 or len(meta) < 2:
+        return empty
+
+    # Per-instance local EDT: for each object, work only within its own bounding box
+    # padded by max_gap (converted to voxels per axis), and measure the distance from
+    # every OTHER object's voxels to this object. The minimum over an object's voxels
+    # is the surface-to-surface gap. Bounded by small local regions, so this stays fast
+    # even with thousands of instances (unlike a whole-volume feature transform).
+    slices = find_objects(L)
+    vz, vy, vx = voxel_size_zyx
+    rz = int(math.ceil(max_gap_um / vz))
+    ry = int(math.ceil(max_gap_um / vy))
+    rx = int(math.ceil(max_gap_um / vx))
+    Z, Y, X = shape
+    pair_min: Dict[Tuple[int, int], float] = {}
+    for a_id in range(1, gid + 1):
+        sl = slices[a_id - 1]
+        if sl is None:
+            continue
+        z0 = max(0, sl[0].start - rz); z1 = min(Z, sl[0].stop + rz)
+        y0 = max(0, sl[1].start - ry); y1 = min(Y, sl[1].stop + ry)
+        x0 = max(0, sl[2].start - rx); x1 = min(X, sl[2].stop + rx)
+        sub = L[z0:z1, y0:y1, x0:x1]
+        other = (sub > 0) & (sub != a_id)
+        if not other.any():
+            continue
+        # distance from every voxel to the nearest a_id voxel (a_id voxels are the zeros)
+        dt_a = edt.edt(np.ascontiguousarray((sub != a_id).astype(np.uint8)),
+                       anisotropy=voxel_size_zyx, parallel=1)
+        o_ids = sub[other]
+        o_dist = dt_a[other]
+        order = np.argsort(o_ids, kind="stable")
+        o_ids = o_ids[order]
+        o_dist = o_dist[order]
+        uniq, first = np.unique(o_ids, return_index=True)
+        mins = np.minimum.reduceat(o_dist, first)
+        for b_id, gap in zip(uniq.tolist(), mins.tolist()):
+            if gap > max_gap_um:
+                continue
+            key = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+            if key not in pair_min or gap < pair_min[key]:
+                pair_min[key] = float(gap)
+
+    if not pair_min:
+        return empty
+    rows = []
+    for (lo_id, hi_id), gap in pair_min.items():
+        ea, la = meta[lo_id]
+        eb, lb = meta[hi_id]
+        rows.append({"entity_a": ea, "label_a": la, "entity_b": eb, "label_b": lb, "gap_um": gap})
+    return pd.DataFrame(rows)
+
+
 def collect_cell_dirs(root: Path) -> list[tuple[Path, str]]:
     """Return (cell_dir, group_name) pairs, supporting up to two levels of nesting.
 
@@ -1226,6 +1350,17 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
         cell_center_zyx_um=cell_center_zyx_um,
     )
     write_report_csv(report_csv, rows)
+
+    if args.with_contacts:
+        print(f"Computing instance contacts (≤{args.contact_max_um} µm)...", flush=True)
+        contacts = compute_contacts(volumes, dataset.entities, label_keys, mask_keys,
+                                    voxel_size_zyx, args.contact_max_um)
+        contacts.insert(0, "cell_id", cell_dir.name)
+        contacts.insert(1, "group_id", group_id)
+        contacts_path = out_dir / "report_contacts.csv"
+        contacts.to_csv(contacts_path, index=False)
+        print(f"Wrote {contacts_path.name} ({len(contacts)} contacts)", flush=True)
+
     print("Cell analysis complete.", flush=True)
 
 
@@ -1259,6 +1394,14 @@ def main() -> None:
             joint.to_parquet(joint_path, index=False)
             kb = joint_path.stat().st_size // 1024
             print(f"Joint report.parquet: {len(joint)} rows, {kb} KB → {joint_path}", flush=True)
+
+        if args.with_contacts:
+            cdfs = [pd.read_csv(od / "report_contacts.csv") for od in out_dirs if (od / "report_contacts.csv").exists()]
+            if cdfs:
+                cjoint = pd.concat(cdfs, ignore_index=True)
+                cpath = args.out_dir / "report_contacts.parquet"
+                cjoint.to_parquet(cpath, index=False)
+                print(f"Joint report_contacts.parquet: {len(cjoint)} rows → {cpath}", flush=True)
 
     print("Done.", flush=True)
     print("  Stats viewer  → open stats_viewer.html, load report.csv (single cell) or report.parquet (joint)", flush=True)

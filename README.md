@@ -33,6 +33,8 @@ Arguments:
 - `--mesh-step-size N`: mesh resolution control (`1` = highest detail)
 - `--mesh-target-reduction F`: mesh decimation fraction (default keeps ~20% of faces)
 - `--mesh-level L`: marching-cubes isosurface level override
+- `--with-contacts`: compute a pairwise instance contact list for interactive proximity/grouping in the viewers
+- `--contact-max-um T`: max surface-to-surface gap (µm) recorded for `--with-contacts` (default: 0.5)
 
 ## What happens during a run
 
@@ -44,7 +46,8 @@ For each detected cell, the script:
 4. Builds/uses distance-transform cache in `.dt_cache`.
 5. Computes file-level and instance-level morphology + distance metrics.
 6. Writes per-cell `report.csv` and (if `--with-mesh`) `report_meshes.csv`.
-7. In batch mode, also writes a joint `report.csv` at the root of `--out-dir`.
+7. If `--with-contacts`, writes per-cell `report_contacts.csv` (pairwise instance gaps ≤ `--contact-max-um`).
+8. In batch mode, also writes a joint `report.parquet` (and joint `report_contacts.parquet` when `--with-contacts`) at the root of `--out-dir`.
 
 ## Input data layout options
 
@@ -107,10 +110,12 @@ Output tree:
 ```text
 <OUTPUT_ROOT>/
   report.parquet             # batch mode only — joint report across all cells
+  report_contacts.parquet    # batch mode + --with-contacts — joint contact edge list
   <group>/<cell>/            # grouped mode
   <cell>/                    # flat mode
     report.csv
     report_meshes.csv        # only when --with-mesh
+    report_contacts.csv      # only when --with-contacts
     masks_for_analysis/
     .dt_cache/
 ```
@@ -129,6 +134,12 @@ Important columns:
 - mesh payload: `mesh_b64` (only in `report_meshes.csv`)
 - skeleton payload: `skeleton_b64` (only in `report_meshes.csv`) — per-instance skeleton as line segments, overlaid on the mesh in `mesh_viewer.html`
 
+`report_contacts.csv` / `report_contacts.parquet` (only with `--with-contacts`) is a separate
+edge list — one row per pair of instances within `--contact-max-um` of each other:
+`cell_id, group_id, entity_a, label_a, entity_b, label_b, gap_um` (surface-to-surface gap; 0 =
+touching, `label` is null for whole-structure masks). The plasma membrane is excluded (its
+proximity is already `distance_to_membrane_um`). The viewers threshold this list interactively.
+
 ## Viewers and how to use them
 
 Live hosted viewers: [https://betaseg.github.io/cellsketch-v2/](https://betaseg.github.io/cellsketch-v2/)
@@ -136,12 +147,14 @@ Live hosted viewers: [https://betaseg.github.io/cellsketch-v2/](https://betaseg.
 - `stats_viewer.html` (multi-cell stats):
   - load: drag/drop a joint `report.parquet` (batch mode) or a per-cell `report.csv`
   - use for: overview plots, component distributions, table + filtering by group/cell/entity
+  - contacts: click **🔗 Contacts** to also load a `report_contacts` file — adds a "Contacts & Groups" section with a pair selector + gap-threshold slider showing group counts/sizes and a touch-count table (all recomputed live, no reprocessing)
 
 - `mesh_viewer.html` (single-cell 3D):
   - load: drag/drop a per-cell `report_meshes.csv`
   - requirement: analysis must be run with `--with-mesh`
   - use for: interactive 3D meshes and per-instance inspection
   - click any instance to open it in 3D; when a `skeleton_b64` is present the skeleton is drawn as an overlay with the mesh shown semi-transparent around it (toggle the skeleton and adjust mesh opacity in the modal header)
+  - contacts: click **🔗 Contacts** to load a `report_contacts` file, then choose **Color by → Contact group** with a pair selector + gap-threshold slider to colour instances by their touching cluster
 
 ## Blender
 

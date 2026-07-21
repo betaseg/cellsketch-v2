@@ -63,6 +63,8 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
   <span class="brand">CellSketch Stats</span>
   <button class="btn btn-sm btn-outline-dark" id="load-btn">&#128194; Open Report</button>
   <input type="file" id="file-input" accept=".csv,.tsv,.parquet" class="d-none">
+  <button class="btn btn-sm btn-outline-secondary" id="contacts-btn" title="Load report_contacts.csv/parquet to enable the Contacts & Groups section">&#128279; Contacts</button>
+  <input type="file" id="contacts-input" accept=".csv,.parquet" class="d-none">
   <span class="file-info" id="file-info"></span>
   <span class="file-info"><i class="bi bi-shield-lock me-1"></i>Your data stays local, nothing is uploaded.</span>
   <div id="global-filters" class="d-none d-flex flex-wrap gap-2 ms-auto align-items-center">
@@ -161,6 +163,28 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
     <div id="entity-stats-container"></div>
   </div>
 
+  <!-- Contacts & Groups -->
+  <div class="section d-none" id="s-contacts">
+    <div class="section-title">Contacts &amp; Groups</div>
+    <p class="section-subtitle">Load a <code>report_contacts</code> file (the &#128279; Contacts button, top left) to explore which instances touch. Choose a pair of structures and a maximum surface gap; instances linked at or below that gap form <b>groups</b> (connected clusters). Drag the threshold to see how the grouping changes — computed live in the browser, no reprocessing. Respects the group/cell/entity filters above.</p>
+    <div class="d-flex flex-wrap align-items-end gap-3 mb-3">
+      <div>
+        <label class="form-label small mb-1">Touching pair</label>
+        <select id="ct-pair" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <div style="width:260px">
+        <label class="form-label small mb-1">Gap &le; <span id="ct-thr-val">0.02</span> µm</label>
+        <input type="range" id="ct-thr" class="form-range" min="0" max="0.5" step="0.005" value="0.02">
+      </div>
+      <span id="ct-count" class="small text-muted align-self-end pb-1"></span>
+    </div>
+    <div id="ct-cards" class="d-flex flex-wrap gap-3 align-items-center mb-3"></div>
+    <div class="charts-row" id="ct-charts"></div>
+    <div class="subsection-label mt-3">How many instances touch another structure</div>
+    <p class="subsection-desc">Each entry counts instances of the <b>row</b> structure that touch at least one instance of the <b>column</b> structure at the current threshold (across the cells in scope).</p>
+    <div id="ct-touch-table" style="overflow-x:auto"></div>
+  </div>
+
 </div><!-- /main -->
 
 <!-- ── Footer ── -->
@@ -226,6 +250,8 @@ function gColor(g) { return plotGroupBy === 'group' ? groupColor(g) : cellColor(
 // ══════════════════════════════════════════════════════════════
 document.getElementById('load-btn').addEventListener('click', function(){ document.getElementById('file-input').click(); });
 document.getElementById('file-input').addEventListener('change', function(e){ if(e.target.files[0]) loadFile(e.target.files[0]); });
+document.getElementById('contacts-btn').addEventListener('click', function(){ document.getElementById('contacts-input').click(); });
+document.getElementById('contacts-input').addEventListener('change', function(e){ if(e.target.files[0]) loadContactsFile(e.target.files[0]); });
 
 var dz = document.getElementById('drop-zone');
 ['dragenter','dragover'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.add('drag-over'); }); });
@@ -263,15 +289,16 @@ function getDuckDB() {
   return _duckdbPromise;
 }
 
-async function loadParquetBuffer(buffer, label) {
+async function loadParquetRows(buffer) {
   var db = await getDuckDB();
   var fname = 'data_' + Math.random().toString(36).slice(2) + '.parquet';
   await db.registerFileBuffer(fname, new Uint8Array(buffer));
   var conn = await db.connect();
+  var cols, rows;
   try {
     var result = await conn.query("SELECT * FROM read_parquet('" + fname + "')");
-    COLS = result.schema.fields.map(function(f){ return f.name; });
-    ALL = result.toArray().map(function(row) {
+    cols = result.schema.fields.map(function(f){ return f.name; });
+    rows = result.toArray().map(function(row) {
       var obj = row.toJSON();
       for (var k in obj) { if (typeof obj[k] === 'bigint') obj[k] = Number(obj[k]); }
       return obj;
@@ -280,6 +307,12 @@ async function loadParquetBuffer(buffer, label) {
     await conn.close();
     await db.dropFile(fname);
   }
+  return { cols: cols, rows: rows };
+}
+
+async function loadParquetBuffer(buffer, label) {
+  var res = await loadParquetRows(buffer);
+  COLS = res.cols; ALL = res.rows;
   resetLoadState();
   document.getElementById('file-info').textContent = label;
   onLoaded();
@@ -571,6 +604,167 @@ function renderAll() {
   renderOverview();
   renderStructure();
   renderEntityStats();
+  renderContacts();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Contacts & Groups (optional report_contacts.csv/.parquet)
+// ══════════════════════════════════════════════════════════════
+var CONTACTS = [];
+function hasContacts() { return CONTACTS && CONTACTS.length > 0; }
+function contactMaxGap() {
+  return CONTACTS.reduce(function(m, e){ return (e.gap_um != null && e.gap_um > m) ? e.gap_um : m; }, 0.5);
+}
+function contactPairLabels() {
+  var s = new Set();
+  CONTACTS.forEach(function(e){ s.add([e.entity_a, e.entity_b].sort().join(' ↔ ')); });
+  return [...s].sort();
+}
+
+function loadContactsFile(file) {
+  var done = function(){
+    document.getElementById('file-info').textContent += '  +contacts:' + CONTACTS.length;
+    renderContacts();
+  };
+  var reader = new FileReader();
+  if (isParquetName(file.name)) {
+    reader.onload = function(e){ loadParquetRows(e.target.result).then(function(res){ CONTACTS = res.rows; done(); }).catch(showLoadError); };
+    reader.readAsArrayBuffer(file);
+  } else {
+    reader.onload = function(e){ var res = Papa.parse(e.target.result, { header:true, dynamicTyping:true, skipEmptyLines:true }); CONTACTS = res.data; done(); };
+    reader.readAsText(file);
+  }
+}
+
+// Union-find over one cell's instances (keyed entity|label): add an edge when gap ≤ thr and
+// the pair matches pairFilter ('' = all, 'same' = same-type, or 'A ↔ B'). Returns the sizes
+// of multi-member groups, the singleton count, and the total instance count.
+function contactGroupSizes(cid, thr, pairFilter, instRows) {
+  var parent = {};
+  function find(x){ while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+  function ensure(k){ if (!(k in parent)) parent[k] = k; }
+  function key(e, l){ return e + '|' + l; }
+  instRows.forEach(function(r){ ensure(key(r.entity_name, r.label_id)); });
+  CONTACTS.forEach(function(e){
+    if (cid !== undefined && e.cell_id !== cid) return;
+    if (e.gap_um == null || e.gap_um > thr) return;
+    if (pairFilter === 'same' && e.entity_a !== e.entity_b) return;
+    if (pairFilter && pairFilter !== 'same'
+        && [e.entity_a, e.entity_b].sort().join(' ↔ ') !== pairFilter) return;
+    var ka = key(e.entity_a, e.label_a), kb = key(e.entity_b, e.label_b);
+    ensure(ka); ensure(kb);
+    parent[find(ka)] = find(kb);
+  });
+  var sizes = {};
+  Object.keys(parent).forEach(function(k){ var r = find(k); sizes[r] = (sizes[r] || 0) + 1; });
+  var multi = [], singles = 0;
+  Object.keys(sizes).forEach(function(r){ if (sizes[r] > 1) multi.push(sizes[r]); else singles++; });
+  return { multiSizes: multi, singletons: singles, instCount: Object.keys(parent).length };
+}
+
+var _ctInited = false;
+function initContactsControls() {
+  var pairSel = document.getElementById('ct-pair');
+  var prev = pairSel.value;
+  pairSel.innerHTML = '<option value="">All pairs</option><option value="same">Same type only</option>'
+    + contactPairLabels().map(function(p){ return '<option value="'+p+'">'+p+'</option>'; }).join('');
+  if (prev) pairSel.value = prev;
+  document.getElementById('ct-thr').max = contactMaxGap().toFixed(3);
+  if (!_ctInited) {
+    _ctInited = true;
+    pairSel.addEventListener('change', renderContacts);
+    document.getElementById('ct-thr').addEventListener('input', function(){
+      document.getElementById('ct-thr-val').textContent = (+this.value).toFixed(3);
+      renderContacts();
+    });
+  }
+}
+
+function ctCard(v, l) {
+  return '<div class="card-metric"><div class="big">'+v+'</div><div class="lbl">'+l+'</div></div>';
+}
+
+function renderContacts() {
+  var section = document.getElementById('s-contacts');
+  if (!hasContacts()) { section.classList.add('d-none'); return; }
+  section.classList.remove('d-none');
+  initContactsControls();
+  var thr = +document.getElementById('ct-thr').value;
+  var pair = document.getElementById('ct-pair').value;
+
+  var scopeCells = uniq(filtered('instance').map(function(r){ return r.cell_id; }).filter(Boolean));
+  if (!scopeCells.length) scopeCells = [undefined];
+
+  var allSizes = [], totalGroups = 0, totalSingles = 0, largest = 0, inGroups = 0, instTotal = 0;
+  scopeCells.forEach(function(cid){
+    var instRows = ALL.filter(function(r){
+      return r.row_type==='instance' && r.entity_kind==='label'
+        && (cid===undefined || r.cell_id===cid) && (!st.entity || r.entity_name===st.entity);
+    });
+    var g = contactGroupSizes(cid, thr, pair, instRows);
+    g.multiSizes.forEach(function(s){ allSizes.push(s); if (s>largest) largest=s; inGroups += s; });
+    totalGroups += g.multiSizes.length; totalSingles += g.singletons; instTotal += g.instCount;
+  });
+  var mean = allSizes.length ? allSizes.reduce(function(a,b){ return a+b; }, 0) / allSizes.length : 0;
+  document.getElementById('ct-cards').innerHTML =
+    ctCard(totalGroups, 'groups (≥2)') + ctCard(largest || '–', 'largest group')
+    + ctCard(mean ? mean.toFixed(1) : '–', 'mean group size') + ctCard(totalSingles, 'singletons')
+    + ctCard(instTotal ? Math.round(100*inGroups/instTotal)+'%' : '0%', 'instances grouped');
+  document.getElementById('ct-count').textContent =
+    'gap ≤ ' + thr.toFixed(3) + ' µm · ' + scopeCells.filter(Boolean).length + ' cell(s) in scope';
+
+  var charts = document.getElementById('ct-charts'); charts.innerHTML = '';
+  var hEl = document.createElement('div'); hEl.className = 'chart-cell'; hEl.style.width = '440px';
+  charts.appendChild(hEl);
+  if (allSizes.length) {
+    Plotly.newPlot(hEl, [{ type:'histogram', x:allSizes, marker:{color:'#80AAFF'}, xbins:{start:1.5, size:1} }],
+      { margin:{l:50,r:10,t:30,b:40}, height:260, font:{size:9},
+        title:{text:'group size distribution (members ≥ 2)', font:{size:11}},
+        xaxis:{title:'instances per group', dtick:1}, yaxis:{title:'# groups'} },
+      {responsive:true, displayModeBar:false});
+  } else {
+    hEl.innerHTML = '<div class="text-muted small">No groups of 2+ at this threshold / pair.</div>';
+  }
+
+  renderTouchTable(scopeCells, thr);
+}
+
+// For each ordered type pair, how many instances of the row type touch ≥1 of the column type.
+function renderTouchTable(scopeCells, thr) {
+  var cellSet = new Set(scopeCells.filter(function(c){ return c !== undefined; }));
+  var types = uniq(ALL.filter(function(r){
+    return r.row_type==='instance' && r.entity_kind==='label' && (!st.entity || r.entity_name===st.entity);
+  }).map(function(r){ return r.entity_name; }));
+  var tableEl = document.getElementById('ct-touch-table');
+  if (!types.length) { tableEl.innerHTML = ''; return; }
+  var touch = {};
+  types.forEach(function(a){ touch[a] = {}; types.forEach(function(b){ touch[a][b] = new Set(); }); });
+  CONTACTS.forEach(function(e){
+    if (e.gap_um == null || e.gap_um > thr) return;
+    if (cellSet.size && !cellSet.has(e.cell_id)) return;
+    var a = e.entity_a, b = e.entity_b;
+    if (touch[a] && touch[a][b] !== undefined) {
+      touch[a][b].add(e.cell_id + '|' + a + '|' + e.label_a);
+      touch[b][a].add(e.cell_id + '|' + b + '|' + e.label_b);
+    }
+  });
+  var total = {};
+  types.forEach(function(t){
+    total[t] = ALL.filter(function(r){
+      return r.row_type==='instance' && r.entity_kind==='label' && r.entity_name===t
+        && (!cellSet.size || cellSet.has(r.cell_id));
+    }).length;
+  });
+  var thead = '<tr><th>touches →</th>' + types.map(function(t){ return '<th class="text-end">'+t+'</th>'; }).join('') + '</tr>';
+  var tbody = types.map(function(a){
+    return '<tr><td><b>'+a+'</b> <span class="text-muted">(n='+total[a]+')</span></td>'
+      + types.map(function(b){
+          var n = touch[a][b].size, pct = total[a] ? Math.round(100*n/total[a]) : 0;
+          return '<td class="text-end">' + (n ? n+' <span class="text-muted" style="font-size:.7em">'+pct+'%</span>' : '–') + '</td>';
+        }).join('') + '</tr>';
+  }).join('');
+  tableEl.innerHTML = '<table class="table table-sm table-hover mb-0" style="min-width:400px">'
+    + '<thead class="table-light">'+thead+'</thead><tbody>'+tbody+'</tbody></table>';
 }
 
 // ══════════════════════════════════════════════════════════════

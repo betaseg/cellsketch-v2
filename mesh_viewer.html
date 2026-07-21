@@ -255,8 +255,7 @@ window.render3DScene = async function(rows, metricCol, colorBy, maskRows) {
       hex = window.cellColor(r.cell_id || '');
       legendEntries[r.cell_id || '?'] = hex;
     } else if (byGroup) {
-      hex = window.cellColor(r.group_id || '');
-      legendEntries[r.group_id || '?'] = hex;
+      hex = window.cgroupColorFor(r);
     } else {
       const v = r[metricCol];
       if (v == null || !isFinite(v) || isSelfDist(r)) {
@@ -307,8 +306,15 @@ window.render3DScene = async function(rows, metricCol, colorBy, maskRows) {
           +'<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#888"></span>'
           +'<span style="font-size:.66rem;color:#444">n/a</span></div>' : '')
       +'<div style="color:#666;margin-top:5px">'+count+' meshes</div>';
+  } else if (byGroup) {
+    const s = window._cgroupStats || { nGroups: 0, nSingletons: 0, largest: 0 };
+    leg.innerHTML = '<div style="font-weight:600;margin-bottom:5px">Contact groups</div>'
+      +'<div style="font-size:.66rem;color:#333">'+s.nGroups+' groups (≥2)</div>'
+      +'<div style="font-size:.66rem;color:#333">largest: '+s.largest+' instances</div>'
+      +'<div style="font-size:.66rem;color:#777">'+s.nSingletons+' singletons (grey)</div>'
+      +'<div style="color:#666;margin-top:5px">'+count+' meshes</div>';
   } else {
-    leg.innerHTML = '<div style="font-weight:600;margin-bottom:5px">'+(byEntity?'Entity':byGroup?'Group':'Cell')+'</div>'
+    leg.innerHTML = '<div style="font-weight:600;margin-bottom:5px">'+(byEntity?'Entity':'Cell')+'</div>'
       + Object.entries(legendEntries).map(([k,c]) =>
           '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">'
           +'<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:'+c+'"></span>'
@@ -473,6 +479,8 @@ window.showMesh3D = function(row, title) {
   <span class="brand">CellSketch 3D</span>
   <button class="btn btn-sm btn-outline-dark" id="load-btn">&#128194; Open Report</button>
   <input type="file" id="file-input" accept=".csv,.tsv,.parquet" class="d-none">
+  <button class="btn btn-sm btn-outline-secondary" id="contacts-btn" title="Load report_contacts.csv/parquet to enable contact-group coloring">&#128279; Contacts</button>
+  <input type="file" id="contacts-input" accept=".csv,.parquet" class="d-none">
   <span class="file-info" id="file-info"></span>
   <span class="file-info"><i class="bi bi-shield-lock me-1"></i>Your data stays local, nothing is uploaded.</span>
   <div id="global-filters" class="d-none d-flex flex-wrap gap-2 ms-auto align-items-center">
@@ -543,6 +551,14 @@ window.showMesh3D = function(row, title) {
       <div id="c3d-metric-wrap" style="display:none">
         <label class="form-label small mb-1">Metric</label>
         <select id="c3d-metric" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <div id="c3d-cgroup-wrap" style="display:none">
+        <label class="form-label small mb-1">Touching pair</label>
+        <select id="c3d-cgroup-pair" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <div id="c3d-cgroup-thr-wrap" style="display:none;width:200px">
+        <label class="form-label small mb-1">Gap &le; <span id="c3d-cgroup-thr-val">0.02</span> µm</label>
+        <input type="range" id="c3d-cgroup-thr" class="form-range" min="0" max="0.5" step="0.005" value="0.02">
       </div>
       <div id="c3d-explode-wrap" style="display:none;width:190px">
         <label class="form-label small mb-1" title="Pushes each organelle outward from the cell center along its real position, like an exploded-view diagram. The membrane stays put — it defines the center.">
@@ -682,6 +698,8 @@ window.entColor  = entColor;
 // ══════════════════════════════════════════════════════════════
 document.getElementById('load-btn').addEventListener('click', function(){ document.getElementById('file-input').click(); });
 document.getElementById('file-input').addEventListener('change', function(e){ if(e.target.files[0]) loadFile(e.target.files[0]); });
+document.getElementById('contacts-btn').addEventListener('click', function(){ document.getElementById('contacts-input').click(); });
+document.getElementById('contacts-input').addEventListener('change', function(e){ if(e.target.files[0]) loadContactsFile(e.target.files[0]); });
 
 var dz = document.getElementById('drop-zone');
 ['dragenter','dragover'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.add('drag-over'); }); });
@@ -719,15 +737,16 @@ function getDuckDB() {
   return _duckdbPromise;
 }
 
-async function loadParquetBuffer(buffer, label) {
+async function loadParquetRows(buffer) {
   var db = await getDuckDB();
   var fname = 'data_' + Math.random().toString(36).slice(2) + '.parquet';
   await db.registerFileBuffer(fname, new Uint8Array(buffer));
   var conn = await db.connect();
+  var cols, rows;
   try {
     var result = await conn.query("SELECT * FROM read_parquet('" + fname + "')");
-    COLS = result.schema.fields.map(function(f){ return f.name; });
-    ALL = result.toArray().map(function(row) {
+    cols = result.schema.fields.map(function(f){ return f.name; });
+    rows = result.toArray().map(function(row) {
       var obj = row.toJSON();
       for (var k in obj) { if (typeof obj[k] === 'bigint') obj[k] = Number(obj[k]); }
       return obj;
@@ -736,6 +755,12 @@ async function loadParquetBuffer(buffer, label) {
     await conn.close();
     await db.dropFile(fname);
   }
+  return { cols: cols, rows: rows };
+}
+
+async function loadParquetBuffer(buffer, label) {
+  var res = await loadParquetRows(buffer);
+  COLS = res.cols; ALL = res.rows;
   resetLoadState();
   document.getElementById('file-info').textContent = label;
   onLoaded();
@@ -840,6 +865,73 @@ function filtered(rowType) {
     return (!rowType    || r.row_type    === rowType)
         && (!st.entity || r.entity_name === st.entity);
   });
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Contacts & grouping (optional report_contacts.csv/.parquet)
+// ══════════════════════════════════════════════════════════════
+var CONTACTS = [];
+function hasContacts() { return CONTACTS && CONTACTS.length > 0; }
+function contactMaxGap() {
+  return CONTACTS.reduce(function(m, e){ return (e.gap_um != null && e.gap_um > m) ? e.gap_um : m; }, 0.5);
+}
+function contactPairLabels() {
+  var s = new Set();
+  CONTACTS.forEach(function(e){ s.add([e.entity_a, e.entity_b].sort().join(' ↔ ')); });
+  return [...s].sort();
+}
+
+// Union-find over instances (keyed entity|label). Adds an edge when gap ≤ threshold and
+// the pair matches pairFilter ('' = all, 'same' = same-type only, or 'A ↔ B'). Returns a
+// colouring function + group counts. Multi-member groups get palette colours; singletons
+// are muted. Purely client-side, so threshold/pair changes never reload data.
+function buildContactGroups(cellId, threshold, pairFilter, instRows) {
+  var parent = {};
+  function find(x){ while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+  function ensure(k){ if (!(k in parent)) parent[k] = k; }
+  function key(ent, lab){ return ent + '|' + lab; }
+  instRows.forEach(function(r){ ensure(key(r.entity_name, r.label_id)); });
+  CONTACTS.forEach(function(e){
+    if (cellId && e.cell_id !== cellId) return;
+    if (e.gap_um == null || e.gap_um > threshold) return;
+    if (pairFilter === 'same' && e.entity_a !== e.entity_b) return;
+    if (pairFilter && pairFilter !== 'same'
+        && [e.entity_a, e.entity_b].sort().join(' ↔ ') !== pairFilter) return;
+    var ka = key(e.entity_a, e.label_a), kb = key(e.entity_b, e.label_b);
+    ensure(ka); ensure(kb);
+    parent[find(ka)] = find(kb);
+  });
+  var sizes = {}, rootOf = {};
+  Object.keys(parent).forEach(function(k){ var r = find(k); rootOf[k] = r; sizes[r] = (sizes[r] || 0) + 1; });
+  var multi = Object.keys(sizes).filter(function(r){ return sizes[r] > 1; })
+    .sort(function(a, b){ return sizes[b] - sizes[a]; });
+  var pal = chroma.scale('Spectral').colors(Math.max(multi.length, 3));
+  var rootColor = {};
+  multi.forEach(function(r, i){ rootColor[r] = pal[i % pal.length]; });
+  return {
+    colorFor: function(row){ var r = rootOf[key(row.entity_name, row.label_id)]; return (r && rootColor[r]) || '#cfcfcf'; },
+    nGroups: multi.length,
+    nSingletons: Object.keys(sizes).filter(function(r){ return sizes[r] === 1; }).length,
+    largest: multi.length ? sizes[multi[0]] : 0,
+  };
+}
+window.cgroupColorFor = function(){ return '#cfcfcf'; };  // replaced per-render by renderCell3D
+
+function loadContactsFile(file) {
+  var reader = new FileReader();
+  var done = function(){ document.getElementById('file-info').textContent += '  +contacts:' + CONTACTS.length; if (typeof renderAll === 'function') renderAll(); };
+  if (isParquetName(file.name)) {
+    reader.onload = function(e){
+      loadParquetRows(e.target.result).then(function(res){ CONTACTS = res.rows; done(); }).catch(showLoadError);
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    reader.onload = function(e){
+      var res = Papa.parse(e.target.result, { header:true, dynamicTyping:true, skipEmptyLines:true });
+      CONTACTS = res.data; done();
+    };
+    reader.readAsText(file);
+  }
 }
 
 var SKIP = new Set(['cell_id','group_id','entity_name','entity_kind','row_type','label_id',
@@ -966,17 +1058,35 @@ function initCell3D() {
     return '<option value="'+c+'"'+(c==='volume_um3'?' selected':'')+'>'+c.replace(/_/g,' ')+'</option>';
   }).join('');
 
+  // "Contact group" colouring — only offered when a contacts file is loaded.
+  var colorSel = document.getElementById('c3d-color');
+  var prevColorVal = colorSel.value || 'entity';
+  colorSel.innerHTML = '<option value="entity">Entity</option><option value="metric">Metric</option>'
+    + (hasContacts() ? '<option value="group">Contact group</option>' : '');
+  colorSel.value = (prevColorVal === 'group' && !hasContacts()) ? 'entity' : prevColorVal;
+  if (hasContacts()) {
+    var pairSel = document.getElementById('c3d-cgroup-pair');
+    var prevPair = pairSel.value;
+    pairSel.innerHTML = '<option value="">All pairs</option><option value="same">Same type only</option>'
+      + contactPairLabels().map(function(p){ return '<option value="'+p+'">'+p+'</option>'; }).join('');
+    if (prevPair) pairSel.value = prevPair;
+    document.getElementById('c3d-cgroup-thr').max = contactMaxGap().toFixed(3);
+  }
+  updateC3dColorWraps();
+
   var hasPolar = ALL.some(function(r){ return r.polar_dist_um!=null && isFinite(r.polar_dist_um); });
   document.getElementById('c3d-explode-wrap').style.display = hasPolar ? '' : 'none';
 
   if (!_c3dInited) {
     _c3dInited = true;
     cellSel.addEventListener('change', renderCell3D);
-    document.getElementById('c3d-color').addEventListener('change', function(){
-      document.getElementById('c3d-metric-wrap').style.display = this.value==='metric' ? '' : 'none';
+    document.getElementById('c3d-color').addEventListener('change', function(){ updateC3dColorWraps(); renderCell3D(); });
+    document.getElementById('c3d-metric').addEventListener('change', renderCell3D);
+    document.getElementById('c3d-cgroup-pair').addEventListener('change', renderCell3D);
+    document.getElementById('c3d-cgroup-thr').addEventListener('input', function(){
+      document.getElementById('c3d-cgroup-thr-val').textContent = (+this.value).toFixed(3);
       renderCell3D();
     });
-    document.getElementById('c3d-metric').addEventListener('change', renderCell3D);
     var explodeSlider = document.getElementById('c3d-explode');
     explodeSlider.addEventListener('input', function(){
       document.getElementById('c3d-explode-val').textContent = (+this.value).toFixed(1)+'×';
@@ -987,6 +1097,14 @@ function initCell3D() {
     });
   }
   renderCell3D();
+}
+
+function updateC3dColorWraps() {
+  var v = document.getElementById('c3d-color').value;
+  document.getElementById('c3d-metric-wrap').style.display = v === 'metric' ? '' : 'none';
+  var showG = v === 'group' && hasContacts();
+  document.getElementById('c3d-cgroup-wrap').style.display = showG ? '' : 'none';
+  document.getElementById('c3d-cgroup-thr-wrap').style.display = showG ? '' : 'none';
 }
 
 function renderCell3D() {
@@ -1003,6 +1121,14 @@ function renderCell3D() {
   });
   document.getElementById('c3d-count').textContent =
     instRows.length + ' instances · ' + maskRows.length + ' masks';
+
+  if (colorBy === 'group' && hasContacts()) {
+    var thr = +document.getElementById('c3d-cgroup-thr').value;
+    var pair = document.getElementById('c3d-cgroup-pair').value;
+    var g = buildContactGroups(cellId, thr, pair, instRows);
+    window.cgroupColorFor = g.colorFor;
+    window._cgroupStats = { nGroups: g.nGroups, nSingletons: g.nSingletons, largest: g.largest };
+  }
   if (typeof window.render3DScene === 'function') {
     var overlay = document.getElementById('c3d-loading');
     overlay.style.display = 'flex';
