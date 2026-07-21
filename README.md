@@ -106,7 +106,7 @@ Output tree:
 
 ```text
 <OUTPUT_ROOT>/
-  report.csv
+  report.parquet             # batch mode only — joint report across all cells
   <group>/<cell>/            # grouped mode
   <cell>/                    # flat mode
     report.csv
@@ -115,7 +115,7 @@ Output tree:
     .dt_cache/
 ```
 
-CSV row types:
+Row types (in `report.csv` / `report.parquet`):
 
 - `row_type = file`: one row per entity file per cell (entity summary metrics)
 - `row_type = instance`: one row per labeled object (instance metrics + distances)
@@ -133,7 +133,7 @@ Important columns:
 Live hosted viewers: [https://betaseg.github.io/cellsketch-v2/](https://betaseg.github.io/cellsketch-v2/)
 
 - `stats_viewer.html` (multi-cell stats):
-  - load: drag/drop a joint `report.csv` (or per-cell `report.csv`)
+  - load: drag/drop a joint `report.parquet` (batch mode) or a per-cell `report.csv`
   - use for: overview plots, component distributions, table + filtering by group/cell/entity
 
 - `mesh_viewer.html` (single-cell 3D):

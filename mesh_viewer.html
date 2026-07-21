@@ -126,6 +126,34 @@ function fitCamera(scene, camera, controls) {
 }
 
 let _R = null, _S = null, _C = null, _O = null;
+let _explodeItems = [];   // {mesh, dir:[dx,dy,dz], dist} — radial offset basis per mesh
+let _explodeFactor = 0;
+
+// Move every exploded mesh to `dir * dist * factor` away from its original spot —
+// dir/dist come from the same cell-center-relative direction used for polarity, so an
+// instance that already sits near the membrane moves further than one near the center.
+function applyExplode(factor) {
+  _explodeFactor = factor;
+  _explodeItems.forEach(function(it) {
+    it.mesh.position.set(it.dir[0] * it.dist * factor, it.dir[1] * it.dist * factor, it.dir[2] * it.dist * factor);
+  });
+}
+window.setExplode = function(factor) { applyExplode(factor); };
+window.fitCamera3D = function() {
+  if (!_S) return;
+  _S.updateMatrixWorld(true);
+  fitCamera(_S, _C, _O);
+};
+
+function explodeBasis(r) {
+  if (r.polar_dist_um != null && isFinite(r.polar_dist_um)
+      && r.polar_nx != null && isFinite(r.polar_nx)
+      && r.polar_ny != null && isFinite(r.polar_ny)
+      && r.polar_nz != null && isFinite(r.polar_nz)) {
+    return { dir: [r.polar_nx, r.polar_ny, r.polar_nz], dist: r.polar_dist_um };
+  }
+  return { dir: [0, 0, 0], dist: 0 };
+}
 
 function ensureScene() {
   if (_R) return;
@@ -156,6 +184,7 @@ function ensureScene() {
 window.render3DScene = async function(rows, metricCol, colorBy, maskRows) {
   ensureScene();
   clearMeshes(_S);
+  _explodeItems = [];
 
   const byEntity = colorBy === 'entity';
   const byCell   = colorBy === 'cell';
@@ -200,10 +229,12 @@ window.render3DScene = async function(rows, metricCol, colorBy, maskRows) {
         hex = viridisAt(Math.max(0, Math.min(1, (v - minV) / span)));
       }
     }
-    _S.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+    const mesh = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
       color: new THREE.Color(hex), side: THREE.DoubleSide,
       transparent: false, shininess: 25,
-    })));
+    }));
+    _S.add(mesh);
+    _explodeItems.push(Object.assign({ mesh }, explodeBasis(r)));
     count++;
   });
 
@@ -214,15 +245,18 @@ window.render3DScene = async function(rows, metricCol, colorBy, maskRows) {
     maskGeos.forEach((geo, i) => {
       if (!geo) return;
       const r = maskRows[i];
-      _S.add(new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+      const mesh = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
         color: new THREE.Color(window.entColor(r.entity_name) || '#aaa'),
         side: THREE.DoubleSide,
         transparent: true, opacity: 0.07, shininess: 5, depthWrite: false,
-      })));
+      }));
+      _S.add(mesh);
+      _explodeItems.push(Object.assign({ mesh }, explodeBasis(r)));
     });
   }
 
-  if (count) fitCamera(_S, _C, _O);
+  applyExplode(_explodeFactor);
+  if (count) window.fitCamera3D();
 
   const leg = document.getElementById('c3d-legend');
   if (!leg) return;
@@ -334,8 +368,8 @@ window.showMesh3D = function(b64, title) {
 <!-- ── Top bar ──────────────────────────────────────────────── -->
 <div class="topbar">
   <span class="brand">CellSketch 3D</span>
-  <button class="btn btn-sm btn-outline-dark" id="load-btn">&#128194; Open CSV</button>
-  <input type="file" id="file-input" accept=".csv,.tsv" class="d-none">
+  <button class="btn btn-sm btn-outline-dark" id="load-btn">&#128194; Open Report</button>
+  <input type="file" id="file-input" accept=".csv,.tsv,.parquet" class="d-none">
   <span class="file-info" id="file-info"></span>
   <span class="file-info"><i class="bi bi-shield-lock me-1"></i>Your data stays local, nothing is uploaded.</span>
   <div id="global-filters" class="d-none d-flex flex-wrap gap-2 ms-auto align-items-center">
@@ -351,7 +385,7 @@ window.showMesh3D = function(b64, title) {
     <div class="col-md-5" id="landing-form">
       <div id="drop-zone" onclick="document.getElementById('file-input').click()">
         <div style="font-size:3.5rem">&#127757;</div>
-        <div class="mt-2 fw-semibold fs-6">Drop <code>report_meshes.csv</code> here or click to browse</div>
+        <div class="mt-2 fw-semibold fs-6">Drop <code>report_meshes.csv</code> or <code>report_meshes.parquet</code> here or click to browse</div>
         <div class="small text-muted mt-1">Per-cell 3D mesh report — use <strong>stats_viewer.html</strong> for multi-cell stats</div>
       </div>
       <div style="border-top:1px solid #ddd;margin-top:1.2rem;padding-top:1rem">
@@ -406,6 +440,12 @@ window.showMesh3D = function(b64, title) {
       <div id="c3d-metric-wrap" style="display:none">
         <label class="form-label small mb-1">Metric</label>
         <select id="c3d-metric" class="form-select form-select-sm" style="width:auto"></select>
+      </div>
+      <div id="c3d-explode-wrap" style="display:none;width:190px">
+        <label class="form-label small mb-1" title="Pushes each organelle outward from the cell center along its real position, like an exploded-view diagram. The membrane stays put — it defines the center.">
+          Explode <span id="c3d-explode-val">0&times;</span>
+        </label>
+        <input type="range" id="c3d-explode" class="form-range" min="0" max="4" step="0.1" value="0">
       </div>
       <span id="c3d-count" class="small text-muted align-self-end pb-1"></span>
     </div>
@@ -535,13 +575,69 @@ var dz = document.getElementById('drop-zone');
 ['dragleave','drop'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.remove('drag-over'); }); });
 dz.addEventListener('drop', function(e){ if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
 
+function resetLoadState() {
+  _cellPal = null; _entPal = null; _viewerInited = false; _c3dInited = false;
+  st.entity = '';
+}
+
 function parseAndLoad(text, label) {
   var res = Papa.parse(text, { header:true, dynamicTyping:true, skipEmptyLines:true });
   ALL = res.data; COLS = res.meta.fields || [];
-  _cellPal = null; _entPal = null; _viewerInited = false; _c3dInited = false;
-  st.entity = '';
+  resetLoadState();
   document.getElementById('file-info').textContent = label;
   onLoaded();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Parquet loading via DuckDB-WASM
+// ══════════════════════════════════════════════════════════════
+var _duckdbPromise = null;
+function getDuckDB() {
+  if (!_duckdbPromise) {
+    _duckdbPromise = (async function() {
+      var duckdb = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm');
+      var bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+      var worker = await duckdb.createWorker(bundle.mainWorker);
+      var db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING), worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      return db;
+    })();
+  }
+  return _duckdbPromise;
+}
+
+async function loadParquetBuffer(buffer, label) {
+  var db = await getDuckDB();
+  var fname = 'data_' + Math.random().toString(36).slice(2) + '.parquet';
+  await db.registerFileBuffer(fname, new Uint8Array(buffer));
+  var conn = await db.connect();
+  try {
+    var result = await conn.query("SELECT * FROM read_parquet('" + fname + "')");
+    COLS = result.schema.fields.map(function(f){ return f.name; });
+    ALL = result.toArray().map(function(row) {
+      var obj = row.toJSON();
+      for (var k in obj) { if (typeof obj[k] === 'bigint') obj[k] = Number(obj[k]); }
+      return obj;
+    });
+  } finally {
+    await conn.close();
+    await db.dropFile(fname);
+  }
+  resetLoadState();
+  document.getElementById('file-info').textContent = label;
+  onLoaded();
+}
+
+function isParquetName(name) {
+  return /\.parquet$/i.test(name.split('?')[0].split('#')[0]);
+}
+
+function showLoadError(err) {
+  document.getElementById('landing-loading').classList.add('d-none');
+  document.getElementById('landing-error').classList.remove('d-none');
+  var msg = err && err.message ? err.message : String(err);
+  if (msg === 'Failed to fetch') msg = 'Could not reach the server. Check the URL and ensure the server allows cross-origin requests (CORS).';
+  document.getElementById('landing-error-msg').textContent = msg;
 }
 
 function loadFile(file) {
@@ -550,11 +646,19 @@ function loadFile(file) {
   document.getElementById('landing-error').classList.add('d-none');
   document.getElementById('loading-url').textContent = file.name;
   var reader = new FileReader();
-  reader.onload = function(e) {
-    history.replaceState(null, '', window.location.pathname);
-    parseAndLoad(e.target.result, file.name + ' (' + (file.size/1024/1024).toFixed(1) + ' MB)');
-  };
-  reader.readAsText(file);
+  if (isParquetName(file.name)) {
+    reader.onload = function(e) {
+      history.replaceState(null, '', window.location.pathname);
+      loadParquetBuffer(e.target.result, file.name + ' (' + (file.size/1024/1024).toFixed(1) + ' MB)').catch(showLoadError);
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    reader.onload = function(e) {
+      history.replaceState(null, '', window.location.pathname);
+      parseAndLoad(e.target.result, file.name + ' (' + (file.size/1024/1024).toFixed(1) + ' MB)');
+    };
+    reader.readAsText(file);
+  }
 }
 
 
@@ -569,22 +673,18 @@ function loadFromUrl(url) {
   document.getElementById('landing-loading').classList.remove('d-none');
   document.getElementById('landing-error').classList.add('d-none');
   document.getElementById('loading-url').textContent = url;
+  var parquet = isParquetName(url);
   fetch(url)
     .then(function(r) {
       if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
-      return r.text();
+      return parquet ? r.arrayBuffer() : r.text();
     })
-    .then(function(text) {
+    .then(function(data) {
       history.replaceState(null, '', '?data=' + encodeURIComponent(url));
-      parseAndLoad(text, url.split('/').pop() + ' (remote)');
+      var label = url.split('/').pop() + ' (remote)';
+      return parquet ? loadParquetBuffer(data, label) : parseAndLoad(data, label);
     })
-    .catch(function(err) {
-      document.getElementById('landing-loading').classList.add('d-none');
-      document.getElementById('landing-error').classList.remove('d-none');
-      var msg = err.message;
-      if (msg === 'Failed to fetch') msg = 'Could not reach the server. Check the URL and ensure the server allows cross-origin requests (CORS).';
-      document.getElementById('landing-error-msg').textContent = msg;
-    });
+    .catch(showLoadError);
 }
 
 document.getElementById('url-load-btn').addEventListener('click', function() {
@@ -753,6 +853,9 @@ function initCell3D() {
     return '<option value="'+c+'"'+(c==='volume_um3'?' selected':'')+'>'+c.replace(/_/g,' ')+'</option>';
   }).join('');
 
+  var hasPolar = ALL.some(function(r){ return r.polar_dist_um!=null && isFinite(r.polar_dist_um); });
+  document.getElementById('c3d-explode-wrap').style.display = hasPolar ? '' : 'none';
+
   if (!_c3dInited) {
     _c3dInited = true;
     cellSel.addEventListener('change', renderCell3D);
@@ -761,6 +864,14 @@ function initCell3D() {
       renderCell3D();
     });
     document.getElementById('c3d-metric').addEventListener('change', renderCell3D);
+    var explodeSlider = document.getElementById('c3d-explode');
+    explodeSlider.addEventListener('input', function(){
+      document.getElementById('c3d-explode-val').textContent = (+this.value).toFixed(1)+'×';
+      if (window.setExplode) window.setExplode(+this.value);
+    });
+    explodeSlider.addEventListener('change', function(){
+      if (window.fitCamera3D) window.fitCamera3D();
+    });
   }
   renderCell3D();
 }

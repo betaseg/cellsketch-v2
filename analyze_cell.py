@@ -9,7 +9,8 @@
 #   "tifffile>=2024.5.0",
 #   "edt>=2.4.0",
 #   "fast-simplification>=0.1.6",
-#   "imagecodecs"
+#   "imagecodecs",
+#   "pyarrow>=14.0.0"
 # ]
 # ///
 
@@ -1063,17 +1064,17 @@ def main() -> None:
         run_single_cell(args, cell_dir, out_dir, group_id=group_id)
 
     if batch:
-        # Joint stats CSV — concatenate per-cell report.csv (no b64, safe to load in browser)
+        # Joint stats — concatenate per-cell report.csv into a single parquet (no b64, safe to load in browser)
         dfs = [pd.read_csv(od / "report.csv") for od in out_dirs if (od / "report.csv").exists()]
         if dfs:
             joint = pd.concat(dfs, ignore_index=True)
-            joint_path = args.out_dir / "report.csv"
-            joint.to_csv(joint_path, index=False)
+            joint_path = args.out_dir / "report.parquet"
+            joint.to_parquet(joint_path, index=False)
             kb = joint_path.stat().st_size // 1024
-            print(f"Joint report.csv: {len(joint)} rows, {kb} KB → {joint_path}", flush=True)
+            print(f"Joint report.parquet: {len(joint)} rows, {kb} KB → {joint_path}", flush=True)
 
     print("Done.", flush=True)
-    print("  Stats viewer  → open stats_viewer.html, load report.csv", flush=True)
+    print("  Stats viewer  → open stats_viewer.html, load report.csv (single cell) or report.parquet (joint)", flush=True)
     print("  3D mesh viewer → open mesh_viewer.html, load a per-cell report_meshes.csv", flush=True)
 
 

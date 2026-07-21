@@ -40,6 +40,7 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
 .entity-title { font-weight: 600; font-size: .88rem; color: #111; margin-bottom: .6rem; display: flex; align-items: center; gap: .5rem; }
 .section-subtitle { font-size: .78rem; color: #666; margin: -.6rem 0 1rem; }
 .subsection-label { font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: #888; margin: .9rem 0 .35rem; }
+.subsection-desc { font-size: .72rem; color: #777; margin: -.2rem 0 .5rem; }
 .charts-row { display: flex; flex-wrap: wrap; gap: 10px; overflow-x: auto; }
 .chart-cell { flex-shrink: 0; }
 
@@ -60,8 +61,8 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
 <!-- ── Top bar ──────────────────────────────────────────────── -->
 <div class="topbar">
   <span class="brand">CellSketch Stats</span>
-  <button class="btn btn-sm btn-outline-dark" id="load-btn">&#128194; Open CSV</button>
-  <input type="file" id="file-input" accept=".csv,.tsv" class="d-none">
+  <button class="btn btn-sm btn-outline-dark" id="load-btn">&#128194; Open Report</button>
+  <input type="file" id="file-input" accept=".csv,.tsv,.parquet" class="d-none">
   <span class="file-info" id="file-info"></span>
   <span class="file-info"><i class="bi bi-shield-lock me-1"></i>Your data stays local, nothing is uploaded.</span>
   <div id="global-filters" class="d-none d-flex flex-wrap gap-2 ms-auto align-items-center">
@@ -85,7 +86,7 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
     <div class="col-md-5" id="landing-form">
       <div id="drop-zone" onclick="document.getElementById('file-input').click()">
         <div style="font-size:3.5rem">&#128202;</div>
-        <div class="mt-2 fw-semibold fs-6">Drop <code>report.csv</code> here or click to browse</div>
+        <div class="mt-2 fw-semibold fs-6">Drop <code>report.csv</code> or <code>report.parquet</code> here or click to browse</div>
         <span class="file-info"><i class="bi bi-shield-lock me-1"></i>Your data stays local, nothing is uploaded.</span>
       </div>
       <div style="border-top:1px solid #ddd;margin-top:1.2rem;padding-top:1rem">
@@ -125,21 +126,18 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
   <!-- Overview -->
   <div class="section" id="s-overview">
     <div class="section-title">Overview</div>
-    <p class="section-subtitle">Detected components, total volumes, and presence across all cells.</p>
-    <div id="overview-cards" class="d-flex flex-wrap gap-3 align-items-center mb-4"></div>
-    <div class="row g-3">
-      <div class="col-lg-5" id="overview-matrix-col"><div id="overview-matrix"></div></div>
-      <div class="col-lg-7" id="overview-volumes-col"><div id="overview-volumes"></div></div>
-    </div>
+    <p class="section-subtitle">What was found, and how big it is. The table shows which structures (masks = single segmented regions, labels = sets of individual instances) are present in which cell and group, and how many instances each label has. Below it, one chart per structure shows its total volume so you can compare sizes at a glance.</p>
+    <div id="overview-cards" class="d-flex flex-wrap gap-3 align-items-center mb-3"></div>
+    <div id="overview-table-wrap" class="mb-4"></div>
+    <div id="overview-volumes"></div>
   </div>
 
   <!-- Structure -->
   <div class="section" id="s-structure">
     <div class="section-title">File Structure</div>
-    <p class="section-subtitle">Input file sizes and TIFF organisation. The sunburst shows relative file sizes; segments are proportional to disk space, not biological volume.</p>
+    <p class="section-subtitle">An overview of the input files — one row per structure per cell.</p>
     <div class="row g-3">
-      <div class="col-lg-6"><div id="sunburst-chart" style="height:520px"></div></div>
-      <div class="col-lg-6">
+      <div class="col-12">
         <div style="max-height:480px;overflow-y:auto">
           <table class="table table-sm table-hover mb-0">
             <thead class="table-light sticky-top">
@@ -155,13 +153,10 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
   <!-- Per-entity stats -->
   <div class="section" id="s-entities">
     <div class="section-title">Component Stats</div>
-    <p class="section-subtitle">Per-instance distributions for each segmented structure. Box plots show the spread across instances; for multi-cell datasets each box is one cell or group. Hover any plot for exact values.</p>
-    <div id="polarity-ref-bar" class="d-none mb-3 p-2 d-flex flex-wrap align-items-center gap-2" style="background:#f8f8f8;border:1px solid #e0e0e0">
-      <span class="small fw-semibold" style="white-space:nowrap">Polarity reference:</span>
-      <select id="polarity-ref" class="form-select form-select-sm" style="width:auto">
-        <option value="">None (raw orientations)</option>
-      </select>
-      <span class="small text-muted">When set, all polar globes rotate so this entity's mean direction points to the top of the sphere — making polarity comparable across cells.</span>
+    <p class="section-subtitle">A closer look at each structure. Box plots show the range of values across all instances — the box covers the middle 50%, the line is the median, and dots are individual instances. For multi-cell datasets, each box is one cell or group, so you can see whether they differ. Hover any plot for exact values.</p>
+    <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+      <span class="small fw-semibold" style="white-space:nowrap">Component:</span>
+      <select id="stats-entity-select" class="form-select form-select-sm" style="width:auto"></select>
     </div>
     <div id="entity-stats-container"></div>
   </div>
@@ -189,7 +184,7 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
 //  Data & state
 // ══════════════════════════════════════════════════════════════
 var ALL = [], COLS = [];
-var st = { group: '', cell: '', entity: '' };
+var st = { group: '', cell: '', entity: '', statsEntity: null };
 var plotGroupBy = 'cell';
 
 // Color caches
@@ -237,13 +232,69 @@ var dz = document.getElementById('drop-zone');
 ['dragleave','drop'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.remove('drag-over'); }); });
 dz.addEventListener('drop', function(e){ if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
 
+function resetLoadState() {
+  _cellPal = null; _entPal = null; _grpPal = null;
+  st.group = ''; st.cell = ''; st.entity = ''; st.statsEntity = null;
+}
+
 function parseAndLoad(text, label) {
   var res = Papa.parse(text, { header:true, dynamicTyping:true, skipEmptyLines:true });
   ALL = res.data; COLS = res.meta.fields || [];
-  _cellPal = null; _entPal = null; _grpPal = null;
-  st.group = ''; st.cell = ''; st.entity = '';
+  resetLoadState();
   document.getElementById('file-info').textContent = label;
   onLoaded();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Parquet loading via DuckDB-WASM
+// ══════════════════════════════════════════════════════════════
+var _duckdbPromise = null;
+function getDuckDB() {
+  if (!_duckdbPromise) {
+    _duckdbPromise = (async function() {
+      var duckdb = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0/+esm');
+      var bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
+      var worker = await duckdb.createWorker(bundle.mainWorker);
+      var db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(duckdb.LogLevel.WARNING), worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      return db;
+    })();
+  }
+  return _duckdbPromise;
+}
+
+async function loadParquetBuffer(buffer, label) {
+  var db = await getDuckDB();
+  var fname = 'data_' + Math.random().toString(36).slice(2) + '.parquet';
+  await db.registerFileBuffer(fname, new Uint8Array(buffer));
+  var conn = await db.connect();
+  try {
+    var result = await conn.query("SELECT * FROM read_parquet('" + fname + "')");
+    COLS = result.schema.fields.map(function(f){ return f.name; });
+    ALL = result.toArray().map(function(row) {
+      var obj = row.toJSON();
+      for (var k in obj) { if (typeof obj[k] === 'bigint') obj[k] = Number(obj[k]); }
+      return obj;
+    });
+  } finally {
+    await conn.close();
+    await db.dropFile(fname);
+  }
+  resetLoadState();
+  document.getElementById('file-info').textContent = label;
+  onLoaded();
+}
+
+function isParquetName(name) {
+  return /\.parquet$/i.test(name.split('?')[0].split('#')[0]);
+}
+
+function showLoadError(err) {
+  document.getElementById('landing-loading').classList.add('d-none');
+  document.getElementById('landing-error').classList.remove('d-none');
+  var msg = err && err.message ? err.message : String(err);
+  if (msg === 'Failed to fetch') msg = 'Could not reach the server. Check the URL and ensure the server allows cross-origin requests (CORS).';
+  document.getElementById('landing-error-msg').textContent = msg;
 }
 
 function loadFile(file) {
@@ -252,11 +303,19 @@ function loadFile(file) {
   document.getElementById('landing-error').classList.add('d-none');
   document.getElementById('loading-url').textContent = file.name;
   var reader = new FileReader();
-  reader.onload = function(e) {
-    history.replaceState(null, '', window.location.pathname);
-    parseAndLoad(e.target.result, file.name + ' (' + (file.size/1024).toFixed(0) + ' KB)');
-  };
-  reader.readAsText(file);
+  if (isParquetName(file.name)) {
+    reader.onload = function(e) {
+      history.replaceState(null, '', window.location.pathname);
+      loadParquetBuffer(e.target.result, file.name + ' (' + (file.size/1024).toFixed(0) + ' KB)').catch(showLoadError);
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    reader.onload = function(e) {
+      history.replaceState(null, '', window.location.pathname);
+      parseAndLoad(e.target.result, file.name + ' (' + (file.size/1024).toFixed(0) + ' KB)');
+    };
+    reader.readAsText(file);
+  }
 }
 
 function showLandingForm() {
@@ -270,22 +329,18 @@ function loadFromUrl(url) {
   document.getElementById('landing-loading').classList.remove('d-none');
   document.getElementById('landing-error').classList.add('d-none');
   document.getElementById('loading-url').textContent = url;
+  var parquet = isParquetName(url);
   fetch(url)
     .then(function(r) {
       if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
-      return r.text();
+      return parquet ? r.arrayBuffer() : r.text();
     })
-    .then(function(text) {
+    .then(function(data) {
       history.replaceState(null, '', '?data=' + encodeURIComponent(url));
-      parseAndLoad(text, url.split('/').pop() + ' (remote)');
+      var label = url.split('/').pop() + ' (remote)';
+      return parquet ? loadParquetBuffer(data, label) : parseAndLoad(data, label);
     })
-    .catch(function(err) {
-      document.getElementById('landing-loading').classList.add('d-none');
-      document.getElementById('landing-error').classList.remove('d-none');
-      var msg = err.message;
-      if (msg === 'Failed to fetch') msg = 'Could not reach the server. Check the URL and ensure the server allows cross-origin requests (CORS).';
-      document.getElementById('landing-error-msg').textContent = msg;
-    });
+    .catch(showLoadError);
 }
 
 document.getElementById('url-load-btn').addEventListener('click', function() {
@@ -310,16 +365,9 @@ function onLoaded() {
   document.getElementById('landing').classList.add('d-none');
   document.getElementById('main-content').classList.remove('d-none');
   document.getElementById('global-filters').classList.remove('d-none');
-  polarRef = ''; _polarRotMap = {};
   initFilters();
   renderAll();
 }
-
-document.getElementById('polarity-ref').addEventListener('change', function() {
-  polarRef = this.value;
-  _polarRotMap = polarRef ? buildPolarRotMap(polarRef) : {};
-  renderEntityStats();
-});
 
 // ══════════════════════════════════════════════════════════════
 //  Helpers
@@ -444,62 +492,47 @@ function linearRegression(xs, ys) {
   return { slope: slope, intercept: (sy - slope * sx) / n };
 }
 
-// ══════════════════════════════════════════════════════════════
-//  Polarity helpers
-// ══════════════════════════════════════════════════════════════
-var polarRef = '';
-var _polarRotMap = {};   // cell_id → {axis:[nz,ny,nx], angle} | null
-
-function cross3(a, b) {
-  return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
-}
-function normVec3(v) {
-  var l = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
-  return l > 0 ? [v[0]/l, v[1]/l, v[2]/l] : [0, 0, 1];
-}
-// Rodrigues' rotation: rotate v around axis by angle
-function rodrigues(v, axis, angle) {
-  var c = Math.cos(angle), s = Math.sin(angle);
-  var dot = v[0]*axis[0]+v[1]*axis[1]+v[2]*axis[2];
-  var cr = cross3(axis, v);
-  return [c*v[0]+s*cr[0]+(1-c)*dot*axis[0],
-          c*v[1]+s*cr[1]+(1-c)*dot*axis[1],
-          c*v[2]+s*cr[2]+(1-c)*dot*axis[2]];
+// Pearson correlation coefficient (r); square it for R²
+function pearsonR(xs, ys) {
+  var n = xs.length;
+  if (n < 2) return null;
+  var mx = 0, my = 0;
+  for (var i = 0; i < n; i++) { mx += xs[i]; my += ys[i]; }
+  mx /= n; my /= n;
+  var sxx = 0, syy = 0, sxy = 0;
+  for (i = 0; i < n; i++) {
+    var dx = xs[i]-mx, dy = ys[i]-my;
+    sxx += dx*dx; syy += dy*dy; sxy += dx*dy;
+  }
+  if (sxx === 0 || syy === 0) return null;
+  return sxy / Math.sqrt(sxx * syy);
 }
 
-// Build per-cell rotation map that aligns refEnt's mean direction to north (nz=1)
-function buildPolarRotMap(refEntName) {
-  var map = {};
-  if (!refEntName) return map;
-  var north = [1, 0, 0]; // nz=1 → el=90° in our convention (vector is [nz,ny,nx])
-  uniq(ALL.map(function(r){ return r.cell_id; }).filter(Boolean)).forEach(function(cid) {
-    var rr = ALL.filter(function(r) {
-      return r.row_type==='instance' && r.entity_name===refEntName && r.cell_id===cid
-        && r.polar_nz!=null && isFinite(r.polar_nz);
-    });
-    if (!rr.length) return;
-    var mz=0, my=0, mx=0;
-    rr.forEach(function(r){ mz+=r.polar_nz; my+=r.polar_ny; mx+=r.polar_nx; });
-    var ref = normVec3([mz/rr.length, my/rr.length, mx/rr.length]);
-    var dot = ref[0]*north[0]+ref[1]*north[1]+ref[2]*north[2];
-    if (dot >= 1-1e-8) { map[cid] = null; return; }
-    if (dot <= -1+1e-8) { map[cid] = {axis:[0,1,0], angle:Math.PI}; return; }
-    map[cid] = {axis: normVec3(cross3(ref, north)), angle: Math.acos(Math.max(-1, Math.min(1, dot)))};
+// ── Axis columns for the morphology/proximity correlation explorer ─────────
+var POLAR_DIRECTION_COLS = new Set(['polar_nz','polar_ny','polar_nx','polar_az_deg','polar_el_deg']);
+var HIST_AUX_RE = /_(hist_min_um|hist_max_um)$/;
+
+function correlationAxisCols(rows) {
+  var morph = nonDistMetricCols(rows).filter(function(c){
+    return !POLAR_DIRECTION_COLS.has(c) && !HIST_AUX_RE.test(c);
   });
-  return map;
+  return morph.concat(scatterDistCols(rows));
 }
 
-// Get (az, el) in degrees for a row, applying normalization rotation if active
-function getPolarCoords(row) {
-  if (row.polar_nz == null || !isFinite(row.polar_nz)) return null;
-  if (!polarRef) return {az: row.polar_az_deg, el: row.polar_el_deg};
-  var v = [row.polar_nz, row.polar_ny, row.polar_nx];
-  var rot = _polarRotMap[row.cell_id];
-  if (rot) v = rodrigues(v, rot.axis, rot.angle);
-  return {
-    az: Math.atan2(v[1], v[2]) * 180 / Math.PI,
-    el: Math.asin(Math.max(-1, Math.min(1, v[0]))) * 180 / Math.PI,
-  };
+function axisColLabel(col) {
+  if (col.startsWith('distance_to_')) return distColLabel(col);
+  return col.replace(/_um3$|_um2$|_um$|_deg$/, '').replace(/_/g, ' ').trim();
+}
+function axisColUnit(col) {
+  if (col.startsWith('distance_to_') || col === 'polar_dist_um' || col === 'length_um') return 'μm';
+  if (col === 'volume_um3') return 'μm³';
+  if (col === 'surface_area_um2') return 'μm²';
+  if (col.endsWith('_deg')) return '°';
+  return '';
+}
+function axisColTitle(col) {
+  var u = axisColUnit(col);
+  return axisColLabel(col) + (u ? ' (' + u + ')' : '');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -568,78 +601,109 @@ function renderOverview() {
     '<div class="card-metric"><div class="big">'+(allCells.length||1)+'</div><div class="lbl">Cells</div></div>'
     +'<div class="d-flex flex-wrap gap-2 align-items-center">'+badges+'</div>';
 
-  var matCol = document.getElementById('overview-matrix-col');
-  var matEl  = document.getElementById('overview-matrix');
-  var volCol = document.getElementById('overview-volumes-col');
-  if(allCells.length < 2) {
-    matCol.classList.add('d-none');
-    matEl.innerHTML = '';
-    volCol.className = 'col-12';
-  } else {
-    matCol.classList.remove('d-none');
-    volCol.className = 'col-lg-7';
-    var presSet = new Set(allFileRows.map(function(r){ return r.cell_id+'|'+r.entity_name; }));
-    var z    = allCells.map(function(c){ return colDefs.map(function(cd){ return presSet.has(c+'|'+cd.name)?1:0; }); });
-    var text = z.map(function(row){ return row.map(function(v){ return v?'✓':'✗'; }); });
-    var colColors = colDefs.map(function(cd){ return cd.kind==='source'?'#999': cd.kind==='mask'?'#0d9488':'#3b82f6'; });
-    Plotly.react('overview-matrix',[{
-      type:'heatmap', z:z, x:colDefs.map(function(c){ return c.name; }), y:allCells,
-      text:text, texttemplate:'%{text}',
-      colorscale:[[0,'#f8d7da'],[1,'#d1e7dd']], showscale:false,
-      hovertemplate:'<b>%{y}</b> × <b>%{x}</b>: %{text}<extra></extra>',
-    }],{
-      margin:{l:140,r:20,t:10,b:90},
-      height:Math.max(220, allCells.length*38+110),
-      xaxis:{tickangle:-35, tickfont:{color:colColors}},
-      font:{size:11},
-    },{responsive:true});
-  }
+  // ── Presence / instance-count table: which structures are in which cell,
+  //    grouped by experimental group, with each structure tagged mask/label ──
+  var cellGroup = {};
+  allFileRows.forEach(function(r){ if (r.cell_id != null) cellGroup[r.cell_id] = r.group_id || ''; });
+  var hasGroups = Object.keys(cellGroup).some(function(c){ return cellGroup[c]; });
+  var rowCells = (allCells.length ? allCells.slice() : ['']).sort(function(a,b){
+    return (cellGroup[a]||'').localeCompare(cellGroup[b]||'') || a.localeCompare(b);
+  });
+  var presenceMap = {};
+  allFileRows.forEach(function(r){ presenceMap[(r.cell_id||'')+'|'+r.entity_name] = r; });
+
+  var thead = '<tr>'
+    + (hasGroups ? '<th>group</th>' : '')
+    + '<th>cell</th>'
+    + nonSource.map(function(c){
+        var cls = c.kind==='mask' ? 'bg-info text-dark' : 'bg-primary';
+        return '<th class="text-center">'+c.name+'<br><span class="badge rounded-pill '+cls+'" style="font-size:.6rem">'+c.kind+'</span></th>';
+      }).join('')
+    + '</tr>';
+  var tbody = rowCells.map(function(cid){
+    var gid = cellGroup[cid] || '';
+    var grpDot = gid ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+groupColor(gid)+';margin-right:4px;flex-shrink:0"></span>' : '';
+    return '<tr>'
+      + (hasGroups ? '<td>'+grpDot+gid+'</td>' : '')
+      + '<td>'+(cid||'(no cell)')+'</td>'
+      + nonSource.map(function(c){
+          var r = presenceMap[cid+'|'+c.name];
+          if (!r) return '<td class="text-center" style="background:#f8d7da;color:#842029" title="'+c.name+' not found for '+(cid||'this cell')+'">missing</td>';
+          if (c.kind==='mask') return '<td class="text-center">✓</td>';
+          var n = r.instance_count;
+          return '<td class="text-center">'+(n!=null?(+n).toLocaleString():'–')+'</td>';
+        }).join('')
+      + '</tr>';
+  }).join('');
+  document.getElementById('overview-table-wrap').innerHTML =
+    '<div style="overflow-x:auto"><table class="table table-sm table-hover mb-0">'
+    + '<thead class="table-light">'+thead+'</thead>'
+    + '<tbody>'+tbody+'</tbody></table></div>';
 
   var volContainer = document.getElementById('overview-volumes');
   volContainer.innerHTML = '';
   var entNames = nonSource.map(function(c){ return c.name; });
   if(!entNames.length) return;
-  var volEl = document.createElement('div');
-  volContainer.appendChild(volEl);
+
   var ovGroups = uniq(allFileRows.map(function(r){ return r.group_id; }).filter(Boolean));
   var byGroup  = plotGroupBy === 'group' && ovGroups.length > 1;
-  var volTraces, volLayout;
+
+  // One small plot per structure, so each can use its own scale
+  // (a nucleus and a mitochondrion don't fit on the same axis).
+  function legendDot(color) {
+    return '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+color+'"></span>';
+  }
   if (byGroup) {
-    volTraces = ovGroups.map(function(g){
-      var xs = [], ys = [];
-      entNames.forEach(function(e){
-        fileRows.filter(function(r){ return r.group_id===g && r.entity_name===e && r.total_volume_um3!=null; })
-          .forEach(function(r){ xs.push(e); ys.push(r.total_volume_um3); });
-      });
-      return { type:'box', name:g, x:xs, y:ys, marker:{color:groupColor(g)},
-               boxpoints:'all', jitter:0.4, pointpos:0 };
-    });
-    volLayout = { boxmode:'group', margin:{l:65,r:15,t:10,b:80}, height:260,
-      xaxis:{tickangle:-30}, yaxis:{title:'vol per cell (μm³)'},
-      showlegend:true, legend:{orientation:'h', y:-0.38, font:{size:8}}, font:{size:9} };
+    volContainer.insertAdjacentHTML('beforeend', '<div class="mb-2 d-flex flex-wrap gap-3" style="font-size:.72rem;color:#555">'
+      + ovGroups.map(function(g){ return '<span class="d-inline-flex align-items-center gap-1">'+legendDot(groupColor(g))+g+'</span>'; }).join('') + '</div>');
   } else if (allCells.length > 1) {
-    volTraces = allCells.map(function(c){
-      return { type:'bar', name:c, marker:{color:cellColor(c)},
-        x: entNames,
-        y: entNames.map(function(e){
+    volContainer.insertAdjacentHTML('beforeend', '<div class="mb-2 d-flex flex-wrap gap-3" style="font-size:.72rem;color:#555">'
+      + allCells.map(function(c){ return '<span class="d-inline-flex align-items-center gap-1">'+legendDot(cellColor(c))+c+'</span>'; }).join('') + '</div>');
+  }
+
+  var row = document.createElement('div');
+  row.className = 'charts-row';
+  volContainer.appendChild(row);
+
+  entNames.forEach(function(e){
+    var panel = document.createElement('div');
+    panel.className = 'chart-cell'; panel.style.width = '230px';
+    var title = document.createElement('div');
+    title.style.cssText = 'font-size:.72rem;font-weight:600;color:#333;margin-bottom:2px;display:flex;align-items:center;gap:5px';
+    title.innerHTML = '<span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:'+entColor(e)+'"></span>'+e;
+    panel.appendChild(title);
+    var plotEl = document.createElement('div');
+    panel.appendChild(plotEl);
+    row.appendChild(panel);
+
+    var traces, layout;
+    var axisStyle = {title:{text:'volume (μm³)', font:{size:9}}, tickfont:{size:8}};
+    if (byGroup) {
+      traces = ovGroups.map(function(g){
+        var ys = fileRows.filter(function(r){ return r.group_id===g && r.entity_name===e && r.total_volume_um3!=null; })
+          .map(function(r){ return r.total_volume_um3; });
+        return { type:'box', name:g, x:ys.map(function(){ return g; }), y:ys, marker:{color:groupColor(g)},
+                 boxpoints:'all', jitter:0.4, pointpos:0, showlegend:false };
+      });
+      layout = { margin:{l:48,r:8,t:6,b:34}, height:190, font:{size:9},
+        xaxis:{tickfont:{size:8}}, yaxis:axisStyle, showlegend:false };
+    } else if (allCells.length > 1) {
+      traces = [{ type:'bar', x:allCells, marker:{color:allCells.map(cellColor)}, showlegend:false,
+        y: allCells.map(function(c){
           var r = fileRows.find(function(r){ return r.cell_id===c && r.entity_name===e; });
           return r && r.total_volume_um3 != null ? r.total_volume_um3 : 0;
-        }) };
-    });
-    volLayout = { barmode:'group', margin:{l:65,r:15,t:10,b:80}, height:260,
-      xaxis:{tickangle:-30}, yaxis:{title:'total vol (μm³)'},
-      showlegend:true, legend:{orientation:'h', y:-0.38, font:{size:8}}, font:{size:9} };
-  } else {
-    volTraces = [{ type:'bar', x:entNames, marker:{color:entNames.map(entColor)},
-      y:entNames.map(function(e){
-        var r = fileRows.find(function(r){ return r.entity_name===e; });
-        return r && r.total_volume_um3 != null ? r.total_volume_um3 : 0;
-      }) }];
-    volLayout = { barmode:'group', margin:{l:65,r:15,t:10,b:80}, height:260,
-      xaxis:{tickangle:-30}, yaxis:{title:'total vol (μm³)'},
-      showlegend:false, font:{size:9} };
-  }
-  Plotly.newPlot(volEl, volTraces, volLayout, {responsive:true, displayModeBar:false});
+        }) }];
+      layout = { margin:{l:48,r:8,t:6,b:34}, height:190, font:{size:9},
+        xaxis:{tickfont:{size:8}}, yaxis:axisStyle, showlegend:false };
+    } else {
+      var r = fileRows.find(function(r){ return r.entity_name===e; });
+      traces = [{ type:'bar', x:[''], marker:{color:entColor(e)}, showlegend:false,
+        y:[r && r.total_volume_um3 != null ? r.total_volume_um3 : 0] }];
+      layout = { margin:{l:48,r:8,t:6,b:18}, height:190, font:{size:9},
+        xaxis:{visible:false}, yaxis:axisStyle, showlegend:false };
+    }
+    Plotly.newPlot(plotEl, traces, layout, {responsive:true, displayModeBar:false});
+  });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -647,42 +711,6 @@ function renderOverview() {
 // ══════════════════════════════════════════════════════════════
 function renderStructure() {
   var fileRows = filtered('file');
-
-  var sbGroups = uniq(fileRows.filter(function(r){ return r.group_id; }).map(function(r){ return r.group_id; }));
-  var sbByGroup = plotGroupBy === 'group' && sbGroups.length > 1;
-  var ids=['__root__'], lbls=['all'], parents=[''], vals=[0], colors=['rgba(0,0,0,0)'];
-  var seenGroups = new Set(), seenCells = new Set();
-  fileRows.filter(function(r){ return r.entity_kind!=='source'; }).forEach(function(r){
-    var cid = r.cell_id||'__nocell__';
-    var gid = r.group_id||'';
-    if (sbByGroup && gid) {
-      if (!seenGroups.has(gid)) {
-        seenGroups.add(gid);
-        ids.push('g:'+gid); lbls.push(gid); parents.push('__root__'); vals.push(0);
-        colors.push(groupColor(gid));
-      }
-      if (!seenCells.has(cid)) {
-        seenCells.add(cid);
-        ids.push(cid); lbls.push(cid||'(no cell)'); parents.push('g:'+gid); vals.push(0);
-        colors.push(chroma(groupColor(gid)).brighten(1).hex());
-      }
-    } else {
-      if (!seenCells.has(cid)) {
-        seenCells.add(cid);
-        ids.push(cid); lbls.push(cid||'(no cell)'); parents.push('__root__'); vals.push(0);
-        colors.push(cellColor(cid));
-      }
-    }
-    var k=cid+'/'+r.entity_name; ids.push(k); lbls.push(r.entity_name); parents.push(cid);
-    vals.push(r.file_size_bytes||0);
-    colors.push(entColor(r.entity_name));
-  });
-  Plotly.react('sunburst-chart',[{
-    type:'sunburst', ids:ids, labels:lbls, parents:parents, values:vals, branchvalues:'remainder',
-    marker:{colors:colors},
-    hovertemplate:'<b>%{label}</b><br>%{customdata}<extra></extra>',
-    customdata: vals.map(function(v){ return v ? (v/1e6).toFixed(2)+' MB' : ''; }),
-  }],{margin:{l:0,r:0,t:5,b:5},height:500},{responsive:true});
 
   document.getElementById('file-table-body').innerHTML = fileRows.slice()
     .sort(function(a,b){ return (a.group_id||'').localeCompare(b.group_id||'') || (a.cell_id||'').localeCompare(b.cell_id||'') || a.entity_name.localeCompare(b.entity_name); })
@@ -700,110 +728,6 @@ function renderStructure() {
         +'<td class="text-end">'+(r.aspect_ratio_major_minor!=null?(+r.aspect_ratio_major_minor).toFixed(2):'')+'</td>'
         +'<td class="text-end">'+sz+'</td><td class="text-muted small">'+mt+'</td></tr>';
     }).join('');
-}
-
-// ══════════════════════════════════════════════════════════════
-//  Polarity section renderer
-// ══════════════════════════════════════════════════════════════
-function renderPolarSection(block, ent, rows, color, multiGroup, allGroups, gKey) {
-  var hasPolar = rows.some(function(r){ return r.polar_az_deg!=null && isFinite(r.polar_az_deg); });
-  if (!hasPolar) return;
-
-  var ppLbl = block.querySelector('#pp-lbl-'+ent);
-  if (ppLbl) ppLbl.style.display = '';
-  var ppEl = block.querySelector('#pp-'+ent);
-
-  // Globe scatter
-  var globeEl = document.createElement('div');
-  globeEl.className = 'chart-cell';
-  globeEl.style.cssText = 'width:320px;height:320px;flex-shrink:0';
-  ppEl.appendChild(globeEl);
-
-  var geoLayout = {
-    showland:false, showocean:false, showlakes:false, showrivers:false, showcoastlines:false,
-    showframe:true, bgcolor:'#f5f5f5', framewidth:1, framecolor:'#999',
-    lataxis:{showgrid:true, gridcolor:'#ddd', gridwidth:0.5, range:[-90,90]},
-    lonaxis:{showgrid:true, gridcolor:'#ddd', gridwidth:0.5, range:[-180,180]},
-    projection:{type:'orthographic'},
-  };
-
-  var traces = [];
-  if (multiGroup) {
-    allGroups.forEach(function(g) {
-      var lons=[], lats=[], txts=[];
-      rows.filter(function(r){ return r[gKey]===g; }).forEach(function(r) {
-        var pc = getPolarCoords(r); if (!pc) return;
-        lons.push(pc.az); lats.push(pc.el);
-        txts.push('id '+r.label_id+(r.polar_dist_um!=null?' '+( +r.polar_dist_um).toFixed(1)+'μm':''));
-      });
-      if (!lons.length) return;
-      traces.push({type:'scattergeo', mode:'markers', name:g,
-        lon:lons, lat:lats, text:txts,
-        marker:{color:gColor(g), size:6, opacity:0.8, line:{width:0}},
-        hovertemplate:'az %{lon:.1f}° el %{lat:.1f}°<br>%{text}<extra>'+g+'</extra>'});
-    });
-  } else {
-    var lons=[], lats=[], txts=[], dists=[];
-    rows.forEach(function(r) {
-      var pc = getPolarCoords(r); if (!pc) return;
-      lons.push(pc.az); lats.push(pc.el);
-      txts.push('id '+r.label_id);
-      dists.push(r.polar_dist_um!=null ? +r.polar_dist_um : null);
-    });
-    var hasDistColor = dists.some(function(d){ return d!=null; });
-    if (lons.length) traces.push({
-      type:'scattergeo', mode:'markers', name:ent,
-      lon:lons, lat:lats, text:txts,
-      marker: hasDistColor ? {
-        color:dists, colorscale:'Viridis', size:7, opacity:0.85, line:{width:0},
-        colorbar:{title:{text:'dist (μm)', font:{size:8}}, thickness:10, len:0.5, x:1.05},
-      } : {color:color, size:7, opacity:0.85, line:{width:0}},
-      hovertemplate:'az %{lon:.1f}° el %{lat:.1f}°<br>%{text}'+(hasDistColor?'<br>%{marker.color:.1f} μm':'')+'<extra></extra>',
-    });
-  }
-
-  if (!traces.length) return;
-  Plotly.newPlot(globeEl, traces, {
-    geo: geoLayout,
-    margin:{l:0,r:50,t:28,b:0}, height:320, width:320,
-    title:{text:'polarity'+(polarRef?' [ref: '+polarRef+']':''), font:{size:10}},
-    showlegend: multiGroup && traces.length > 1,
-    legend:{orientation:'h', y:-0.08, font:{size:8}},
-  }, {responsive:false, displayModeBar:false});
-
-  // Distance from cell center — box plot
-  var dRows = rows.filter(function(r){ return r.polar_dist_um!=null && isFinite(r.polar_dist_um); });
-  if (dRows.length) {
-    var dEl = document.createElement('div');
-    dEl.className = 'chart-cell'; dEl.style.width = '200px';
-    ppEl.appendChild(dEl);
-    var dTraces = multiGroup
-      ? allGroups.map(function(g){ return {type:'box', name:g, boxpoints:false, marker:{color:gColor(g)},
-          y:dRows.filter(function(r){return r[gKey]===g;}).map(function(r){return r.polar_dist_um;})}; })
-      : [{type:'box', name:ent, boxpoints:'suspectedoutliers', marker:{color:color},
-          y:dRows.map(function(r){return r.polar_dist_um;})}];
-    Plotly.newPlot(dEl, dTraces, {
-      margin:{l:50,r:5,t:30,b:40}, height:280, font:{size:9},
-      title:{text:'dist from center', font:{size:10}}, yaxis:{title:'μm'}, showlegend:false,
-    }, {responsive:true, displayModeBar:false});
-  }
-
-  // Angular spread — box plot (only if column present)
-  var sRows = rows.filter(function(r){ return r.polar_angular_spread_deg!=null && isFinite(r.polar_angular_spread_deg); });
-  if (sRows.length) {
-    var sEl = document.createElement('div');
-    sEl.className = 'chart-cell'; sEl.style.width = '200px';
-    ppEl.appendChild(sEl);
-    var sTraces = multiGroup
-      ? allGroups.map(function(g){ return {type:'box', name:g, boxpoints:false, marker:{color:gColor(g)},
-          y:sRows.filter(function(r){return r[gKey]===g;}).map(function(r){return r.polar_angular_spread_deg;})}; })
-      : [{type:'box', name:ent, boxpoints:'suspectedoutliers', marker:{color:color},
-          y:sRows.map(function(r){return r.polar_angular_spread_deg;})}];
-    Plotly.newPlot(sEl, sTraces, {
-      margin:{l:50,r:5,t:30,b:40}, height:280, font:{size:9},
-      title:{text:'angular spread', font:{size:10}}, yaxis:{title:'°'}, showlegend:false,
-    }, {responsive:true, displayModeBar:false});
-  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -832,6 +756,27 @@ function renderEntityStats() {
   var labelEnts = uniq(instRows.filter(function(r){ return r.entity_kind==='label'; }).map(function(r){ return r.entity_name; }));
   var maskEnts  = uniq(fileRows.filter(function(r){ return r.entity_kind==='mask';  }).map(function(r){ return r.entity_name; }));
 
+  // Component picker — render only the selected component's charts at a time (full
+  // re-render of every component is the main cost on large datasets).
+  var allEnts = labelEnts.concat(maskEnts);
+  if (st.statsEntity === null) st.statsEntity = allEnts.length ? allEnts[0] : '__all__';
+  else if (st.statsEntity !== '__all__' && allEnts.indexOf(st.statsEntity) === -1) {
+    st.statsEntity = allEnts.length ? allEnts[0] : '__all__';
+  }
+  var sel = document.getElementById('stats-entity-select');
+  sel.innerHTML = '<option value="__all__"'+(st.statsEntity==='__all__'?' selected':'')+'>All components</option>'
+    + allEnts.map(function(e){
+        return '<option value="'+e+'"'+(st.statsEntity===e?' selected':'')+'>'+e+'</option>';
+      }).join('');
+  if (st.statsEntity !== '__all__') {
+    labelEnts = labelEnts.filter(function(e){ return e===st.statsEntity; });
+    maskEnts  = maskEnts.filter(function(e){ return e===st.statsEntity; });
+  }
+  sel.onchange = function() {
+    st.statsEntity = sel.value;
+    renderEntityStats();
+  };
+
   labelEnts.forEach(function(ent) {
     var rows  = instRows.filter(function(r){ return r.entity_name===ent && r.entity_kind==='label'; });
     var color = entColor(ent);
@@ -842,21 +787,22 @@ function renderEntityStats() {
     block.style.borderLeftColor = color;
     var badge = '<span class="badge bg-primary rounded-pill" style="font-size:.65rem">label</span>';
     block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
-      +'<div class="subsection-label">Morphology metrics</div>'
+      +'<div class="subsection-label">Shape &amp; size</div>'
       +'<div class="charts-row mb-3" id="mc-'+ent+'"></div>'
-      +'<div class="subsection-label" id="dc-lbl-'+ent+'" style="display:none">Minimum distance to other structures (one value per instance)</div>'
+      +'<div class="subsection-label" id="dc-lbl-'+ent+'" style="display:none">Distance to other structures (closest point of each instance)</div>'
       +'<div class="charts-row" id="dc-'+ent+'"></div>'
-      +'<div class="subsection-label mt-3" id="dh-lbl-'+ent+'" style="display:none">Per-pixel distance distributions (aggregated histogram of all pixels within each instance)</div>'
+      +'<div class="subsection-label mt-3" id="dh-lbl-'+ent+'" style="display:none">How close is every pixel? (combined across all instances)</div>'
       +'<div class="charts-row" id="dh-'+ent+'"></div>'
-      +'<div class="subsection-label mt-3" id="dsc-lbl-'+ent+'" style="display:none">Distance correlations (one point per instance)</div>'
-      +'<div class="charts-row" id="dsc-'+ent+'"></div>'
-      +'<div class="subsection-label mt-3" id="pp-lbl-'+ent+'" style="display:none">Spatial polarity — position on sphere around cell center</div>'
-      +'<div class="charts-row" id="pp-'+ent+'"></div>';
+      +'<div class="subsection-label mt-3" id="corr-lbl-'+ent+'" style="display:none">Compare two measurements</div>'
+      +'<p class="subsection-desc" id="corr-desc-'+ent+'" style="display:none">Pick any two values to plot against each other. R² (0–1) shows how strongly they line up — with a small n (few data points), treat any trend with caution.</p>'
+      +'<div class="charts-row" id="corr-'+ent+'"></div>';
     container.appendChild(block);
 
-    var mCols = nonDistMetricCols(rows);
+    var mCols = nonDistMetricCols(rows).filter(function(c){
+      return !POLAR_DIRECTION_COLS.has(c) && c !== 'polar_dist_um';
+    });
     var mcEl  = block.querySelector('#mc-'+ent);
-    mCols.slice(0, 8).forEach(function(metric) {
+    mCols.forEach(function(metric) {
       var valid = rows.filter(function(r){ return r[metric] != null && isFinite(r[metric]); });
       if (!valid.length) return;
       var el = document.createElement('div');
@@ -873,7 +819,7 @@ function renderEntityStats() {
           marker:{color: multiGroup ? xs.map(gColor) : color} }];
       } else if (multiGroup) {
         traces = allGroups.map(function(g){
-          return { type:'box', name:g, boxpoints:false, marker:{color:gColor(g)},
+          return { type:'box', name:g, boxpoints:'suspectedoutliers', marker:{color:gColor(g)},
             y: valid.filter(function(r){ return r[gKey]===g; }).map(function(r){ return r[metric]; }) };
         });
       } else {
@@ -883,7 +829,8 @@ function renderEntityStats() {
       Plotly.newPlot(el, traces, {
         margin:{l:50,r:5,t:28,b:50}, height:230, font:{size:9},
         showlegend: !isSingle && multiGroup,
-        title:{text:metric.replace(/_/g,' '), font:{size:10}},
+        title:{text:axisColLabel(metric), font:{size:10}},
+        yaxis:{title:axisColUnit(metric)||null},
         legend:{orientation:'h', y:-0.25, font:{size:8}},
       }, {responsive:true, displayModeBar:false});
     });
@@ -899,6 +846,14 @@ function renderEntityStats() {
         el.className = 'chart-cell'; el.style.width = '250px';
         dcEl.appendChild(el);
         var lbl = distColLabel(col);
+        // Flag sparse targets — "distance to nearest X" is noisy when X has very few instances.
+        var targetKey = col.replace(/^distance_to_/, '').replace(/_um$/, '').replace(/^label_/, '');
+        if (targetKey !== 'closest_same_type') {
+          var tCount = instRows.filter(function(r){ return r.entity_kind==='label' && r.entity_name===targetKey; }).length;
+          if (tCount > 0 && (tCount < 20 || tCount < rows.length * 0.05)) {
+            lbl += ' (target n=' + tCount + ')';
+          }
+        }
         var traces;
         if (isSingle) {
           if (multiGroup) {
@@ -924,7 +879,7 @@ function renderEntityStats() {
           if (multiGroup) {
             traces = allGroups.map(function(g){
               var ys = rows.filter(function(r){ return r[gKey]===g && r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
-              return { type:'box', name:g, y:ys, boxpoints:false, marker:{color:gColor(g)} };
+              return { type:'box', name:g, y:ys, boxpoints:'suspectedoutliers', marker:{color:gColor(g)} };
             });
           } else {
             var ys = rows.filter(function(r){ return r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
@@ -983,7 +938,7 @@ function renderEntityStats() {
         Plotly.newPlot(el, traces, {
           barmode:'overlay',
           margin:{l:50,r:5,t:30,b:50}, height:270, font:{size:9},
-          title:{text:'→ '+lbl+' (px dist)', font:{size:10}},
+          title:{text:'distance to '+lbl+' — every pixel', font:{size:10}},
           xaxis:{title:'distance (μm)'},
           yaxis:{title:'density'},
           showlegend:multiGroup,
@@ -992,47 +947,74 @@ function renderEntityStats() {
       });
     }
 
-    // ── Distance correlation scatter plots ────────────────────────────────────
-    var sdCols = scatterDistCols(rows);
-    if (sdCols.length >= 2) {
-      var dscLbl = block.querySelector('#dsc-lbl-'+ent);
-      if (dscLbl) dscLbl.style.display = '';
-      var dscEl = block.querySelector('#dsc-'+ent);
+    // ── Morphology vs. proximity correlation explorer ─────────────────────────
+    var axisCols = correlationAxisCols(rows);
+    if (axisCols.length >= 2) {
+      var corrLbl = block.querySelector('#corr-lbl-'+ent);
+      if (corrLbl) corrLbl.style.display = '';
+      var corrDesc = block.querySelector('#corr-desc-'+ent);
+      if (corrDesc) corrDesc.style.display = '';
+      var corrEl = block.querySelector('#corr-'+ent);
 
-      var pairs = [];
-      for (var pi = 0; pi < sdCols.length; pi++) {
-        for (var qi = pi+1; qi < sdCols.length; qi++) {
-          pairs.push([sdCols[pi], sdCols[qi]]);
-        }
-      }
+      var defX = axisCols.find(function(c){ return c==='distance_to_membrane_um'; })
+        || axisCols.find(function(c){ return c.startsWith('distance_to_'); })
+        || axisCols[0];
+      var defY = ['branches','sphericity','aspect_ratio_major_minor','length_um','tortuosity','polar_dist_um']
+        .map(function(c){ return axisCols.indexOf(c) >= 0 ? c : null; })
+        .filter(function(c){ return c && c !== defX; })[0]
+        || axisCols.find(function(c){ return c !== defX; })
+        || axisCols[0];
 
-      pairs.slice(0, 20).forEach(function(pair) {
-        var colA = pair[0], colB = pair[1];
-        var lblA = distColLabel(colA), lblB = distColLabel(colB);
-        var el = document.createElement('div');
-        el.className = 'chart-cell'; el.style.width = '280px';
-        dscEl.appendChild(el);
-        var scTraces = [];
+      var wrap = document.createElement('div');
+      wrap.className = 'chart-cell'; wrap.style.width = '380px';
+      corrEl.appendChild(wrap);
+
+      var ctrl = document.createElement('div');
+      ctrl.className = 'd-flex flex-wrap gap-2 align-items-center mb-1';
+      ctrl.style.fontSize = '.7rem';
+      var ySel = document.createElement('select'), xSel = document.createElement('select');
+      ySel.className = xSel.className = 'form-select form-select-sm';
+      ySel.style.cssText = xSel.style.cssText = 'width:auto;font-size:.7rem';
+      axisCols.forEach(function(c){
+        ySel.innerHTML += '<option value="'+c+'"'+(c===defY?' selected':'')+'>'+axisColLabel(c)+'</option>';
+        xSel.innerHTML += '<option value="'+c+'"'+(c===defX?' selected':'')+'>'+axisColLabel(c)+'</option>';
+      });
+      var yLbl = document.createElement('span'); yLbl.textContent = 'y:';
+      var xLbl = document.createElement('span'); xLbl.textContent = 'vs x:';
+      ctrl.append(yLbl, ySel, xLbl, xSel);
+      wrap.appendChild(ctrl);
+
+      var plotEl = document.createElement('div');
+      plotEl.style.cssText = 'width:380px;height:280px';
+      wrap.appendChild(plotEl);
+
+      function drawCorr() {
+        var colX = xSel.value, colY = ySel.value;
+        var lblX = axisColTitle(colX), lblY = axisColTitle(colY);
+        var traces = [];
+        var subtitle = '';
 
         if (multiGroup) {
           allGroups.forEach(function(g) {
             var xs = [], ys = [];
             rows.filter(function(r){ return r[gKey]===g; }).forEach(function(r) {
-              if (r[colA]!=null && isFinite(r[colA]) && r[colB]!=null && isFinite(r[colB])) {
-                xs.push(r[colA]); ys.push(r[colB]);
+              if (r[colX]!=null && isFinite(r[colX]) && r[colY]!=null && isFinite(r[colY])) {
+                xs.push(r[colX]); ys.push(r[colY]);
               }
             });
             if (!xs.length) return;
-            scTraces.push({
-              type:'scatter', mode:'markers', name:g,
+            var rr = pearsonR(xs, ys);
+            var nameWithR2 = g + (rr!=null ? ' (R²='+(rr*rr).toFixed(2)+', n='+xs.length+')' : ' (n='+xs.length+')');
+            traces.push({
+              type:'scatter', mode:'markers', name:nameWithR2,
               x:xs, y:ys,
-              marker:{color:gColor(g), size:5, opacity:0.7},
-              hovertemplate:lblA+': %{x:.2f} μm<br>'+lblB+': %{y:.2f} μm<extra>'+g+'</extra>',
+              marker:{color:gColor(g), size:5, opacity:0.6},
+              hovertemplate:lblX+': %{x:.3g}<br>'+lblY+': %{y:.3g}<extra>'+g+'</extra>',
             });
             if (xs.length >= 3) {
               var lr = linearRegression(xs, ys);
               var xlo = Math.min.apply(null,xs), xhi = Math.max.apply(null,xs);
-              scTraces.push({
+              traces.push({
                 type:'scatter', mode:'lines', showlegend:false,
                 x:[xlo,xhi], y:[lr.intercept+lr.slope*xlo, lr.intercept+lr.slope*xhi],
                 line:{color:gColor(g), width:1.5, dash:'dash'}, hoverinfo:'skip',
@@ -1042,62 +1024,49 @@ function renderEntityStats() {
         } else {
           var xs = [], ys = [], htxts = [];
           rows.forEach(function(r) {
-            if (r[colA]!=null && isFinite(r[colA]) && r[colB]!=null && isFinite(r[colB])) {
-              xs.push(r[colA]); ys.push(r[colB]);
+            if (r[colX]!=null && isFinite(r[colX]) && r[colY]!=null && isFinite(r[colY])) {
+              xs.push(r[colX]); ys.push(r[colY]);
               htxts.push('id '+r.label_id);
             }
           });
           if (xs.length) {
-            scTraces.push({
+            traces.push({
               type:'scatter', mode:'markers', name:ent,
               x:xs, y:ys, text:htxts,
-              marker:{color:color, size:5, opacity:0.7},
-              hovertemplate:lblA+': %{x:.2f} μm<br>'+lblB+': %{y:.2f} μm<br>%{text}<extra></extra>',
+              marker:{color:color, size:5, opacity:0.6},
+              hovertemplate:lblX+': %{x:.3g}<br>'+lblY+': %{y:.3g}<br>%{text}<extra></extra>',
             });
             if (xs.length >= 3) {
               var lr = linearRegression(xs, ys);
               var xlo = Math.min.apply(null,xs), xhi = Math.max.apply(null,xs);
-              scTraces.push({
+              traces.push({
                 type:'scatter', mode:'lines', showlegend:false,
                 x:[xlo,xhi], y:[lr.intercept+lr.slope*xlo, lr.intercept+lr.slope*xhi],
                 line:{color:'#888', width:1.5, dash:'dash'}, hoverinfo:'skip',
               });
             }
+            var rr = pearsonR(xs, ys);
+            subtitle = rr!=null ? '  —  R² = '+(rr*rr).toFixed(3)+' (n='+xs.length+')' : '  —  n='+xs.length;
           }
         }
 
-        if (!scTraces.length) return;
-        Plotly.newPlot(el, scTraces, {
-          margin:{l:55,r:5,t:30,b:60}, height:270, font:{size:9},
-          title:{text:lblA+' vs '+lblB, font:{size:10}},
-          xaxis:{title:lblA+' (μm)'},
-          yaxis:{title:lblB+' (μm)'},
+        if (!traces.length) { Plotly.purge(plotEl); return; }
+        Plotly.newPlot(plotEl, traces, {
+          margin:{l:55,r:5,t:30,b:50}, height:280, font:{size:9},
+          title:{text:lblY+' vs '+lblX+subtitle, font:{size:10}},
+          xaxis:{title:lblX},
+          yaxis:{title:lblY},
           showlegend:multiGroup,
-          legend:{orientation:'h', y:-0.35, font:{size:8}},
+          legend:{orientation:'h', y:-0.32, font:{size:8}},
         }, {responsive:true, displayModeBar:false});
-      });
+      }
+
+      xSel.onchange = drawCorr;
+      ySel.onchange = drawCorr;
+      drawCorr();
     }
 
-    // ── Spatial polarity ──────────────────────────────────────────────────────
-    renderPolarSection(block, ent, rows, color, multiGroup, allGroups, gKey);
-
   }); // end labelEnts.forEach
-
-  // Update polarity reference dropdown
-  var polarEnts = uniq(instRows.filter(function(r){
-    return r.entity_kind==='label' && r.polar_az_deg!=null && isFinite(r.polar_az_deg);
-  }).map(function(r){ return r.entity_name; }));
-  var polarBar = document.getElementById('polarity-ref-bar');
-  var polarSel = document.getElementById('polarity-ref');
-  if (polarEnts.length) {
-    polarBar.classList.remove('d-none');
-    polarSel.innerHTML = '<option value="">None (raw orientations)</option>'
-      + polarEnts.map(function(e){
-          return '<option value="'+e+'"'+(polarRef===e?' selected':'')+'>'+e+'</option>';
-        }).join('');
-  } else {
-    polarBar.classList.add('d-none');
-  }
 
   maskEnts.forEach(function(ent) {
     var mRows = fileRows.filter(function(r){ return r.entity_name===ent && r.entity_kind==='mask'; });
@@ -1106,7 +1075,7 @@ function renderEntityStats() {
     block.className = 'entity-block'; block.style.borderLeftColor = color;
     var badge = '<span class="badge bg-info text-dark rounded-pill" style="font-size:.65rem">mask</span>';
     block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
-      +'<div class="subsection-label">Morphology metrics: whole-structure measurements</div>'
+      +'<div class="subsection-label">Shape &amp; size (whole structure)</div>'
       +'<div class="charts-row" id="mk-'+ent+'"></div>';
     container.appendChild(block);
     if (!mRows.length) return;
