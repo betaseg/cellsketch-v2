@@ -479,8 +479,6 @@ window.showMesh3D = function(row, title) {
   <span class="brand">CellSketch 3D</span>
   <button class="btn btn-sm btn-outline-dark" id="load-btn">&#128194; Open Report</button>
   <input type="file" id="file-input" accept=".csv,.tsv,.parquet" class="d-none">
-  <button class="btn btn-sm btn-outline-secondary" id="contacts-btn" title="Load report_contacts.csv/parquet to enable contact-group coloring">&#128279; Contacts</button>
-  <input type="file" id="contacts-input" accept=".csv,.parquet" class="d-none">
   <span class="file-info" id="file-info"></span>
   <span class="file-info"><i class="bi bi-shield-lock me-1"></i>Your data stays local, nothing is uploaded.</span>
   <div id="global-filters" class="d-none d-flex flex-wrap gap-2 ms-auto align-items-center">
@@ -698,8 +696,6 @@ window.entColor  = entColor;
 // ══════════════════════════════════════════════════════════════
 document.getElementById('load-btn').addEventListener('click', function(){ document.getElementById('file-input').click(); });
 document.getElementById('file-input').addEventListener('change', function(e){ if(e.target.files[0]) loadFile(e.target.files[0]); });
-document.getElementById('contacts-btn').addEventListener('click', function(){ document.getElementById('contacts-input').click(); });
-document.getElementById('contacts-input').addEventListener('change', function(e){ if(e.target.files[0]) loadContactsFile(e.target.files[0]); });
 
 var dz = document.getElementById('drop-zone');
 ['dragenter','dragover'].forEach(function(ev){ dz.addEventListener(ev, function(e){ e.preventDefault(); dz.classList.add('drag-over'); }); });
@@ -846,6 +842,10 @@ document.getElementById('url-input').addEventListener('keydown', function(e) {
 
 
 function onLoaded() {
+  // Contacts ride inside the report as row_type='contact' rows — split them out so the
+  // instance/file logic never sees them.
+  CONTACTS = ALL.filter(function(r){ return r.row_type === 'contact'; });
+  ALL = ALL.filter(function(r){ return r.row_type !== 'contact'; });
   document.getElementById('landing').classList.add('d-none');
   document.getElementById('main-content').classList.remove('d-none');
   document.getElementById('global-filters').classList.remove('d-none');
@@ -868,12 +868,23 @@ function filtered(rowType) {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Contacts & grouping (optional report_contacts.csv/.parquet)
+//  Contacts & grouping (row_type='contact' rows embedded in the report)
 // ══════════════════════════════════════════════════════════════
 var CONTACTS = [];
 function hasContacts() { return CONTACTS && CONTACTS.length > 0; }
+// Largest gap actually recorded — drives the slider range so it always fits the data
+// (the processing --contact-max-um may be well below the old hard-coded 0.5 default).
 function contactMaxGap() {
-  return CONTACTS.reduce(function(m, e){ return (e.gap_um != null && e.gap_um > m) ? e.gap_um : m; }, 0.5);
+  var m = 0;
+  CONTACTS.forEach(function(e){ if (e.gap_um != null && e.gap_um > m) m = e.gap_um; });
+  return m > 0 ? m : 0.5;
+}
+// Gap value with precision matched to how small the recorded gaps are.
+function fmtGap(v) {
+  if (v == null) return '–';
+  if (v >= 0.1) return (+v).toFixed(2);
+  if (v >= 0.01) return (+v).toFixed(3);
+  return (+v).toFixed(4);
 }
 function contactPairLabels() {
   var s = new Set();
@@ -916,23 +927,6 @@ function buildContactGroups(cellId, threshold, pairFilter, instRows) {
   };
 }
 window.cgroupColorFor = function(){ return '#cfcfcf'; };  // replaced per-render by renderCell3D
-
-function loadContactsFile(file) {
-  var reader = new FileReader();
-  var done = function(){ document.getElementById('file-info').textContent += '  +contacts:' + CONTACTS.length; if (typeof renderAll === 'function') renderAll(); };
-  if (isParquetName(file.name)) {
-    reader.onload = function(e){
-      loadParquetRows(e.target.result).then(function(res){ CONTACTS = res.rows; done(); }).catch(showLoadError);
-    };
-    reader.readAsArrayBuffer(file);
-  } else {
-    reader.onload = function(e){
-      var res = Papa.parse(e.target.result, { header:true, dynamicTyping:true, skipEmptyLines:true });
-      CONTACTS = res.data; done();
-    };
-    reader.readAsText(file);
-  }
-}
 
 var SKIP = new Set(['cell_id','group_id','entity_name','entity_kind','row_type','label_id',
   'instance_count','total_volume_um3','mesh_b64','skeleton_b64','file_size_bytes','file_mtime','file_name']);
@@ -1058,7 +1052,7 @@ function initCell3D() {
     return '<option value="'+c+'"'+(c==='volume_um3'?' selected':'')+'>'+c.replace(/_/g,' ')+'</option>';
   }).join('');
 
-  // "Contact group" colouring — only offered when a contacts file is loaded.
+  // "Contact group" colouring — only offered when the report contains contact rows.
   var colorSel = document.getElementById('c3d-color');
   var prevColorVal = colorSel.value || 'entity';
   colorSel.innerHTML = '<option value="entity">Entity</option><option value="metric">Metric</option>'
@@ -1070,7 +1064,21 @@ function initCell3D() {
     pairSel.innerHTML = '<option value="">All pairs</option><option value="same">Same type only</option>'
       + contactPairLabels().map(function(p){ return '<option value="'+p+'">'+p+'</option>'; }).join('');
     if (prevPair) pairSel.value = prevPair;
-    document.getElementById('c3d-cgroup-thr').max = contactMaxGap().toFixed(3);
+    // Size the slider to the recorded gaps: full span = data max, ~100 steps. Start tight
+    // (a quarter of the range, near "actually touching") rather than at the max, which would
+    // link the whole recorded set into a few giant groups.
+    var maxGap = contactMaxGap();
+    var defGap = maxGap * 0.25;
+    var gthr = document.getElementById('c3d-cgroup-thr');
+    gthr.max = maxGap;
+    gthr.step = maxGap / 100;
+    if (!_c3dInited) {
+      gthr.value = defGap;
+      document.getElementById('c3d-cgroup-thr-val').textContent = fmtGap(defGap);
+    } else if (+gthr.value > maxGap) {
+      gthr.value = maxGap;
+      document.getElementById('c3d-cgroup-thr-val').textContent = fmtGap(maxGap);
+    }
   }
   updateC3dColorWraps();
 
@@ -1084,7 +1092,7 @@ function initCell3D() {
     document.getElementById('c3d-metric').addEventListener('change', renderCell3D);
     document.getElementById('c3d-cgroup-pair').addEventListener('change', renderCell3D);
     document.getElementById('c3d-cgroup-thr').addEventListener('input', function(){
-      document.getElementById('c3d-cgroup-thr-val').textContent = (+this.value).toFixed(3);
+      document.getElementById('c3d-cgroup-thr-val').textContent = fmtGap(+this.value);
       renderCell3D();
     });
     var explodeSlider = document.getElementById('c3d-explode');
