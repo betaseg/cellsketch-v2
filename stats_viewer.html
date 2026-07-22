@@ -525,8 +525,25 @@ function distColLabel(col) {
     .trim();
 }
 
-// Aggregate per-instance histograms (stored as JSON in rows) onto a common grid
-function aggregateHistograms(rows, key, numBins) {
+// The common [min,max] span of a distance target's per-pixel histograms across rows — pass it
+// to aggregateHistograms so every group is binned on the SAME grid (otherwise per-group grids
+// produce misaligned bars with gaps when overlaid).
+function histSpan(rows, key) {
+  var minCol = 'distance_to_' + key + '_hist_min_um', maxCol = 'distance_to_' + key + '_hist_max_um';
+  var histCol = 'distance_to_' + key + '_hist_um';
+  var gmin = Infinity, gmax = -Infinity;
+  rows.forEach(function(r) {
+    if (r[histCol] == null || r[minCol] == null || r[maxCol] == null) return;
+    if (!isFinite(r[minCol]) || !isFinite(r[maxCol])) return;
+    if (r[minCol] < gmin) gmin = r[minCol];
+    if (r[maxCol] > gmax) gmax = r[maxCol];
+  });
+  return (isFinite(gmin) && gmax > gmin) ? { min: gmin, max: gmax } : null;
+}
+
+// Aggregate per-instance histograms (stored as JSON in rows) onto a grid. Pass `span`
+// ({min,max}) to force a shared grid across groups; otherwise it is derived from `rows`.
+function aggregateHistograms(rows, key, numBins, span) {
   numBins = numBins || 30;
   var minCol  = 'distance_to_' + key + '_hist_min_um';
   var maxCol  = 'distance_to_' + key + '_hist_max_um';
@@ -536,8 +553,8 @@ function aggregateHistograms(rows, key, numBins) {
       && isFinite(r[minCol]) && isFinite(r[maxCol]);
   });
   if (!valid.length) return null;
-  var gmin = valid.reduce(function(m, r){ return Math.min(m, r[minCol]); }, Infinity);
-  var gmax = valid.reduce(function(m, r){ return Math.max(m, r[maxCol]); }, -Infinity);
+  var gmin = span ? span.min : valid.reduce(function(m, r){ return Math.min(m, r[minCol]); }, Infinity);
+  var gmax = span ? span.max : valid.reduce(function(m, r){ return Math.max(m, r[maxCol]); }, -Infinity);
   if (!isFinite(gmin) || gmax <= gmin) return null;
   var bw = (gmax - gmin) / numBins;
   var counts = new Array(numBins).fill(0);
@@ -1083,22 +1100,24 @@ function renderOverview() {
     var traces, layout;
     var axisStyle = {title:{text:'volume (μm³)', font:{size:9}}, tickfont:{size:8}};
     if (byGroup) {
-      traces = ovGroups.map(function(g){
+      var ovShort = shortFacetLabels(ovGroups);
+      traces = ovGroups.map(function(g, gi){
         var ys = fileRows.filter(function(r){ return r.group_id===g && r.entity_name===e && r.total_volume_um3!=null; })
           .map(function(r){ return r.total_volume_um3; });
-        return { type:'box', name:g, x:ys.map(function(){ return g; }), y:ys, marker:{color:groupColor(g)},
-                 boxpoints:'all', jitter:0.4, pointpos:0, showlegend:false };
+        return { type:'box', name:ovShort[gi], x:ys.map(function(){ return ovShort[gi]; }), y:ys, marker:{color:groupColor(g)},
+                 boxpoints:'all', jitter:0.4, pointpos:0, showlegend:false, hovertemplate:'%{y:.3g}<extra>'+g+'</extra>' };
       });
       layout = { margin:{l:48,r:8,t:6,b:34}, height:190, font:{size:9},
-        xaxis:{tickfont:{size:8}}, yaxis:axisStyle, showlegend:false };
+        xaxis:{tickfont:{size:8}, automargin:true}, yaxis:axisStyle, showlegend:false };
     } else if (allCells.length > 1) {
-      traces = [{ type:'bar', x:allCells, marker:{color:allCells.map(cellColor)}, showlegend:false,
+      var cellShort = shortFacetLabels(allCells);
+      traces = [{ type:'bar', x:cellShort, customdata:allCells, marker:{color:allCells.map(cellColor)}, showlegend:false,
         y: allCells.map(function(c){
           var r = fileRows.find(function(r){ return r.cell_id===c && r.entity_name===e; });
           return r && r.total_volume_um3 != null ? r.total_volume_um3 : 0;
-        }) }];
+        }), hovertemplate:'%{customdata}: %{y:.3g}<extra></extra>' }];
       layout = { margin:{l:48,r:8,t:6,b:34}, height:190, font:{size:9},
-        xaxis:{tickfont:{size:8}}, yaxis:axisStyle, showlegend:false };
+        xaxis:{tickfont:{size:8}, automargin:true}, yaxis:axisStyle, showlegend:false };
     } else {
       var r = fileRows.find(function(r){ return r.entity_name===e; });
       traces = [{ type:'bar', x:[''], marker:{color:entColor(e)}, showlegend:false,
@@ -1148,6 +1167,13 @@ function renderEntityStats() {
   var allGroups = uniq(instRows.map(function(r){ return r[gKey]; }).filter(Boolean));
   var multiGroup = allGroups.length > 1;
 
+  // Short display labels for the facet (cell/group) names, which are often long shared paths.
+  // Full names stay available on hover.
+  var _shortG = {};
+  shortFacetLabels(allGroups).forEach(function(s, i){ _shortG[allGroups[i]] = s; });
+  function gShort(g){ return _shortG[g] != null ? _shortG[g] : String(g); }
+  var xTick = { automargin:true, tickfont:{size:8} };
+
   var allLabelFileRows = ALL.filter(function(r){ return r.row_type==='file' && r.entity_kind==='label'; });
   var singleLabelEnts = new Set(
     uniq(allLabelFileRows.map(function(r){ return r.entity_name; }))
@@ -1191,13 +1217,19 @@ function renderEntityStats() {
     block.style.borderLeftColor = color;
     var badge = '<span class="badge bg-primary rounded-pill" style="font-size:.65rem">label</span>';
     block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
-      +'<div class="subsection-label">Shape &amp; size</div>'
+      +'<div class="subsection-label">How big and what shape is each '+ent+'?</div>'
+      +'<p class="subsection-desc">One box per '+(multiGroup?(plotGroupBy==='group'?'group':'cell'):ent)+'. The box is the middle 50% of instances, the line the median, dots individual '+ent+'s.</p>'
       +'<div class="charts-row mb-3" id="mc-'+ent+'"></div>'
-      +'<div class="subsection-label" id="dc-lbl-'+ent+'" style="display:none">Distance to other structures (closest point of each instance)</div>'
+      +'<div class="subsection-label" id="dc-lbl-'+ent+'" style="display:none">How far is each '+ent+' from other structures?</div>'
+      +'<p class="subsection-desc" id="dc-desc-'+ent+'" style="display:none">Distance from the closest point of each '+ent+' to the nearest instance of each structure. Near 0 means that '+ent+' sits right against it.</p>'
       +'<div class="charts-row" id="dc-'+ent+'"></div>'
-      +'<div class="subsection-label mt-3" id="dh-lbl-'+ent+'" style="display:none">How close is every pixel? (combined across all instances)</div>'
+      +'<div class="subsection-label mt-3" id="d2-lbl-'+ent+'" style="display:none">Is each '+ent+' close to two structures at once?</div>'
+      +'<p class="subsection-desc" id="d2-desc-'+ent+'" style="display:none">Each dot is one '+ent+': its distance to one structure (x) versus another (y). <b>Bottom-left = close to both.</b> Colour marks the '+(plotGroupBy==='group'?'group':'cell')+', so you can see whether the pattern differs between them.</p>'
+      +'<div class="charts-row" id="d2-'+ent+'"></div>'
+      +'<div class="subsection-label mt-3" id="dh-lbl-'+ent+'" style="display:none">How much of each '+ent+'’s body lies near a structure?</div>'
+      +'<p class="subsection-desc" id="dh-desc-'+ent+'" style="display:none">Every voxel making up the '+ent+' population, binned by its distance to a structure. A tall peak near 0 means '+ent+'s hug that structure along much of their body — not just touch at a single point. (The closest-point view above only sees the single nearest point.)</p>'
       +'<div class="charts-row" id="dh-'+ent+'"></div>'
-      +'<div class="subsection-label mt-3" id="corr-lbl-'+ent+'" style="display:none">Compare two measurements</div>'
+      +'<div class="subsection-label mt-3" id="corr-lbl-'+ent+'" style="display:none">Free exploration: compare any two measurements</div>'
       +'<p class="subsection-desc" id="corr-desc-'+ent+'" style="display:none">Pick any two values to plot against each other. R² (0–1) shows how strongly they line up — with a small n (few data points), treat any trend with caution.</p>'
       +'<div class="charts-row" id="corr-'+ent+'"></div>';
     container.appendChild(block);
@@ -1219,12 +1251,15 @@ function renderEntityStats() {
           var r = valid.find(function(r){ return multiGroup ? r[gKey]===g : true; });
           return r ? r[metric] : null;
         });
-        traces = [{ type:'bar', x:xs, y:ys, showlegend:false,
-          marker:{color: multiGroup ? xs.map(gColor) : color} }];
+        traces = [{ type:'bar', x: multiGroup ? xs.map(gShort) : xs, customdata:xs, y:ys, showlegend:false,
+          marker:{color: multiGroup ? xs.map(gColor) : color},
+          hovertemplate:'%{customdata}: %{y:.3g}<extra></extra>' }];
       } else if (multiGroup) {
+        // One box per facet — the facet is the x-axis category, so no legend (would just repeat it).
         traces = allGroups.map(function(g){
-          return { type:'box', name:g, boxpoints:'suspectedoutliers', marker:{color:gColor(g)},
-            y: valid.filter(function(r){ return r[gKey]===g; }).map(function(r){ return r[metric]; }) };
+          return { type:'box', name:gShort(g), boxpoints:'suspectedoutliers', marker:{color:gColor(g)},
+            y: valid.filter(function(r){ return r[gKey]===g; }).map(function(r){ return r[metric]; }),
+            hovertemplate:'%{y:.3g}<extra>'+g+'</extra>' };
         });
       } else {
         traces = [{ type:'box', name:ent, boxpoints:'suspectedoutliers', marker:{color:color},
@@ -1232,10 +1267,9 @@ function renderEntityStats() {
       }
       Plotly.newPlot(el, traces, {
         margin:{l:50,r:5,t:28,b:50}, height:230, font:{size:9},
-        showlegend: !isSingle && multiGroup,
+        showlegend: false,
         title:{text:axisColLabel(metric), font:{size:10}},
-        yaxis:{title:axisColUnit(metric)||null},
-        legend:{orientation:'h', y:-0.25, font:{size:8}},
+        xaxis:xTick, yaxis:{title:axisColUnit(metric)||null},
       }, {responsive:true, displayModeBar:false});
     });
 
@@ -1243,6 +1277,8 @@ function renderEntityStats() {
     if (dCols.length) {
       var dcLbl = block.querySelector('#dc-lbl-'+ent);
       if (dcLbl) dcLbl.style.display = '';
+      var dcDesc = block.querySelector('#dc-desc-'+ent);
+      if (dcDesc) dcDesc.style.display = '';
       var dcEl = block.querySelector('#dc-'+ent);
 
       dCols.forEach(function(col) {
@@ -1261,41 +1297,110 @@ function renderEntityStats() {
         var traces;
         if (isSingle) {
           if (multiGroup) {
-            traces = allGroups.map(function(g){
-              var r = rows.find(function(r){ return r[gKey]===g; });
-              return { type:'bar', name:g, x:[g], marker:{color:gColor(g)},
-                y:[r && r[col]!=null ? r[col] : null] };
-            });
+            traces = [{ type:'bar', x:allGroups.map(gShort), customdata:allGroups, showlegend:false,
+              marker:{color:allGroups.map(gColor)},
+              y:allGroups.map(function(g){ var r = rows.find(function(r){ return r[gKey]===g; }); return r && r[col]!=null ? r[col] : null; }),
+              hovertemplate:'%{customdata}: %{y:.3g} μm<extra></extra>' }];
           } else {
-            traces = [{ type:'bar', x:allGroups.length ? allGroups : [ent], showlegend:false,
+            traces = [{ type:'bar', x:allGroups.length ? allGroups.map(gShort) : [ent], customdata:allGroups.length ? allGroups : [ent], showlegend:false,
               marker:{color:color},
               y:(allGroups.length ? allGroups : [null]).map(function(g){
                 var r = g ? rows.find(function(r){ return r[gKey]===g; }) : rows[0];
                 return r && r[col]!=null ? r[col] : null;
-              }) }];
+              }), hovertemplate:'%{customdata}: %{y:.3g} μm<extra></extra>' }];
           }
-          Plotly.newPlot(el, traces, {
-            barmode:'group', margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
-            title:{text:lbl, font:{size:10}}, yaxis:{title:'μm'},
-            showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
-          }, {responsive:true, displayModeBar:false});
         } else {
           if (multiGroup) {
+            // One box per facet — facet is the x-axis category, so no legend.
             traces = allGroups.map(function(g){
               var ys = rows.filter(function(r){ return r[gKey]===g && r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
-              return { type:'box', name:g, y:ys, boxpoints:'suspectedoutliers', marker:{color:gColor(g)} };
+              return { type:'box', name:gShort(g), y:ys, boxpoints:'suspectedoutliers', marker:{color:gColor(g)},
+                hovertemplate:'%{y:.3g} μm<extra>'+g+'</extra>' };
             });
           } else {
             var ys = rows.filter(function(r){ return r[col]!=null && isFinite(r[col]); }).map(function(r){ return r[col]; });
             traces = [{ type:'box', name:ent, y:ys, boxpoints:'suspectedoutliers', marker:{color:color} }];
           }
-          Plotly.newPlot(el, traces, {
-            margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
-            title:{text:lbl, font:{size:10}}, yaxis:{title:'μm'},
-            showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
-          }, {responsive:true, displayModeBar:false});
         }
+        Plotly.newPlot(el, traces, {
+          barmode:'group', margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
+          title:{text:lbl, font:{size:10}}, xaxis:xTick, yaxis:{title:'μm'},
+          showlegend:false,
+        }, {responsive:true, displayModeBar:false});
       });
+    }
+
+    // ── Close to two structures at once? (per-instance distance vs distance) ──────
+    var d2cols = scatterDistCols(rows).filter(function(c){
+      return rows.some(function(r){ return r[c]!=null && isFinite(r[c]); });
+    });
+    if (d2cols.length >= 2) {
+      block.querySelector('#d2-lbl-'+ent).style.display = '';
+      block.querySelector('#d2-desc-'+ent).style.display = '';
+      var d2El = block.querySelector('#d2-'+ent);
+
+      // Prefer membrane on x, nucleus on y when present — the canonical "spans between" pair.
+      var pick = function(re){ return d2cols.find(function(c){ return re.test(c); }); };
+      var defX2 = pick(/membrane|plasma|(^|_)pm(_|$)/i) || d2cols[0];
+      var defY2 = pick(/nucl/i);
+      if (!defY2 || defY2 === defX2) defY2 = d2cols.find(function(c){ return c !== defX2; }) || d2cols[1];
+
+      var d2wrap = document.createElement('div');
+      d2wrap.className = 'chart-cell'; d2wrap.style.width = '400px';
+      d2El.appendChild(d2wrap);
+      var d2ctrl = document.createElement('div');
+      d2ctrl.className = 'd-flex flex-wrap gap-2 align-items-center mb-1';
+      d2ctrl.style.fontSize = '.7rem';
+      var xSel2 = document.createElement('select'), ySel2 = document.createElement('select');
+      xSel2.className = ySel2.className = 'form-select form-select-sm';
+      xSel2.style.cssText = ySel2.style.cssText = 'width:auto;font-size:.7rem';
+      d2cols.forEach(function(c){
+        xSel2.innerHTML += '<option value="'+c+'"'+(c===defX2?' selected':'')+'>'+distColLabel(c)+'</option>';
+        ySel2.innerHTML += '<option value="'+c+'"'+(c===defY2?' selected':'')+'>'+distColLabel(c)+'</option>';
+      });
+      var xL2 = document.createElement('span'); xL2.textContent = 'x: dist to';
+      var yL2 = document.createElement('span'); yL2.textContent = 'y: dist to';
+      d2ctrl.append(xL2, xSel2, yL2, ySel2);
+      d2wrap.appendChild(d2ctrl);
+      var d2plot = document.createElement('div');
+      d2plot.style.cssText = 'width:400px;height:300px';
+      d2wrap.appendChild(d2plot);
+
+      var drawD2 = function() {
+        var cx = xSel2.value, cy = ySel2.value;
+        var lblX = distColLabel(cx), lblY = distColLabel(cy);
+        var traces = [];
+        var collect = function(rws){
+          var xs=[], ys=[], ids=[];
+          rws.forEach(function(r){
+            if (r[cx]!=null && isFinite(r[cx]) && r[cy]!=null && isFinite(r[cy])) { xs.push(r[cx]); ys.push(r[cy]); ids.push('id '+r.label_id); }
+          });
+          return { xs:xs, ys:ys, ids:ids };
+        };
+        if (multiGroup) {
+          allGroups.forEach(function(g){
+            var p = collect(rows.filter(function(r){ return r[gKey]===g; }));
+            if (!p.xs.length) return;
+            traces.push({ type:'scatter', mode:'markers', name:gShort(g)+' (n='+p.xs.length+')',
+              x:p.xs, y:p.ys, marker:{color:gColor(g), size:5, opacity:0.6},
+              hovertemplate:lblX+': %{x:.3g} μm<br>'+lblY+': %{y:.3g} μm<extra>'+g+'</extra>' });
+          });
+        } else {
+          var p = collect(rows);
+          if (p.xs.length) traces.push({ type:'scatter', mode:'markers', name:ent, text:p.ids,
+            x:p.xs, y:p.ys, marker:{color:color, size:5, opacity:0.6},
+            hovertemplate:lblX+': %{x:.3g} μm<br>'+lblY+': %{y:.3g} μm<br>%{text}<extra></extra>' });
+        }
+        if (!traces.length) { Plotly.purge(d2plot); return; }
+        Plotly.newPlot(d2plot, traces, {
+          margin:{l:55,r:10,t:10,b:45}, height:300, font:{size:9},
+          xaxis:{title:lblX+' (μm)', rangemode:'tozero'},
+          yaxis:{title:lblY+' (μm)', rangemode:'tozero'},
+          showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
+        }, {responsive:true, displayModeBar:false});
+      };
+      xSel2.onchange = drawD2; ySel2.onchange = drawD2;
+      drawD2();
     }
 
     // ── Per-pixel distance distribution histograms ────────────────────────────
@@ -1303,6 +1408,8 @@ function renderEntityStats() {
     if (htargets.length) {
       var dhLbl = block.querySelector('#dh-lbl-'+ent);
       if (dhLbl) dhLbl.style.display = '';
+      var dhDesc = block.querySelector('#dh-desc-'+ent);
+      if (dhDesc) dhDesc.style.display = '';
       var dhEl = block.querySelector('#dh-'+ent);
 
       htargets.forEach(function(key) {
@@ -1310,29 +1417,29 @@ function renderEntityStats() {
         el.className = 'chart-cell'; el.style.width = '320px';
         dhEl.appendChild(el);
         var lbl = key.replace(/_label_/g,' ').replace(/_/g,' ').trim();
+        // Shared grid across all groups so the density curves line up (no bar-width gaps).
+        var span = histSpan(rows, key);
         var traces = [];
 
         if (multiGroup) {
           allGroups.forEach(function(g) {
-            var gRows = rows.filter(function(r){ return r[gKey]===g; });
-            var agg = aggregateHistograms(gRows, key, 30);
+            var agg = aggregateHistograms(rows.filter(function(r){ return r[gKey]===g; }), key, 30, span);
             if (!agg) return;
             traces.push({
-              type:'bar', name:g,
+              type:'scatter', mode:'lines', name:gShort(g),
               x:agg.centers, y:agg.density,
-              width:agg.width,
-              marker:{color:gColor(g), opacity:0.65},
+              line:{color:gColor(g), width:2, shape:'spline'},
               hovertemplate:'%{x:.2f} μm: %{y:.4f}<extra>'+g+'</extra>',
             });
           });
         } else {
-          var agg = aggregateHistograms(rows, key, 30);
+          var agg = aggregateHistograms(rows, key, 30, span);
           if (agg) {
             traces.push({
-              type:'bar', name:ent,
+              type:'scatter', mode:'lines', name:ent, fill:'tozeroy',
               x:agg.centers, y:agg.density,
-              width:agg.width,
-              marker:{color:color, opacity:0.8},
+              line:{color:color, width:2, shape:'spline'},
+              fillcolor: chroma(color).alpha(0.25).css(),
               hovertemplate:'%{x:.2f} μm: %{y:.4f}<extra></extra>',
             });
           }
@@ -1340,11 +1447,10 @@ function renderEntityStats() {
 
         if (!traces.length) return;
         Plotly.newPlot(el, traces, {
-          barmode:'overlay',
           margin:{l:50,r:5,t:30,b:50}, height:270, font:{size:9},
-          title:{text:'distance to '+lbl+' — every pixel', font:{size:10}},
-          xaxis:{title:'distance (μm)'},
-          yaxis:{title:'density'},
+          title:{text:'proximity of '+ent+' to '+lbl+' (all voxels)', font:{size:10}},
+          xaxis:{title:'distance to '+lbl+' (μm)', rangemode:'tozero'},
+          yaxis:{title:'voxel density', rangemode:'tozero'},
           showlegend:multiGroup,
           legend:{orientation:'h', y:-0.3, font:{size:8}},
         }, {responsive:true, displayModeBar:false});
@@ -1408,7 +1514,7 @@ function renderEntityStats() {
             });
             if (!xs.length) return;
             var rr = pearsonR(xs, ys);
-            var nameWithR2 = g + (rr!=null ? ' (R²='+(rr*rr).toFixed(2)+', n='+xs.length+')' : ' (n='+xs.length+')');
+            var nameWithR2 = gShort(g) + (rr!=null ? ' (R²='+(rr*rr).toFixed(2)+', n='+xs.length+')' : ' (n='+xs.length+')');
             traces.push({
               type:'scatter', mode:'markers', name:nameWithR2,
               x:xs, y:ys,
@@ -1503,19 +1609,19 @@ function renderEntityStats() {
         traces = allGroups.map(function(g){
           var ys = mRows.filter(function(r){ return r[gKey]===g && r[m.col]!=null; })
                         .map(function(r){ return +r[m.col]; });
-          return { type:'box', name:g, y:ys, marker:{color:gColor(g)},
-                   boxpoints:'all', jitter:0.4, pointpos:0 };
+          return { type:'box', name:gShort(g), y:ys, marker:{color:gColor(g)},
+                   boxpoints:'all', jitter:0.4, pointpos:0, hovertemplate:'%{y:.3g}<extra>'+g+'</extra>' };
         });
         layout = { margin:{l:70,r:10,t:28,b:40}, height:230,
           title:{text:m.label, font:{size:10}},
-          yaxis:{title:m.unit||null}, showlegend:false };
+          xaxis:xTick, yaxis:{title:m.unit||null}, showlegend:false };
       } else {
         var vx = mRows.map(function(r){ return r[gKey]||'?'; });
-        traces = [{ type:'bar', x:vx, y:mRows.map(function(r){ return r[m.col]!=null?+r[m.col]:null; }),
-          marker:{color:vx.map(gColor)} }];
+        traces = [{ type:'bar', x:vx.map(gShort), customdata:vx, y:mRows.map(function(r){ return r[m.col]!=null?+r[m.col]:null; }),
+          marker:{color:vx.map(gColor)}, hovertemplate:'%{customdata}: %{y:.3g}<extra></extra>' }];
         layout = { margin:{l:70,r:10,t:28,b:60}, height:220,
           title:{text:m.label, font:{size:10}},
-          yaxis:{title:m.unit||null}, showlegend:false };
+          xaxis:xTick, yaxis:{title:m.unit||null}, showlegend:false };
       }
       Plotly.newPlot(el, traces, layout, {responsive:true, displayModeBar:false});
     });
