@@ -55,10 +55,25 @@ class Dataset:
     entities: Dict[str, Entity]
 
 
+@dataclass
+class Discovery:
+    """Everything entity discovery learned about a cell folder, including what it threw away.
+
+    ``discover_dataset`` keeps only the accepted result and raises on problems; the
+    dry run needs the rejects and reasons too, so both go through this.
+    """
+    source: Path | None
+    entities: Dict[str, Entity]
+    membrane_name: str | None
+    unparsed: list[Path]                    # TIFFs that are neither source nor a valid entity name
+    rejected: list[Tuple[Path, str]]        # entity files dropped, with reason
+    errors: list[str]                       # problems that make the folder unanalyzable
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generic 3D label/mask spatial analysis for one cell.")
     parser.add_argument("--cell-dir", required=True, type=Path)
-    parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument("--out-dir", type=Path, default=None, help="Required unless --dry-run.")
     parser.add_argument("--voxel-size-um", default=None, help="Optional z,y,x um. If omitted, infer from source TIFF.")
     parser.add_argument("--auto-clip-to-pm", action="store_true")
     parser.add_argument("--num-threads", type=int, default=0)
@@ -68,6 +83,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mesh-target-reduction", type=float, default=0.8, metavar="F", help="QEM decimation target reduction fraction (default: 0.8 = keep 20%% of faces). Set to 0 to disable.")
     parser.add_argument("--mesh-level", type=float, default=None, metavar="L", help="Marching cubes iso-surface level on the signed distance field (default: 0.0 = true boundary). Negative dilates, positive erodes.")
     parser.add_argument("--force-reprocess", action="store_true", help="Re-process cells even if report.csv already exists.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Inspect the input folder(s) and print which labels/masks each cell contains, "
+             "which files were ignored, and where cells disagree — then exit without analyzing "
+             "or writing anything. Reads TIFF headers only, so it is fast.",
+    )
     parser.add_argument(
         "--max-skeleton-voxels",
         type=int,
@@ -115,7 +137,10 @@ def parse_args() -> argparse.Namespace:
         metavar="T",
         help="Max surface-to-surface gap (µm) recorded for --with-contacts (default: 0.5).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.out_dir is None and not args.dry_run:
+        parser.error("--out-dir is required (omit it only with --dry-run)")
+    return args
 
 
 def normalize_name(s: str) -> str:
@@ -149,10 +174,16 @@ def is_membrane_name(name: str) -> bool:
     return ("pm" == n) or ("plasma" in n) or ("membrane" in n)
 
 
-def discover_dataset(cell_dir: Path) -> Dataset:
+def inspect_cell_dir(cell_dir: Path) -> Discovery:
+    """Run entity discovery without raising, reporting what was accepted and rejected.
+
+    ``discover_dataset`` wraps this for the analysis path; ``dry_run`` uses the full
+    result so it can explain *why* a file was ignored.
+    """
+    errors: list[str] = []
     tiffs = sorted(cell_dir.glob("*.tif*"))
     if not tiffs:
-        raise FileNotFoundError(f"No TIFF files found in {cell_dir}")
+        return Discovery(None, {}, None, [], [], [f"No TIFF files found in {cell_dir}"])
 
     parsed = {}
     for p in tiffs:
@@ -161,11 +192,12 @@ def discover_dataset(cell_dir: Path) -> Dataset:
             parsed[p] = entry
 
     if not parsed:
-        raise FileNotFoundError("No NAME_label(s) or NAME_mask files found.")
+        errors.append("No NAME_label(s) or NAME_mask files found.")
 
     source_candidates = [p for p in tiffs if p not in parsed]
     if not source_candidates:
-        raise FileNotFoundError("No source TIFF found (expected a non label/mask TIFF).")
+        errors.append("No source TIFF found (expected a non label/mask TIFF).")
+        return Discovery(None, {}, None, [], [], errors)
 
     # Choose source TIFF with strongest shared prefix with derived entity prefixes.
     derived_prefixes = [pref for pref, _, _ in parsed.values()]
@@ -190,9 +222,11 @@ def discover_dataset(cell_dir: Path) -> Dataset:
     max_shared = max(shared_lens.values()) if shared_lens else 0
 
     entities: Dict[str, Entity] = {}
+    rejected: list[Tuple[Path, str]] = []
     for p, (pref, name, kind) in parsed.items():
         sl = shared_lens[p]
         if sl < max_shared:
+            rejected.append((p, f"prefix '{pref}' matches source '{source_norm}' less closely than the other entity files"))
             continue
         min_len = min(len(source_norm), len(pref))
         if sl >= min_len:
@@ -200,21 +234,39 @@ def discover_dataset(cell_dir: Path) -> Dataset:
             # word-boundary guard so "c1" does not match a "c10" prefix.
             longer = source_norm if len(source_norm) >= len(pref) else pref
             if sl < len(longer) and longer[sl] != "_":
+                rejected.append((p, f"prefix '{pref}' is not a word-boundary match for source '{source_norm}'"))
                 continue
         key = f"{kind}:{name}"
+        if key in entities:
+            rejected.append((p, f"duplicate {kind} '{name}' — keeping {entities[key].path.name}"))
+            continue
         entities[key] = Entity(name=name, kind=kind, path=p)
 
-    if not entities:
-        raise FileNotFoundError(
-            "No NAME_label(s) or NAME_mask entities matching source basename were found."
-        )
+    if not entities and not errors:
+        errors.append("No NAME_label(s) or NAME_mask entities matching source basename were found.")
 
     membrane_candidates = [e.name for e in entities.values() if e.kind == "mask" and is_membrane_name(e.name)]
-    if not membrane_candidates:
-        raise FileNotFoundError("No membrane mask found (expected NAME with pm/plasma/membrane).")
-    membrane_name = sorted(membrane_candidates)[0]
+    membrane_name = sorted(membrane_candidates)[0] if membrane_candidates else None
+    if membrane_name is None:
+        errors.append("No membrane mask found (expected NAME with pm/plasma/membrane).")
 
-    return Dataset(source=source, membrane_name=membrane_name, entities=entities)
+    unparsed = [p for p in tiffs if p not in parsed and p != source]
+    return Discovery(
+        source=source,
+        entities=entities,
+        membrane_name=membrane_name,
+        unparsed=unparsed,
+        rejected=rejected,
+        errors=errors,
+    )
+
+
+def discover_dataset(cell_dir: Path) -> Dataset:
+    d = inspect_cell_dir(cell_dir)
+    if d.errors:
+        raise FileNotFoundError(d.errors[0])
+    assert d.source is not None and d.membrane_name is not None
+    return Dataset(source=d.source, membrane_name=d.membrane_name, entities=d.entities)
 
 
 def infer_voxel_size_um_from_source(source_path: Path) -> Tuple[float, float, float]:
@@ -250,7 +302,6 @@ def infer_voxel_size_um_from_source(source_path: Path) -> Tuple[float, float, fl
         if z_um is None or x_um is None or y_um is None:
             raise ValueError(f"Could not infer voxel size from source metadata: {source_path.name}")
 
-    print(f"[meta] voxel_size_um from source {source_path.name}: z={z_um}, y={y_um}, x={x_um}", flush=True)
     return (z_um, y_um, x_um)
 
 
@@ -761,7 +812,10 @@ def resolve_voxel_size_zyx(args: argparse.Namespace, source_path: Path) -> Tuple
             raise ValueError("Expected voxel size as z,y,x")
         print(f"Using provided voxel size (z,y,x): {voxel_size_zyx}", flush=True)
         return voxel_size_zyx
-    return infer_voxel_size_um_from_source(source_path)
+    voxel_size_zyx = infer_voxel_size_um_from_source(source_path)
+    print(f"[meta] voxel_size_um from source {source_path.name}: "
+          f"z={voxel_size_zyx[0]}, y={voxel_size_zyx[1]}, x={voxel_size_zyx[2]}", flush=True)
+    return voxel_size_zyx
 
 
 def load_entity_volumes(dataset: Dataset) -> Dict[str, np.ndarray]:
@@ -1299,6 +1353,12 @@ def collect_cell_dirs(root: Path) -> list[tuple[Path, str]]:
     return entries
 
 
+def out_dir_for(out_root: Path, cell_dir: Path, group_id: str, batch: bool) -> Path:
+    if not batch:
+        return out_root
+    return out_root / group_id / cell_dir.name if group_id else out_root / cell_dir.name
+
+
 def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, group_id: str = "") -> None:
     report_csv = out_dir / "report.csv"
     if report_csv.exists() and not args.force_reprocess:
@@ -1383,8 +1443,232 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
     print("Cell analysis complete.", flush=True)
 
 
+def _tiff_shape_dtype(path: Path) -> Tuple[tuple | None, str | None]:
+    """Shape/dtype from the TIFF header — no pixel data is read."""
+    try:
+        with tifffile.TiffFile(path) as tf:
+            series = tf.series[0]
+            return tuple(int(x) for x in series.shape), str(series.dtype)
+    except Exception:
+        return None, None
+
+
+def _fmt_shape(shape: tuple | None) -> str:
+    return "×".join(str(s) for s in shape) if shape else "unreadable"
+
+
+def _fmt_list(items: list[str], limit: int = 8) -> str:
+    if len(items) <= limit:
+        return ", ".join(items)
+    return ", ".join(items[:limit]) + f", +{len(items) - limit} more"
+
+
+@dataclass
+class CellInspection:
+    label: str                       # "group/cell" or "cell"
+    cell_dir: Path
+    discovery: Discovery
+    voxel_size_zyx: Tuple[float, float, float] | None
+    voxel_error: str | None
+    shapes: Dict[str, tuple | None]  # entity key → shape (plus "source")
+    dtypes: Dict[str, str | None]
+    warnings: list[str]
+
+    @property
+    def ok(self) -> bool:
+        return not self.discovery.errors and not self.warnings
+
+
+def inspect_cell(cell_dir: Path, label: str, forced_voxel_size: Tuple[float, float, float] | None) -> CellInspection:
+    """Header-only inspection of one cell folder: what is there and what does not add up."""
+    d = inspect_cell_dir(cell_dir)
+    shapes: Dict[str, tuple | None] = {}
+    dtypes: Dict[str, str | None] = {}
+    warnings: list[str] = []
+
+    source_shape = None
+    if d.source is not None:
+        source_shape, source_dtype = _tiff_shape_dtype(d.source)
+        shapes["source"] = source_shape
+        dtypes["source"] = source_dtype
+        if source_shape is None:
+            warnings.append(f"source {d.source.name} is unreadable")
+
+    voxel_size = forced_voxel_size
+    voxel_error = None
+    if voxel_size is None and d.source is not None:
+        try:
+            voxel_size = infer_voxel_size_um_from_source(d.source)
+        except Exception as exc:
+            voxel_error = str(exc)
+            warnings.append(f"voxel size cannot be inferred from {d.source.name} — pass --voxel-size-um")
+
+    for key, ent in sorted(d.entities.items()):
+        shape, dtype = _tiff_shape_dtype(ent.path)
+        shapes[key] = shape
+        dtypes[key] = dtype
+        if shape is None:
+            warnings.append(f"{ent.kind} '{ent.name}' ({ent.path.name}) is unreadable")
+            continue
+        if len(shape) != 3:
+            warnings.append(f"{ent.kind} '{ent.name}' is not 3D (shape {_fmt_shape(shape)})")
+        elif source_shape is not None and len(source_shape) == 3 and shape != source_shape:
+            warnings.append(
+                f"{ent.kind} '{ent.name}' shape {_fmt_shape(shape)} ≠ source {_fmt_shape(source_shape)}"
+            )
+
+    for path, reason in sorted(d.rejected):
+        warnings.append(f"ignored {path.name} — {reason}")
+    for path in sorted(d.unparsed):
+        warnings.append(f"ignored {path.name} — name is not <prefix>_<name>_label|labels|mask")
+
+    return CellInspection(
+        label=label,
+        cell_dir=cell_dir,
+        discovery=d,
+        voxel_size_zyx=voxel_size,
+        voxel_error=voxel_error,
+        shapes=shapes,
+        dtypes=dtypes,
+        warnings=warnings,
+    )
+
+
+def print_cell_inspection(insp: CellInspection, indent: str = "  ") -> None:
+    d = insp.discovery
+    pad = indent + "  "
+    print(f"{indent}{insp.label}", flush=True)
+
+    if d.source is not None:
+        bits = [_fmt_shape(insp.shapes.get("source"))]
+        if insp.dtypes.get("source"):
+            bits.append(insp.dtypes["source"])
+        if insp.voxel_size_zyx is not None:
+            vz, vy, vx = insp.voxel_size_zyx
+            bits.append(f"voxel z,y,x µm: {vz:g}, {vy:g}, {vx:g}")
+        else:
+            bits.append("voxel size: unknown")
+        print(f"{pad}source  {d.source.name}  [{'; '.join(bits)}]", flush=True)
+
+    for kind, title in (("label", "labels"), ("mask", "masks ")):
+        names = []
+        for key, ent in sorted(d.entities.items(), key=lambda kv: kv[1].name):
+            if ent.kind != kind:
+                continue
+            star = "*" if (kind == "mask" and ent.name == d.membrane_name) else ""
+            names.append(f"{ent.name}{star}")
+        print(f"{pad}{title}  {', '.join(names) if names else '(none)'}", flush=True)
+
+    for err in d.errors:
+        print(f"{pad}ERROR   {err}", flush=True)
+    for w in insp.warnings:
+        print(f"{pad}warn    {w}", flush=True)
+
+
+def print_dry_run_summary(inspections: list[CellInspection]) -> None:
+    print("\n===== Summary =====", flush=True)
+    n = len(inspections)
+
+    # Which entities are present where — the main cross-cell mismatch check.
+    all_keys: set[str] = set()
+    for insp in inspections:
+        all_keys.update(insp.discovery.entities.keys())
+    if all_keys:
+        width = max(len(k) for k in all_keys)
+        print(f"Entities across {n} cell(s)  (* = plasma membrane):", flush=True)
+        for key in sorted(all_keys):
+            present = [i for i in inspections if key in i.discovery.entities]
+            missing = [i.label for i in inspections if key not in i.discovery.entities]
+            kind, name = key.split(":", 1)
+            star = "*" if kind == "mask" and any(i.discovery.membrane_name == name for i in present) else ""
+            line = f"  {key + star:<{width + 1}}  {len(present)}/{n}"
+            if missing:
+                line += f"   missing in: {_fmt_list(missing)}"
+            print(line, flush=True)
+    else:
+        print("No entities found in any cell.", flush=True)
+
+    # Same name used as a label in some cells and a mask in others — silently produces
+    # different metrics per cell, so it is worth calling out.
+    kinds_by_name: Dict[str, Dict[str, list[str]]] = {}
+    for insp in inspections:
+        for ent in insp.discovery.entities.values():
+            kinds_by_name.setdefault(ent.name, {}).setdefault(ent.kind, []).append(insp.label)
+    conflicts = {name: k for name, k in kinds_by_name.items() if len(k) > 1}
+    if conflicts:
+        print("\nKind mismatches (same name, different kind):", flush=True)
+        for name, kinds in sorted(conflicts.items()):
+            parts = [f"{kind} in {len(labels)} ({_fmt_list(sorted(labels), 4)})" for kind, labels in sorted(kinds.items())]
+            print(f"  {name}: " + "; ".join(parts), flush=True)
+
+    # Voxel sizes should agree across a batch; differing ones make µm metrics incomparable.
+    by_voxel: Dict[object, list[str]] = {}
+    for insp in inspections:
+        key = tuple(round(v, 6) for v in insp.voxel_size_zyx) if insp.voxel_size_zyx else "unknown"
+        by_voxel.setdefault(key, []).append(insp.label)
+    if len(by_voxel) > 1:
+        print("\nVoxel sizes differ across cells:", flush=True)
+        for key, labels in sorted(by_voxel.items(), key=lambda kv: -len(kv[1])):
+            shown = key if key == "unknown" else "z,y,x µm: " + ", ".join(f"{v:g}" for v in key)
+            print(f"  {shown}: {len(labels)} cell(s) — {_fmt_list(sorted(labels), 4)}", flush=True)
+
+    bad = [i.label for i in inspections if i.discovery.errors]
+    warn = [i.label for i in inspections if not i.discovery.errors and i.warnings]
+    print("", flush=True)
+    print(f"{n - len(bad) - len(warn)}/{n} cell(s) clean, {len(warn)} with warnings, {len(bad)} unanalyzable.", flush=True)
+    if warn:
+        print(f"  warnings: {_fmt_list(sorted(warn))}", flush=True)
+    if bad:
+        print(f"  errors:   {_fmt_list(sorted(bad))}", flush=True)
+
+
+def dry_run(args: argparse.Namespace, cell_entries: list[tuple[Path, str]]) -> int:
+    """Print what each cell contains and where things disagree. Returns a process exit code."""
+    forced_voxel_size = None
+    if args.voxel_size_um:
+        forced_voxel_size = tuple(float(x) for x in args.voxel_size_um.split(","))
+        if len(forced_voxel_size) != 3:
+            raise ValueError("Expected voxel size as z,y,x")
+
+    print(f"DRY RUN — inspecting {len(cell_entries)} cell folder(s) under {args.cell_dir}.", flush=True)
+    print("Nothing is analyzed and no files are written; TIFF headers only.\n", flush=True)
+
+    grouped = any(group_id for _, group_id in cell_entries)
+    batch = len(cell_entries) > 1
+    inspections: list[CellInspection] = []
+    already_done: list[str] = []
+    last_group = None
+    for cell_dir, group_id in cell_entries:
+        if grouped and group_id != last_group:
+            print(f"[group] {group_id or '(ungrouped)'}", flush=True)
+            last_group = group_id
+        label = f"{group_id}/{cell_dir.name}" if group_id else cell_dir.name
+        insp = inspect_cell(cell_dir, label, forced_voxel_size)
+        inspections.append(insp)
+        print_cell_inspection(insp)
+        if args.out_dir is not None and not args.force_reprocess:
+            if (out_dir_for(args.out_dir, cell_dir, group_id, batch) / "report.csv").exists():
+                already_done.append(label)
+
+    print_dry_run_summary(inspections)
+    if already_done:
+        print(f"\n{len(already_done)} cell(s) already have a report.csv in {args.out_dir} and would be "
+              f"skipped without --force-reprocess: {_fmt_list(sorted(already_done))}", flush=True)
+    print("\nNote: entity kinds are as found on disk — with --auto-label-masks, multi-component "
+          "masks become label entities during the real run.", flush=True)
+    return 1 if any(i.discovery.errors for i in inspections) else 0
+
+
 def main() -> None:
     args = parse_args()
+    if args.dry_run:
+        try:
+            cell_entries = collect_cell_dirs(args.cell_dir)
+        except FileNotFoundError as exc:
+            print(f"DRY RUN — {exc}", flush=True)
+            raise SystemExit(1)
+        raise SystemExit(dry_run(args, cell_entries))
+
     cell_entries = collect_cell_dirs(args.cell_dir)
     batch = len(cell_entries) > 1
     if batch:
@@ -1392,12 +1676,7 @@ def main() -> None:
 
     out_dirs: list[Path] = []
     for idx, (cell_dir, group_id) in enumerate(cell_entries, start=1):
-        if not batch:
-            out_dir = args.out_dir
-        elif group_id:
-            out_dir = args.out_dir / group_id / cell_dir.name
-        else:
-            out_dir = args.out_dir / cell_dir.name
+        out_dir = out_dir_for(args.out_dir, cell_dir, group_id, batch)
         out_dir.mkdir(parents=True, exist_ok=True)
         out_dirs.append(out_dir)
         label = f"{group_id}/{cell_dir.name}" if group_id else cell_dir.name

@@ -22,7 +22,8 @@ uv run --script analyze_cell.py --cell-dir <INPUT_ROOT> --out-dir <OUTPUT_ROOT> 
 Arguments:
 
 - `--cell-dir <INPUT_ROOT>` (required): input root (single cell, flat batch, or grouped batch)
-- `--out-dir <OUTPUT_ROOT>` (required): where outputs are written
+- `--out-dir <OUTPUT_ROOT>` (required, except with `--dry-run`): where outputs are written
+- `--dry-run`: inspect the input only — print the labels/masks per cell and any mismatches, then exit
 - `--with-mesh`: include `mesh_b64` mesh data for `mesh_viewer.html` and Blender
 - `--auto-clip-to-pm`: clip non-membrane entities to plasma membrane before analysis
 - `--voxel-size-um z,y,x`: manual voxel size in um (otherwise inferred from source TIFF metadata)
@@ -48,6 +49,48 @@ For each detected cell, the script:
 6. Writes per-cell `report.csv` and (if `--with-mesh`) `report_meshes.csv`.
 7. If `--with-contacts`, computes pairwise instance gaps (≤ `--contact-max-um`) and embeds them **inside** `report.csv`/`report.parquet` as `row_type = contact` rows (no separate file).
 8. In batch mode, also writes a joint `report.parquet` at the root of `--out-dir` (contacts included).
+
+## Checking your input first (`--dry-run`)
+
+Before a long batch run, check that every cell has the files you expect:
+
+```bash
+uv run --script analyze_cell.py --cell-dir <INPUT_ROOT> --dry-run
+```
+
+It reads TIFF headers only (no analysis, no output files, seconds even for a large batch) and prints,
+per cell: the detected source image with shape/dtype/voxel size, the label and mask entities found
+(`*` marks the plasma membrane), plus anything that looks wrong. Then a cross-cell summary.
+
+Reported problems:
+
+- `ERROR` — the cell cannot be analyzed: no TIFFs, no source image, no entity files, or no membrane mask
+- `warn ignored <file>` — a TIFF in the folder that is not used, and why: the name does not follow
+  `<prefix>_<name>_label|labels|mask`, or its prefix does not match the source image basename
+- `warn ... shape ... ≠ source ...` — an entity volume whose dimensions differ from the source image
+- `warn voxel size cannot be inferred` — source metadata lacks spacing/resolution (pass `--voxel-size-um`)
+- summary: which entities are **missing in which cells**, names used as a label in some cells and a
+  mask in others, and voxel sizes that differ across the batch (µm metrics would not be comparable)
+
+Entity kinds are reported as found on disk; `--auto-label-masks` promotion happens only during a real
+run. Exit code is `1` if any cell has an `ERROR`, otherwise `0`.
+
+Example:
+
+```text
+[group] control
+  control/cell_b
+    source  sample_b.tif  [20×40×40; uint8; voxel z,y,x µm: 0.1, 0.02, 0.02]
+    labels  er
+    masks   nucleus, pm*
+    warn    mask 'nucleus' shape 20×40×39 ≠ source 20×40×40
+    warn    ignored readme_overlay.tif — name is not <prefix>_<name>_label|labels|mask
+
+===== Summary =====
+Entities across 3 cell(s)  (* = plasma membrane):
+  label:mito      2/3   missing in: control/cell_b
+  mask:pm*        2/3   missing in: treated/cell_c
+```
 
 ## Input data layout options
 
