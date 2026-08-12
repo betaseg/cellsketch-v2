@@ -786,14 +786,6 @@ function aggregateHistograms(rows, key, numBins, span) {
   };
 }
 
-function linearRegression(xs, ys) {
-  var n = xs.length, sx = 0, sy = 0, sxx = 0, sxy = 0;
-  for (var i = 0; i < n; i++) { sx += xs[i]; sy += ys[i]; sxx += xs[i]*xs[i]; sxy += xs[i]*ys[i]; }
-  var denom = n * sxx - sx * sx;
-  if (!denom) return { slope: 0, intercept: sy / n };
-  var slope = (n * sxy - sx * sy) / denom;
-  return { slope: slope, intercept: (sy - slope * sx) / n };
-}
 
 // Pearson correlation coefficient (r); square it for R²
 function pearsonR(xs, ys) {
@@ -1277,7 +1269,7 @@ function renderContactSpan(scopeCells, thr, pair, pt) {
   var facetShort = {}; facetVals.forEach(function(f,i){ facetShort[f] = shortArr[i]; });
 
   document.getElementById('ct-span-desc').innerHTML =
-    'Each dot is one contact group at the current gap (members chained by the selected pair\'s contacts). Its position is the group\'s <b>closest approach</b> to each structure — the nearest any member gets. <b>Bottom-left = the group reaches both.</b> Dot size grows with the number of instances in the group; colour marks the ' + nounS + '.';
+    'For each contact group at the current gap, take its <b>closest approach</b> to each of the two structures below — the nearest any member gets — and keep the <b>larger</b> of the two: the distance at which that group reaches <b>both</b>. The curve reads off how many groups reach both within any distance, so a curve that <b>rises early and steeply</b> means most groups sit right against both structures. Colour marks the ' + nounS + '; group sizes are in the table above.';
 
   var pick = function(re){ return targets.find(function(c){ return re.test(c); }); };
   var defX = pick(/membrane|plasma|(^|_)pm(_|$)/i) || targets[0];
@@ -1296,8 +1288,8 @@ function renderContactSpan(scopeCells, thr, pair, pt) {
     xSel.innerHTML += '<option value="'+c+'"'+(c===defX?' selected':'')+'>'+distColLabel(c)+'</option>';
     ySel.innerHTML += '<option value="'+c+'"'+(c===defY?' selected':'')+'>'+distColLabel(c)+'</option>';
   });
-  var xL = document.createElement('span'); xL.textContent = 'x: closest to';
-  var yL = document.createElement('span'); yL.textContent = 'y: closest to';
+  var xL = document.createElement('span'); xL.textContent = 'reaches both';
+  var yL = document.createElement('span'); yL.textContent = 'and';
   ctrl.append(xL, xSel, yL, ySel);
   panel.appendChild(ctrl);
   var plotEl = document.createElement('div'); plotEl.style.cssText = 'width:760px;height:340px';
@@ -1318,20 +1310,32 @@ function renderContactSpan(scopeCells, thr, pair, pt) {
           if (r[cx] != null && isFinite(r[cx])) minX = Math.min(minX, r[cx]);
           if (r[cy] != null && isFinite(r[cy])) minY = Math.min(minY, r[cy]);
         });
+        // The larger of the two closest approaches is the distance at which this group
+        // reaches BOTH structures — one number per group, so the comparison across
+        // facets is a curve rather than a cloud.
         if (isFinite(minX) && isFinite(minY)) {
-          (byFacet[facet] = byFacet[facet] || []).push({ x: minX, y: minY, n: mem.length, cell: cid });
+          (byFacet[facet] = byFacet[facet] || []).push({ reach: Math.max(minX, minY), n: mem.length, cell: cid });
         }
       });
     });
-    var traces = Object.keys(byFacet).sort(function(a,b){ return String(a).localeCompare(String(b), undefined, {numeric:true}); })
+    // Cumulative share of groups by reach distance: every group is on the curve, and
+    // with a few dozen groups per facet a step curve stays readable where dots would
+    // pile up on top of each other.
+    var keys = Object.keys(byFacet).sort(function(a,b){ return String(a).localeCompare(String(b), undefined, {numeric:true}); });
+    // Common right edge so every curve visibly flattens at 100% instead of ending on a
+    // bare vertical step at its own last value.
+    var xEnd = keys.reduce(function(m, f) {
+      return byFacet[f].reduce(function(mm, p){ return Math.max(mm, p.reach); }, m);
+    }, 0) * 1.04;
+    var traces = keys
       .map(function(f){
-        var pts = byFacet[f];
-        return { type:'scatter', mode:'markers', name:(facetShort[f]||f)+' (n='+pts.length+')',
-          x:pts.map(function(p){ return p.x; }), y:pts.map(function(p){ return p.y; }),
-          customdata:pts.map(function(p){ return [p.n, p.cell]; }),
-          marker:{ color:gColor(f), opacity:0.6, line:{width:0.5, color:'#fff'},
-                   size:pts.map(function(p){ return Math.min(6 + (p.n - 2) * 3, 26); }) },
-          hovertemplate:distColLabel(cx)+': %{x:.3g} µm<br>'+distColLabel(cy)+': %{y:.3g} µm<br>%{customdata[0]} instances · %{customdata[1]}<extra></extra>' };
+        var vals = byFacet[f].map(function(p){ return p.reach; }).sort(function(a,b){ return a-b; });
+        var xs = [0], ys = [0];
+        vals.forEach(function(v, i){ xs.push(v); ys.push((i + 1) / vals.length * 100); });
+        xs.push(xEnd); ys.push(100);
+        return { type:'scatter', mode:'lines', name:(facetShort[f]||f)+' (n='+vals.length+')',
+          x:xs, y:ys, line:{ color:gColor(f), width:2, shape:'hv' },
+          hovertemplate:'within %{x:.3g} µm of both<br>%{y:.0f}% of contact groups<extra>'+f+'</extra>' };
       });
     if (!traces.length) {
       Plotly.purge(plotEl);
@@ -1342,8 +1346,8 @@ function renderContactSpan(scopeCells, thr, pair, pt) {
       // Legend to the right, not below: these names are long enough that a horizontal
       // legend wraps to one row per facet and lands on the x-axis title.
       margin:{l:55, r:250, t:10, b:45}, height:340,
-      xaxis:{title:'closest approach to '+distColLabel(cx)+' (µm)', rangemode:'tozero'},
-      yaxis:{title:'closest approach to '+distColLabel(cy)+' (µm)', rangemode:'tozero'},
+      xaxis:{title:'reaches both within (µm)', rangemode:'tozero'},
+      yaxis:{title:'% of contact groups', rangemode:'tozero', ticksuffix:'%', range:[0, 102]},
       showlegend:true,
       legend:{orientation:'v', x:1.02, xanchor:'left', y:1, yanchor:'top', itemsizing:'constant'},
     }, {responsive:true, displayModeBar:false});
@@ -1517,15 +1521,6 @@ function renderStructure() {
 //  Distance matrix (all structure pairs at once)
 // ══════════════════════════════════════════════════════════════
 var MATRIX_MAX_DIMS = 8;
-// WebGL once, not per chart: splom is a WebGL trace type, and a report opened in a
-// browser without it (VMs, remote desktops, --disable-gpu) would otherwise show
-// Plotly's "WebGL is not supported" box where the chart should be.
-var HAS_WEBGL = (function() {
-  try {
-    var c = document.createElement('canvas');
-    return !!(window.WebGLRenderingContext && (c.getContext('webgl') || c.getContext('experimental-webgl')));
-  } catch (e) { return false; }
-})();
 
 // Read as a matrix, so the columns need a stable, meaningful order: the membrane
 // first (the canonical "how deep in the cell" axis), then the nucleus, then the
@@ -1546,113 +1541,216 @@ function dimLabel(col) {
   return distColLabel(col).replace(/\s*\(mean\)$/, '').replace(/^label /, '');
 }
 
-// Thin deterministically (every k-th instance) to a per-facet cap, and report the
-// step so the note can say what is on screen instead of quietly dropping points.
-function thinRows(rws, cap) {
-  var step = Math.ceil(rws.length / cap);
-  return { rows: step > 1 ? rws.filter(function(_, i){ return i % step === 0; }) : rws, step: step };
+// ══════════════════════════════════════════════════════════════
+//  Trend summaries — what the panels draw instead of point clouds
+// ══════════════════════════════════════════════════════════════
+// A point per instance answers neither question these panels are asked: with
+// thousands of instances the cloud is opaque, and a cloud shows no trend. So x is
+// split into equal-count bins and each bin reports the median of y with its 25–75%
+// range. Every instance lands in a bin — nothing is sampled away.
+var TREND_MIN_N = 24;      // below this, bin medians are noise; show the points
+var TREND_MAX_BANDS = 4;   // more overlapping ribbons than this is mud
+
+function quantileSorted(sorted, q) {
+  if (!sorted.length) return null;
+  var i = (sorted.length - 1) * q, lo = Math.floor(i), hi = Math.ceil(i);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+}
+function finitePairs(xs, ys) {
+  var pts = [];
+  for (var i = 0; i < xs.length; i++) {
+    if (xs[i] != null && isFinite(xs[i]) && ys[i] != null && isFinite(ys[i])) pts.push([xs[i], ys[i]]);
+  }
+  return pts;
+}
+function binnedTrend(pts, maxBins) {
+  if (pts.length < TREND_MIN_N) return null;
+  pts = pts.slice().sort(function(a, b){ return a[0] - b[0]; });
+  // At least ~12 instances per bin: thinner bins make the median jump around, which
+  // reads as structure rather than as sampling noise.
+  var nBins = Math.max(3, Math.min(maxBins || 8, Math.floor(pts.length / 12)));
+  var out = { x:[], med:[], lo:[], hi:[], n:[] }, per = pts.length / nBins;
+  for (var b = 0; b < nBins; b++) {
+    var i0 = Math.round(b * per), i1 = (b === nBins - 1) ? pts.length : Math.round((b + 1) * per);
+    if (i1 <= i0) continue;
+    var chunk = pts.slice(i0, i1);
+    var cy = chunk.map(function(q){ return q[1]; }).sort(function(a, b){ return a - b; });
+    out.x.push(quantileSorted(chunk.map(function(q){ return q[0]; }), 0.5));
+    out.med.push(quantileSorted(cy, 0.5));
+    out.lo.push(quantileSorted(cy, 0.25));
+    out.hi.push(quantileSorted(cy, 0.75));
+    out.n.push(chunk.length);
+  }
+  return out.x.length >= 3 ? out : null;
 }
 
-function drawDistMatrix(plotEl, noteEl, wrapEl, dims, facets, ent, allMean, dimsDropped) {
-  var n = dims.length;
-  var panels = n - 1;                       // lower triangle, no diagonal
-  var cellPx = n <= 3 ? 210 : n <= 5 ? 165 : 130;
-  var side   = panels * cellPx;
-  var nPanels = panels * (panels + 1) / 2;
-  // SVG draws one DOM node per marker, so the fallback path gets a marker budget the
-  // browser can actually paint; WebGL can take far more.
-  var cap = HAS_WEBGL ? 4000 : Math.max(150, Math.floor(24000 / nPanels / facets.length));
+// Share of a population at or below each value, as a step curve. This has no minimum
+// sample size: one observation is one step, ten thousand is a smooth curve, and the
+// reading ("x% are within d") is the same either way — which is why the pair matrix
+// uses it instead of anything that needs enough points to bin.
+function ecdfCurve(vals, maxVertices) {
+  var v = vals.slice().sort(function(a, b){ return a - b; });
+  var n = v.length;
+  if (!n) return null;
+  // Quantiles rather than every point: a monotone curve needs no more vertices than
+  // this to look identical, and 8k instances per series would otherwise be 8k nodes.
+  var K = Math.min(n, maxVertices || 160);
+  var xs = [0], ys = [0];
+  for (var i = 1; i <= K; i++) {
+    var idx = Math.ceil(i * n / K) - 1;
+    xs.push(v[idx]); ys.push((idx + 1) / n * 100);
+  }
+  return { x:xs, y:ys, n:n, median:quantileSorted(v, 0.5) };
+}
 
-  var step = 1, plotted = 0;
-  var data = facets.map(function(f) {
-    var t = thinRows(f.rows, cap);
-    step = Math.max(step, t.step); plotted += t.rows.length;
-    return { name:f.name, color:f.color, rows:t.rows };
+// Traces for one series in one panel: median line, optional IQR ribbon. `opts` carries
+// the subplot axes (matrix panels) and the axis labels used in the tooltip.
+function trendTraces(t, name, color, opts) {
+  var o = opts || {}, tr = [];
+  if (o.band) {
+    tr.push({ type:'scatter', mode:'lines', showlegend:false, hoverinfo:'skip',
+      x: t.x.concat(t.x.slice().reverse()), y: t.hi.concat(t.lo.slice().reverse()),
+      fill:'toself', fillcolor: withAlpha(color, 0.16), line:{width:0},
+      xaxis:o.xaxis, yaxis:o.yaxis });
+  }
+  tr.push({ type:'scatter', mode:'lines+markers', name:name, showlegend:!!o.showlegend,
+    x:t.x, y:t.med, customdata:t.n,
+    line:{color:color, width:o.width || 2}, marker:{color:color, size:o.width === 1.5 ? 3 : 4},
+    xaxis:o.xaxis, yaxis:o.yaxis,
+    hovertemplate:(o.xlabel || 'x') + ': %{x:.3g}<br>median ' + (o.ylabel || 'y')
+      + ': %{y:.3g}<br>%{customdata} in bin<extra>' + name + '</extra>' });
+  return tr;
+}
+// Least-squares line — the honest trend when there are too few instances to bin. Not
+// a substitute for the binned median: it assumes the relationship is a straight one.
+function fitLine(pts) {
+  var n = pts.length;
+  if (n < 3) return null;
+  var sx = 0, sy = 0, sxx = 0, sxy = 0, lo = Infinity, hi = -Infinity;
+  pts.forEach(function(q) {
+    sx += q[0]; sy += q[1]; sxx += q[0] * q[0]; sxy += q[0] * q[1];
+    if (q[0] < lo) lo = q[0];
+    if (q[0] > hi) hi = q[0];
   });
-  var total = facets.reduce(function(a, f){ return a + f.rows.length; }, 0);
+  var den = n * sxx - sx * sx;
+  if (!den || hi <= lo) return null;
+  var slope = (n * sxy - sx * sy) / den;
+  return { x:[lo, hi], y:[(sy - slope * sx) / n + slope * lo, (sy - slope * sx) / n + slope * hi] };
+}
+function fitTrace(fit, color, opts) {
+  var o = opts || {};
+  return { type:'scatter', mode:'lines', showlegend:false, hoverinfo:'skip',
+    x:fit.x, y:fit.y, line:{ color:color, width:1.5, dash:'dot' },
+    xaxis:o.xaxis, yaxis:o.yaxis,
+    name:o.pooled ? 'trend (all instances)' : 'trend' };
+}
 
-  wrapEl.style.width = (side + 130) + 'px';
-  plotEl.style.cssText = 'width:100%;height:' + (side + 110) + 'px';
+// Fallback for a series with too few instances to bin: the instances themselves.
+// Honest, and at this count there is nothing to overplot.
+function pointTrace(pts, name, color, opts) {
+  var o = opts || {};
+  return { type:'scatter', mode:'markers', name:name, showlegend:!!o.showlegend,
+    x:pts.map(function(q){ return q[0]; }), y:pts.map(function(q){ return q[1]; }),
+    marker:{color:color, size:6, opacity:0.75, line:{width:0}},
+    xaxis:o.xaxis, yaxis:o.yaxis,
+    hovertemplate:(o.xlabel || 'x') + ': %{x:.3g}<br>' + (o.ylabel || 'y')
+      + ': %{y:.3g}<extra>' + name + '</extra>' };
+}
 
-  var layout = { margin:{l:78, r:16, t:12, b:74}, height: side + 110,
-                 hovermode:'closest', showlegend:false };
-  var ticks = cellPx < 160 ? 3 : 4;
-  var traces;
+// One panel per structure pair, lower triangle, no diagonal. Panels are plain SVG
+// subplots with column/row ranges tied by `matches`, so a row shares its y scale and
+// a column its x scale — comparable at a glance, and no WebGL trace type involved.
+// One panel per structure pair, lower triangle, no diagonal. Each panel asks the
+// section's question directly: for every instance take the LARGER of its two
+// distances — the distance at which it is close to BOTH structures — and plot the
+// share of instances at or below each value. Every panel therefore has the same two
+// axes (distance, %), so the whole matrix is comparable, and there is no sample size
+// at which the encoding stops working.
+function drawDistMatrix(plotEl, noteEl, wrapEl, dims, facets, ent, allMean, dimsDropped) {
+  var n = dims.length, panels = n - 1;
+  var cellPx = n <= 3 ? 215 : n <= 5 ? 175 : 148;
+  var side = panels * cellPx;
+  var gap = 0.045, cw = (1 - gap * (panels - 1)) / panels;
 
-  if (HAS_WEBGL) {
-    layout.dragmode = 'select';             // splom brushes across every panel
-    dims.forEach(function(_, i) {
-      var sfx = i ? (i + 1) : '';
-      layout['xaxis' + sfx] = { nticks:ticks, rangemode:'tozero' };
-      layout['yaxis' + sfx] = { nticks:ticks, rangemode:'tozero' };
-    });
-    traces = data.map(function(d) {
-      return { type:'splom', name:d.name, showlegend:false,
-        showupperhalf:false, diagonal:{visible:false},
-        dimensions: dims.map(function(c) {
-          return { label: dimLabel(c),
-                   values: d.rows.map(function(r){ return r[c] != null && isFinite(r[c]) ? r[c] : null; }) };
-        }),
-        marker:{ color:d.color, size:5, opacity:0.55, line:{width:0} },
-        hovertemplate:'%{xaxis.title.text}: %{x:.3g} µm<br>%{yaxis.title.text}: %{y:.3g} µm<extra>'+d.name+'</extra>' };
-    });
-  } else {
-    // Hand-built matrix of plain SVG scatter panels: same geometry, no WebGL. Column
-    // and row ranges are tied with `matches` so every panel in a column shares an x
-    // scale and every panel in a row shares a y scale — as a splom does.
-    var gap = 0.035;
-    var cw = (1 - gap * (panels - 1)) / panels;
-    traces = [];
-    var k = 0, colRef = {}, rowRef = {};
-    for (var r = 0; r < panels; r++) {
-      for (var c = 0; c <= r; c++) {
-        k++;
-        var sfx = k > 1 ? k : '';
-        var bottom = (r === panels - 1), left = (c === 0);
-        var x0 = c * (cw + gap), yTop = 1 - r * (cw + gap);
-        // Ticks only where they are labelled — an unlabelled tick mark on an inner
-        // panel edge is noise, not information.
-        layout['xaxis' + sfx] = {
-          domain:[x0, x0 + cw], anchor:'y' + (k > 1 ? k : ''), nticks:ticks, rangemode:'tozero',
-          showticklabels:bottom, ticks: bottom ? 'outside' : '',
-          title: bottom ? dimLabel(dims[c]) : undefined,
-          matches: colRef[c] ? 'x' + (colRef[c] > 1 ? colRef[c] : '') : undefined };
-        layout['yaxis' + sfx] = {
-          domain:[yTop - cw, yTop], anchor:'x' + (k > 1 ? k : ''), nticks:ticks, rangemode:'tozero',
-          showticklabels:left, ticks: left ? 'outside' : '',
-          title: left ? dimLabel(dims[r + 1]) : undefined,
-          matches: rowRef[r] ? 'y' + (rowRef[r] > 1 ? rowRef[r] : '') : undefined };
-        if (!colRef[c]) colRef[c] = k;
-        if (!rowRef[r]) rowRef[r] = k;
-        var cx = dims[c], cy = dims[r + 1];
-        data.forEach(function(d) {
-          var xs = [], ys = [];
-          d.rows.forEach(function(row) {
-            if (row[cx] != null && isFinite(row[cx]) && row[cy] != null && isFinite(row[cy])) {
-              xs.push(row[cx]); ys.push(row[cy]);
-            }
-          });
-          if (!xs.length) return;
-          traces.push({ type:'scatter', mode:'markers', name:d.name, showlegend:false,
-            xaxis:'x' + (k > 1 ? k : ''), yaxis:'y' + (k > 1 ? k : ''), x:xs, y:ys,
-            marker:{ color:d.color, size:5, opacity:0.55, line:{width:0} },
-            hovertemplate:dimLabel(cx)+': %{x:.3g} µm<br>'+dimLabel(cy)+': %{y:.3g} µm<extra>'+d.name+'</extra>' });
-        });
-      }
+  wrapEl.style.width = (side + 175) + 'px';
+  plotEl.style.cssText = 'width:100%;height:' + (side + 130) + 'px';
+  var layout = { margin:{l:104, r:16, t:10, b:96}, height: side + 130,
+                 hovermode:'closest', showlegend:false, annotations:[] };
+  var colCentre = function(c){ return c * (cw + gap) + cw / 2; };
+  var rowCentre = function(r){ return 1 - r * (cw + gap) - cw / 2; };
+
+  // A curve needs a few observations to be worth reading. When a cell holds one or two
+  // instances of this structure (single-copy structures: one ER, one nucleus) the split
+  // by cell is what fails, not the encoding — so pool the instances into one curve and
+  // say so, rather than drawing eight single-step lines.
+  var ECDF_MIN_PER_SERIES = 4;
+  var thinnest = facets.reduce(function(m, f){ return Math.min(m, f.rows.length); }, Infinity);
+  var pooling = facets.length > 1 && thinnest < ECDF_MIN_PER_SERIES;
+  var series = pooling
+    ? [{ name:'all ' + (plotGroupBy === 'group' ? 'groups' : 'cells'), color:CS.ink2,
+         rows:facets.reduce(function(a, f){ return a.concat(f.rows); }, []) }]
+    : facets;
+
+  var traces = [], k = 0;
+  for (var r = 0; r < panels; r++) {
+    for (var c = 0; c <= r; c++) {
+      k++;
+      var ax = k > 1 ? String(k) : '';
+      var bottom = (r === panels - 1), left = (c === 0);
+      var x0 = c * (cw + gap), yTop = 1 - r * (cw + gap);
+      // Every panel measures the same thing, so all panels share one x range (matched
+      // to the first) — a curve in one panel is directly comparable with any other.
+      layout['xaxis' + ax] = {
+        domain:[x0, x0 + cw], anchor:'y' + ax, nticks:4, rangemode:'tozero',
+        showticklabels:bottom, ticks: bottom ? 'outside' : '',
+        matches: k > 1 ? 'x' : undefined };
+      layout['yaxis' + ax] = {
+        domain:[yTop - cw, yTop], anchor:'x' + ax, range:[0, 103], dtick:25,
+        ticksuffix:'%', showticklabels:left, ticks: left ? 'outside' : '' };
+
+      var cx = dims[c], cy = dims[r + 1];
+      series.forEach(function(f) {
+        var pts = finitePairs(f.rows.map(function(row){ return row[cx]; }),
+                              f.rows.map(function(row){ return row[cy]; }));
+        if (!pts.length) return;
+        var e = ecdfCurve(pts.map(function(q){ return Math.max(q[0], q[1]); }));
+        traces.push({ type:'scatter', name:f.name, showlegend:false,
+          x:e.x, y:e.y, line:{ color:f.color, width: series.length > 4 ? 1.5 : 2, shape:'hv' },
+          // Markers only while the steps are countable: they mark where each instance
+          // sits, and drop away once the curve is dense enough to read on its own.
+          mode: e.n <= 20 ? 'lines+markers' : 'lines',
+          marker:{ color:f.color, size:5 },
+          xaxis:'x' + ax, yaxis:'y' + ax,
+          hovertemplate:'within %{x:.3g} µm of both<br>%{y:.0f}% of ' + ent + 's (n=' + e.n
+            + ')<extra>' + f.name + '</extra>' });
+      });
+
+      // The pair is named by the matrix itself: column header under each column, row
+      // header beside each row. The axes are the same everywhere and get one label.
+      if (bottom) layout.annotations.push({ xref:'paper', yref:'paper', x:colCentre(c), y:0,
+        yanchor:'top', yshift:-28, showarrow:false, text:dimLabel(dims[c]),
+        font:{size:10.5, color:CS.ink2} });
+      if (left) layout.annotations.push({ xref:'paper', yref:'paper', x:0, y:rowCentre(r),
+        xanchor:'right', xshift:-42, showarrow:false, textangle:-90, text:dimLabel(dims[r + 1]),
+        font:{size:10.5, color:CS.ink2} });
     }
   }
+  layout.annotations.push({ xref:'paper', yref:'paper', x:0.5, y:0, yanchor:'top', yshift:-54,
+    showarrow:false, text:'distance at which an ' + ent + ' is close to <b>both</b> (µm)',
+    font:{size:10.5, color:CS.ink3} });
+  layout.annotations.push({ xref:'paper', yref:'paper', x:0, y:0.5, xanchor:'right', xshift:-72,
+    showarrow:false, textangle:-90, text:'% of ' + ent + 's', font:{size:10.5, color:CS.ink3} });
 
   Plotly.newPlot(plotEl, traces, layout, {responsive:true, displayModeBar:false});
 
   var notes = [];
-  if (HAS_WEBGL) notes.push('Drag across any panel to select — the same ' + ent + 's light up in every other panel.');
+  if (pooling) notes.push('Each cell holds fewer than ' + ECDF_MIN_PER_SERIES + ' ' + ent
+    + 's, so all ' + series[0].rows.length + ' are pooled into one curve — one step per '
+    + ent + '. Switch “Group plots by” to Group to compare groups once each holds enough.');
   if (allMean) notes.push('Distances are each ' + ent + '\u2019s mean to that structure.');
-  if (step > 1) notes.push('Showing every ' + step + (step === 2 ? 'nd' : step === 3 ? 'rd' : 'th')
-    + ' instance (' + plotted.toLocaleString() + ' of ' + total.toLocaleString() + ')'
-    + (HAS_WEBGL ? ' to keep the matrix responsive.' : ' — this browser has no WebGL, so the matrix is drawn as SVG, which cannot carry every point.'));
   if (dimsDropped > 0) notes.push(dimsDropped + ' further structure' + (dimsDropped > 1 ? 's are' : ' is')
     + ' omitted — the matrix shows the first ' + MATRIX_MAX_DIMS + '.');
-  noteEl.textContent = notes.join(' ');
+  noteEl.innerHTML = notes.join(' ');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1740,13 +1838,13 @@ function renderEntityStats() {
       +'<p class="subsection-desc" id="dc-desc-'+ent+'" style="display:none">Distance from the closest point of each '+ent+' to the nearest instance of each structure. Near 0 means that '+ent+' sits right against it.</p>'
       +'<div class="charts-row" id="dc-'+ent+'"></div>'
       +'<div class="subsection-label mt-3" id="d2-lbl-'+ent+'" style="display:none">Is each '+ent+' close to two structures at once?</div>'
-      +'<p class="subsection-desc" id="d2-desc-'+ent+'" style="display:none">One panel per pair of structures, so you can read every combination at once. Each dot is one '+ent+': its distance to the structure named on the x axis versus the one on the y axis — <b>bottom-left = close to both</b>. Colour marks the '+(plotGroupBy==='group'?'group':'cell')+', so you can see whether the pattern differs between them.</p>'
+      +'<p class="subsection-desc" id="d2-desc-'+ent+'" style="display:none">One panel per pair of structures, so you can read every combination at once. For each '+ent+' we take the <b>larger</b> of its two distances — the distance at which it is close to <b>both</b> structures — and the curve shows the share of '+ent+'s at or below it. A curve that <b>climbs early and steeply</b> means most '+ent+'s sit against both; one pushed to the right means few do. Every panel shares the same axes, so panels are directly comparable, and the reading is the same whether a cell holds one '+ent+' or ten thousand. Colour marks the '+(plotGroupBy==='group'?'group':'cell')+'.</p>'
       +'<div class="charts-row" id="d2-'+ent+'"></div>'
       +'<div class="subsection-label mt-3" id="dh-lbl-'+ent+'" style="display:none">How much of each '+ent+'’s body lies near a structure?</div>'
       +'<p class="subsection-desc" id="dh-desc-'+ent+'" style="display:none">Every voxel making up the '+ent+' population, binned by its distance to a structure. A tall peak near 0 means '+ent+'s hug that structure along much of their body — not just touch at a single point. (The closest-point view above only sees the single nearest point.)</p>'
       +'<div class="charts-row" id="dh-'+ent+'"></div>'
       +'<div class="subsection-label mt-3" id="corr-lbl-'+ent+'" style="display:none">Free exploration: compare any two measurements</div>'
-      +'<p class="subsection-desc" id="corr-desc-'+ent+'" style="display:none">Pick any two values to plot against each other. R² (0–1) shows how strongly they line up — with a small n (few data points), treat any trend with caution.</p>'
+      +'<p class="subsection-desc" id="corr-desc-'+ent+'" style="display:none">Pick any two values to compare. With enough instances the line is the median y per equal-count bin of x and the band the middle 50%; with only a few, the instances are drawn with a dotted least-squares line through them. R² (0–1) below reports how strongly the two line up across all instances — with a small n, treat any trend with caution.</p>'
       +'<div class="charts-row" id="corr-'+ent+'"></div>';
     container.appendChild(block);
 
@@ -1988,67 +2086,61 @@ function renderEntityStats() {
         var subtitle = '';
         var fits = [];
 
-        if (multiGroup) {
-          allGroups.forEach(function(g) {
-            var xs = [], ys = [];
-            rows.filter(function(r){ return r[gKey]===g; }).forEach(function(r) {
-              if (r[colX]!=null && isFinite(r[colX]) && r[colY]!=null && isFinite(r[colY])) {
-                xs.push(r[colX]); ys.push(r[colY]);
-              }
-            });
-            if (!xs.length) return;
-            var rr = pearsonR(xs, ys);
-            fits.push({ facet:g, r2: rr!=null ? (rr*rr) : null, n: xs.length });
-            traces.push({
-              type:'scatter', mode:'markers', name:gShort(g),
-              x:xs, y:ys,
-              marker:{color:gColor(g), size:5, opacity:0.6},
-              hovertemplate:lblX+': %{x:.3g}<br>'+lblY+': %{y:.3g}<extra>'+g+'</extra>',
-            });
-            if (xs.length >= 3) {
-              var lr = linearRegression(xs, ys);
-              var xlo = Math.min.apply(null,xs), xhi = Math.max.apply(null,xs);
-              traces.push({
-                type:'scatter', mode:'lines', showlegend:false,
-                x:[xlo,xhi], y:[lr.intercept+lr.slope*xlo, lr.intercept+lr.slope*xhi],
-                line:{color:gColor(g), width:1.5, dash:'dash'}, hoverinfo:'skip',
-              });
-            }
-          });
-        } else {
-          var xs = [], ys = [], htxts = [];
-          rows.forEach(function(r) {
-            if (r[colX]!=null && isFinite(r[colX]) && r[colY]!=null && isFinite(r[colY])) {
-              xs.push(r[colX]); ys.push(r[colY]);
-              htxts.push('id '+r.label_id);
-            }
-          });
-          if (xs.length) {
-            traces.push({
-              type:'scatter', mode:'markers', name:ent,
-              x:xs, y:ys, text:htxts,
-              marker:{color:color, size:5, opacity:0.6},
-              hovertemplate:lblX+': %{x:.3g}<br>'+lblY+': %{y:.3g}<br>%{text}<extra></extra>',
-            });
-            if (xs.length >= 3) {
-              var lr = linearRegression(xs, ys);
-              var xlo = Math.min.apply(null,xs), xhi = Math.max.apply(null,xs);
-              traces.push({
-                type:'scatter', mode:'lines', showlegend:false,
-                x:[xlo,xhi], y:[lr.intercept+lr.slope*xlo, lr.intercept+lr.slope*xhi],
-                line:{color:'#888', width:1.5, dash:'dash'}, hoverinfo:'skip',
-              });
-            }
-            var rr = pearsonR(xs, ys);
-            subtitle = rr!=null ? '  —  R² = '+(rr*rr).toFixed(3)+' (n='+xs.length+')' : '  —  n='+xs.length;
+        // Two free-form measurements have no "close to both" reading, so this chart keeps
+        // an x-versus-y view — but it must still say something when a cell holds a single
+        // instance. Enough instances to bin: median of y per equal-count x-bin with the
+        // middle 50% as a band. Too few: the instances themselves plus a least-squares
+        // line, pooled across cells when no single cell can carry a line — with one
+        // instance per cell the cells ARE the observations. Either way there is a trend
+        // to look at. R² always comes from every instance, never from the bins.
+        var band = (multiGroup ? allGroups.length : 1) <= TREND_MAX_BANDS;
+        var series = multiGroup
+          ? allGroups.map(function(g) {
+              return { name:gShort(g), full:g, color:gColor(g),
+                       rows:rows.filter(function(r){ return r[gKey]===g; }) };
+            })
+          : [{ name:ent, full:ent, color:color, rows:rows }];
+        var pooled = [], anyTrend = false, anyFitted = false;
+        series.forEach(function(sr) {
+          var pts = finitePairs(sr.rows.map(function(r){ return r[colX]; }),
+                                sr.rows.map(function(r){ return r[colY]; }));
+          if (!pts.length) return;
+          pooled = pooled.concat(pts);
+          var rr = pearsonR(pts.map(function(q){ return q[0]; }), pts.map(function(q){ return q[1]; }));
+          fits.push({ facet:sr.full, r2: rr!=null ? (rr*rr) : null, n: pts.length });
+          var opts = { band:band, xlabel:lblX, ylabel:lblY,
+                       width: series.length > TREND_MAX_BANDS ? 1.5 : 2 };
+          var t = binnedTrend(pts, 12);
+          if (t) { anyTrend = true; traces.push.apply(traces, trendTraces(t, sr.name, sr.color, opts)); }
+          else {
+            traces.push(pointTrace(pts, sr.name, sr.color, opts));
+            var fit = fitLine(pts);
+            if (fit) { anyFitted = true; traces.push(fitTrace(fit, sr.color, opts)); }
           }
+        });
+        // No single series could be summarised: fit the pooled instances instead, so the
+        // chart still shows the relationship rather than a handful of loose dots.
+        if (!anyTrend && !anyFitted) {
+          var pfit = fitLine(pooled);
+          if (pfit) {
+            traces.push(fitTrace(pfit, CS.grey, { xlabel:lblX, ylabel:lblY, pooled:true }));
+            // The drawn line gets its own number: the per-cell rows all read n=1 here.
+            var prr = pearsonR(pooled.map(function(q){ return q[0]; }), pooled.map(function(q){ return q[1]; }));
+            fits.push({ facet:'all ' + (plotGroupBy === 'group' ? 'groups' : 'cells') + ' pooled',
+                        r2: prr != null ? prr * prr : null, n: pooled.length, pooled:true });
+          }
+        }
+        if (!multiGroup && fits.length) {
+          subtitle = fits[0].r2 != null
+            ? '  —  R² = ' + fits[0].r2.toFixed(3) + ' (n=' + fits[0].n + ')'
+            : '  —  n=' + fits[0].n;
         }
 
         fitEl.innerHTML = fits.length
-          ? '<span class="fit-note-lbl">fit per '+(plotGroupBy==='group'?'group':'cell')+'</span>'
+          ? '<span class="fit-note-lbl">correlation per '+(plotGroupBy==='group'?'group':'cell')+'</span>'
             + fits.map(function(f){
-                return '<span class="fit-note-item"><span class="fit-dot" style="background:'+gColor(f.facet)+'"></span>'
-                  + gShort(f.facet) + ' <b>R²&nbsp;' + (f.r2!=null ? f.r2.toFixed(2) : '–')
+                return '<span class="fit-note-item"><span class="fit-dot" style="background:'+(f.pooled ? CS.grey : gColor(f.facet))+'"></span>'
+                  + (f.pooled ? f.facet : gShort(f.facet)) + ' <b>R²&nbsp;' + (f.r2!=null ? f.r2.toFixed(2) : '–')
                   + '</b> <span class="text-muted">n=' + f.n + '</span></span>';
               }).join('')
           : '';
