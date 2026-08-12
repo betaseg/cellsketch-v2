@@ -117,6 +117,8 @@ code { font-size: .85em; color: var(--ink); background: var(--surface-2);
 .chart-cell { flex-shrink: 0; }
 .chart-legend { display: flex; flex-wrap: wrap; gap: .25rem 1.1rem; font-size: .76rem;
   color: var(--ink-2); margin-bottom: .7rem; }
+.chart-note { font-size: .76rem; color: var(--ink-3); line-height: 1.5;
+  max-width: 70ch; margin-top: .5rem; }
 .fit-note { display: flex; flex-wrap: wrap; gap: .1rem .85rem; font-size: .74rem;
   color: var(--ink-2); margin-top: .35rem; }
 .fit-note-lbl { text-transform: uppercase; letter-spacing: .1em; font-size: .64rem;
@@ -1512,6 +1514,148 @@ function renderStructure() {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  Distance matrix (all structure pairs at once)
+// ══════════════════════════════════════════════════════════════
+var MATRIX_MAX_DIMS = 8;
+// WebGL once, not per chart: splom is a WebGL trace type, and a report opened in a
+// browser without it (VMs, remote desktops, --disable-gpu) would otherwise show
+// Plotly's "WebGL is not supported" box where the chart should be.
+var HAS_WEBGL = (function() {
+  try {
+    var c = document.createElement('canvas');
+    return !!(window.WebGLRenderingContext && (c.getContext('webgl') || c.getContext('experimental-webgl')));
+  } catch (e) { return false; }
+})();
+
+// Read as a matrix, so the columns need a stable, meaningful order: the membrane
+// first (the canonical "how deep in the cell" axis), then the nucleus, then the
+// remaining structures alphabetically, with same-type distance last — it answers a
+// different question (how clustered a structure is with itself).
+function orderDistDims(cols) {
+  var rank = function(c) {
+    if (/closest_same_type/.test(c)) return 3;
+    if (/membrane|plasma|(^|_)pm(_|$)/i.test(c)) return 0;
+    if (/nucl/i.test(c)) return 1;
+    return 2;
+  };
+  return cols.slice().sort(function(a, b) {
+    return rank(a) - rank(b) || distColLabel(a).localeCompare(distColLabel(b));
+  });
+}
+function dimLabel(col) {
+  return distColLabel(col).replace(/\s*\(mean\)$/, '').replace(/^label /, '');
+}
+
+// Thin deterministically (every k-th instance) to a per-facet cap, and report the
+// step so the note can say what is on screen instead of quietly dropping points.
+function thinRows(rws, cap) {
+  var step = Math.ceil(rws.length / cap);
+  return { rows: step > 1 ? rws.filter(function(_, i){ return i % step === 0; }) : rws, step: step };
+}
+
+function drawDistMatrix(plotEl, noteEl, wrapEl, dims, facets, ent, allMean, dimsDropped) {
+  var n = dims.length;
+  var panels = n - 1;                       // lower triangle, no diagonal
+  var cellPx = n <= 3 ? 210 : n <= 5 ? 165 : 130;
+  var side   = panels * cellPx;
+  var nPanels = panels * (panels + 1) / 2;
+  // SVG draws one DOM node per marker, so the fallback path gets a marker budget the
+  // browser can actually paint; WebGL can take far more.
+  var cap = HAS_WEBGL ? 4000 : Math.max(150, Math.floor(24000 / nPanels / facets.length));
+
+  var step = 1, plotted = 0;
+  var data = facets.map(function(f) {
+    var t = thinRows(f.rows, cap);
+    step = Math.max(step, t.step); plotted += t.rows.length;
+    return { name:f.name, color:f.color, rows:t.rows };
+  });
+  var total = facets.reduce(function(a, f){ return a + f.rows.length; }, 0);
+
+  wrapEl.style.width = (side + 130) + 'px';
+  plotEl.style.cssText = 'width:100%;height:' + (side + 110) + 'px';
+
+  var layout = { margin:{l:78, r:16, t:12, b:74}, height: side + 110,
+                 hovermode:'closest', showlegend:false };
+  var ticks = cellPx < 160 ? 3 : 4;
+  var traces;
+
+  if (HAS_WEBGL) {
+    layout.dragmode = 'select';             // splom brushes across every panel
+    dims.forEach(function(_, i) {
+      var sfx = i ? (i + 1) : '';
+      layout['xaxis' + sfx] = { nticks:ticks, rangemode:'tozero' };
+      layout['yaxis' + sfx] = { nticks:ticks, rangemode:'tozero' };
+    });
+    traces = data.map(function(d) {
+      return { type:'splom', name:d.name, showlegend:false,
+        showupperhalf:false, diagonal:{visible:false},
+        dimensions: dims.map(function(c) {
+          return { label: dimLabel(c),
+                   values: d.rows.map(function(r){ return r[c] != null && isFinite(r[c]) ? r[c] : null; }) };
+        }),
+        marker:{ color:d.color, size:5, opacity:0.55, line:{width:0} },
+        hovertemplate:'%{xaxis.title.text}: %{x:.3g} µm<br>%{yaxis.title.text}: %{y:.3g} µm<extra>'+d.name+'</extra>' };
+    });
+  } else {
+    // Hand-built matrix of plain SVG scatter panels: same geometry, no WebGL. Column
+    // and row ranges are tied with `matches` so every panel in a column shares an x
+    // scale and every panel in a row shares a y scale — as a splom does.
+    var gap = 0.035;
+    var cw = (1 - gap * (panels - 1)) / panels;
+    traces = [];
+    var k = 0, colRef = {}, rowRef = {};
+    for (var r = 0; r < panels; r++) {
+      for (var c = 0; c <= r; c++) {
+        k++;
+        var sfx = k > 1 ? k : '';
+        var bottom = (r === panels - 1), left = (c === 0);
+        var x0 = c * (cw + gap), yTop = 1 - r * (cw + gap);
+        // Ticks only where they are labelled — an unlabelled tick mark on an inner
+        // panel edge is noise, not information.
+        layout['xaxis' + sfx] = {
+          domain:[x0, x0 + cw], anchor:'y' + (k > 1 ? k : ''), nticks:ticks, rangemode:'tozero',
+          showticklabels:bottom, ticks: bottom ? 'outside' : '',
+          title: bottom ? dimLabel(dims[c]) : undefined,
+          matches: colRef[c] ? 'x' + (colRef[c] > 1 ? colRef[c] : '') : undefined };
+        layout['yaxis' + sfx] = {
+          domain:[yTop - cw, yTop], anchor:'x' + (k > 1 ? k : ''), nticks:ticks, rangemode:'tozero',
+          showticklabels:left, ticks: left ? 'outside' : '',
+          title: left ? dimLabel(dims[r + 1]) : undefined,
+          matches: rowRef[r] ? 'y' + (rowRef[r] > 1 ? rowRef[r] : '') : undefined };
+        if (!colRef[c]) colRef[c] = k;
+        if (!rowRef[r]) rowRef[r] = k;
+        var cx = dims[c], cy = dims[r + 1];
+        data.forEach(function(d) {
+          var xs = [], ys = [];
+          d.rows.forEach(function(row) {
+            if (row[cx] != null && isFinite(row[cx]) && row[cy] != null && isFinite(row[cy])) {
+              xs.push(row[cx]); ys.push(row[cy]);
+            }
+          });
+          if (!xs.length) return;
+          traces.push({ type:'scatter', mode:'markers', name:d.name, showlegend:false,
+            xaxis:'x' + (k > 1 ? k : ''), yaxis:'y' + (k > 1 ? k : ''), x:xs, y:ys,
+            marker:{ color:d.color, size:5, opacity:0.55, line:{width:0} },
+            hovertemplate:dimLabel(cx)+': %{x:.3g} µm<br>'+dimLabel(cy)+': %{y:.3g} µm<extra>'+d.name+'</extra>' });
+        });
+      }
+    }
+  }
+
+  Plotly.newPlot(plotEl, traces, layout, {responsive:true, displayModeBar:false});
+
+  var notes = [];
+  if (HAS_WEBGL) notes.push('Drag across any panel to select — the same ' + ent + 's light up in every other panel.');
+  if (allMean) notes.push('Distances are each ' + ent + '\u2019s mean to that structure.');
+  if (step > 1) notes.push('Showing every ' + step + (step === 2 ? 'nd' : step === 3 ? 'rd' : 'th')
+    + ' instance (' + plotted.toLocaleString() + ' of ' + total.toLocaleString() + ')'
+    + (HAS_WEBGL ? ' to keep the matrix responsive.' : ' — this browser has no WebGL, so the matrix is drawn as SVG, which cannot carry every point.'));
+  if (dimsDropped > 0) notes.push(dimsDropped + ' further structure' + (dimsDropped > 1 ? 's are' : ' is')
+    + ' omitted — the matrix shows the first ' + MATRIX_MAX_DIMS + '.');
+  noteEl.textContent = notes.join(' ');
+}
+
+// ══════════════════════════════════════════════════════════════
 //  Entity Stats
 // ══════════════════════════════════════════════════════════════
 function renderEntityStats() {
@@ -1596,7 +1740,7 @@ function renderEntityStats() {
       +'<p class="subsection-desc" id="dc-desc-'+ent+'" style="display:none">Distance from the closest point of each '+ent+' to the nearest instance of each structure. Near 0 means that '+ent+' sits right against it.</p>'
       +'<div class="charts-row" id="dc-'+ent+'"></div>'
       +'<div class="subsection-label mt-3" id="d2-lbl-'+ent+'" style="display:none">Is each '+ent+' close to two structures at once?</div>'
-      +'<p class="subsection-desc" id="d2-desc-'+ent+'" style="display:none">Each dot is one '+ent+': its distance to one structure (x) versus another (y). <b>Bottom-left = close to both.</b> Colour marks the '+(plotGroupBy==='group'?'group':'cell')+', so you can see whether the pattern differs between them.</p>'
+      +'<p class="subsection-desc" id="d2-desc-'+ent+'" style="display:none">One panel per pair of structures, so you can read every combination at once. Each dot is one '+ent+': its distance to the structure named on the x axis versus the one on the y axis — <b>bottom-left = close to both</b>. Colour marks the '+(plotGroupBy==='group'?'group':'cell')+', so you can see whether the pattern differs between them.</p>'
       +'<div class="charts-row" id="d2-'+ent+'"></div>'
       +'<div class="subsection-label mt-3" id="dh-lbl-'+ent+'" style="display:none">How much of each '+ent+'’s body lies near a structure?</div>'
       +'<p class="subsection-desc" id="dh-desc-'+ent+'" style="display:none">Every voxel making up the '+ent+' population, binned by its distance to a structure. A tall peak near 0 means '+ent+'s hug that structure along much of their body — not just touch at a single point. (The closest-point view above only sees the single nearest point.)</p>'
@@ -1711,70 +1855,30 @@ function renderEntityStats() {
       block.querySelector('#d2-desc-'+ent).style.display = '';
       var d2El = block.querySelector('#d2-'+ent);
 
-      // Prefer membrane on x, nucleus on y when present — the canonical "spans between" pair.
-      var pick = function(re){ return d2cols.find(function(c){ return re.test(c); }); };
-      var defX2 = pick(/membrane|plasma|(^|_)pm(_|$)/i) || d2cols[0];
-      var defY2 = pick(/nucl/i);
-      if (!defY2 || defY2 === defX2) defY2 = d2cols.find(function(c){ return c !== defX2; }) || d2cols[1];
+      // Every structure pair at once, as a scatter-plot matrix: one panel per pair, so
+      // no pair sits behind a dropdown and the pattern across pairs is directly
+      // comparable. Lower triangle only (the upper half is the same panels mirrored)
+      // and no diagonal (a distance against itself says nothing here).
+      var dims = orderDistDims(d2cols).slice(0, MATRIX_MAX_DIMS);
+      var dimsDropped = d2cols.length - dims.length;
+      var allMean = dims.every(function(c){ return /_mean_um$/.test(c); });
+      var facets = multiGroup
+        ? allGroups.map(function(g) {
+            return { name:g, color:gColor(g), rows:rows.filter(function(r){ return r[gKey]===g; }) };
+          }).filter(function(f){ return f.rows.length; })
+        : (rows.length ? [{ name:ent, color:color, rows:rows }] : []);
 
-      var d2wrap = document.createElement('div');
-      d2wrap.className = 'chart-cell'; d2wrap.style.width = '400px';
-      d2El.appendChild(d2wrap);
-      var d2ctrl = document.createElement('div');
-      d2ctrl.className = 'd-flex flex-wrap gap-2 align-items-center mb-1';
-      d2ctrl.style.fontSize = '.7rem';
-      var xSel2 = document.createElement('select'), ySel2 = document.createElement('select');
-      xSel2.className = ySel2.className = 'form-select form-select-sm';
-      xSel2.style.cssText = ySel2.style.cssText = 'width:auto;font-size:.7rem';
-      d2cols.forEach(function(c){
-        xSel2.innerHTML += '<option value="'+c+'"'+(c===defX2?' selected':'')+'>'+distColLabel(c)+'</option>';
-        ySel2.innerHTML += '<option value="'+c+'"'+(c===defY2?' selected':'')+'>'+distColLabel(c)+'</option>';
-      });
-      var xL2 = document.createElement('span'); xL2.textContent = 'x: dist to';
-      var yL2 = document.createElement('span'); yL2.textContent = 'y: dist to';
-      d2ctrl.append(xL2, xSel2, yL2, ySel2);
-      d2wrap.appendChild(d2ctrl);
-      var d2plot = document.createElement('div');
-      d2plot.style.cssText = 'width:400px;height:300px';
-      d2wrap.appendChild(d2plot);
-
-      var drawD2 = function() {
-        var cx = xSel2.value, cy = ySel2.value;
-        var lblX = distColLabel(cx), lblY = distColLabel(cy);
-        var traces = [];
-        var collect = function(rws){
-          var xs=[], ys=[], ids=[];
-          rws.forEach(function(r){
-            if (r[cx]!=null && isFinite(r[cx]) && r[cy]!=null && isFinite(r[cy])) { xs.push(r[cx]); ys.push(r[cy]); ids.push('id '+r.label_id); }
-          });
-          return { xs:xs, ys:ys, ids:ids };
-        };
-        if (multiGroup) {
-          allGroups.forEach(function(g){
-            var p = collect(rows.filter(function(r){ return r[gKey]===g; }));
-            if (!p.xs.length) return;
-            traces.push({ type:'scatter', mode:'markers', name:gShort(g)+' (n='+p.xs.length+')',
-              x:p.xs, y:p.ys, marker:{color:gColor(g), size:5, opacity:0.6},
-              hovertemplate:lblX+': %{x:.3g} μm<br>'+lblY+': %{y:.3g} μm<extra>'+g+'</extra>' });
-          });
-        } else {
-          var p = collect(rows);
-          if (p.xs.length) traces.push({ type:'scatter', mode:'markers', name:ent, text:p.ids,
-            x:p.xs, y:p.ys, marker:{color:color, size:5, opacity:0.6},
-            hovertemplate:lblX+': %{x:.3g} μm<br>'+lblY+': %{y:.3g} μm<br>%{text}<extra></extra>' });
-        }
-        if (!traces.length) { Plotly.purge(d2plot); return; }
-        Plotly.newPlot(d2plot, traces, {
-          margin:{l:55,r:10,t:10,b:45}, height:300,
-          xaxis:{title:lblX+' (μm)', rangemode:'tozero'},
-          yaxis:{title:lblY+' (μm)', rangemode:'tozero'},
-          // Identity is in the block's shared legend; a per-chart one would repeat it
-          // and, with eight long cell names, collide with the x-axis title.
-          showlegend:false,
-        }, {responsive:true, displayModeBar:false});
-      };
-      xSel2.onchange = drawD2; ySel2.onchange = drawD2;
-      drawD2();
+      if (facets.length) {
+        var d2wrap = document.createElement('div');
+        d2wrap.className = 'chart-cell';
+        d2El.appendChild(d2wrap);
+        var d2plot = document.createElement('div');
+        d2wrap.appendChild(d2plot);
+        var noteEl = document.createElement('div');
+        noteEl.className = 'chart-note';
+        d2wrap.appendChild(noteEl);
+        drawDistMatrix(d2plot, noteEl, d2wrap, dims, facets, ent, allMean, dimsDropped);
+      }
     }
 
     // ── Per-pixel distance distribution histograms ────────────────────────────
