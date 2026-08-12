@@ -9,51 +9,163 @@
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/plotly.js@2.27.0/dist/plotly.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chroma-js@2.4.2/chroma.min.js"></script>
 <style>
+/* ══════════════════════════════════════════════════════════════════════
+   CellSketch Stats — editorial stylesheet.
+
+   The report is read like a paper, not scanned like a dashboard: serif
+   headings, one warm paper surface, hairline rules instead of boxed cards,
+   and body text at a size you can actually read. The section "questions"
+   ("How big is each mito?") are real headings — they carry the narrative,
+   so they get heading treatment rather than 11px grey uppercase.
+
+   Series colours live in --series-1…8 and are mirrored in JS (CS.series) so
+   page chrome and Plotly charts draw from one palette. That set is validated
+   for colour-vision deficiency on this surface (adjacent CVD ΔE ≥ 8); if you
+   re-colour, re-validate rather than eyeballing it.
+   ══════════════════════════════════════════════════════════════════════ */
+:root {
+  --paper:      #faf8f4;   /* page surface */
+  --surface:    #fffefb;   /* raised: table bodies, chart wells */
+  --surface-2:  #f2eee5;   /* sunken: table heads, callouts */
+  --ink:        #17150f;   /* headings */
+  --ink-2:      #4a453c;   /* body */
+  --ink-3:      #7d7566;   /* labels, captions */
+  --rule:       #e6e0d3;   /* hairline grid */
+  --rule-2:     #cdc4b1;   /* structural rules */
+  --accent:     #1c5cab;   /* links & active controls */
+  --danger:     #a02724;
+  --danger-bg:  #f7e4e1;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua",
+           Charter, "Source Serif 4", "Noto Serif", Georgia, "Liberation Serif", ui-serif, serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --series-1:#2a78d6; --series-2:#eb6834; --series-3:#1baf7a; --series-4:#eda100;
+  --series-5:#e87ba4; --series-6:#008300; --series-7:#4a3aa7; --series-8:#e34948;
+}
 *, *::before, *::after { box-sizing: border-box; }
-body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direction: column; min-height: 100vh; }
+body { font-family: var(--sans); font-size: .9rem; line-height: 1.55;
+  color: var(--ink-2); background: var(--paper); margin: 0;
+  display: flex; flex-direction: column; min-height: 100vh;
+  -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); }
+code { font-size: .85em; color: var(--ink); background: var(--surface-2);
+  padding: .05em .3em; border-radius: 2px; }
 
-.topbar { background: #fff; color: #111; padding: .5rem 1.2rem;
-  display: flex; flex-wrap: wrap; gap: .6rem; align-items: center;
-  position: sticky; top: 0; z-index: 300; border-bottom: 1.5px solid #111; }
-.topbar .brand { font-weight: 700; font-size: 1rem; color: #111; margin-right: .4rem; white-space: nowrap; }
-.topbar .file-info { font-size: .72rem; color: #555; }
+/* ── Top bar ─────────────────────────────────────────────────────── */
+.topbar { background: var(--surface); color: var(--ink); padding: .55rem 1.6rem;
+  display: flex; flex-wrap: wrap; gap: .7rem; align-items: center;
+  position: sticky; top: 0; z-index: 300; border-bottom: 1px solid var(--rule-2); }
+.topbar .brand { font-family: var(--serif); font-weight: 600; font-size: 1.18rem;
+  letter-spacing: -.01em; color: var(--ink); margin-right: .5rem; white-space: nowrap; }
+.topbar .file-info { font-size: .78rem; color: var(--ink-3); }
 
-.main { max-width: 1600px; margin: 0 auto; padding: 1.5rem 1rem 3rem; flex: 1; }
+.main { max-width: 1500px; margin: 0 auto; padding: 2rem 1.6rem 4rem; flex: 1;
+  counter-reset: section; width: 100%; }
 
-.section { background: #fff; border-radius: 0; border: 1px solid #ddd;
-  padding: 1.2rem 1.4rem; margin-bottom: 1.4rem; }
-.section-title { font-size: .9rem; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .06em; color: #111; border-bottom: 2px solid #111; padding-bottom: .5rem; margin-bottom: 1rem; }
+/* ── Sections: rules, not cards ──────────────────────────────────── */
+.section { background: none; border: 0; border-top: 1px solid var(--rule-2);
+  padding: 1.7rem 0 2.4rem; margin: 0; }
+.main > .section:first-of-type { border-top: 0; padding-top: .6rem; }
+.section-title { font-family: var(--serif); font-size: 1.6rem; font-weight: 600;
+  text-transform: none; letter-spacing: -.015em; color: var(--ink);
+  border: 0; padding: 0; margin: 0 0 .1rem; line-height: 1.15; }
+.section-title::before { counter-increment: section;
+  content: counter(section, decimal-leading-zero); display: block;
+  font-family: var(--sans); font-size: .68rem; font-weight: 600;
+  letter-spacing: .16em; color: var(--ink-3); margin-bottom: .5rem; }
+.section-subtitle { font-size: .895rem; line-height: 1.62; color: var(--ink-2);
+  max-width: 80ch; margin: .55rem 0 1.5rem; }
 
-.card-metric { text-align: center; padding: .6rem 1.4rem; background: #f8f8f8;
-  border-radius: 0; border: 1px solid #ddd; }
-.card-metric .big { font-size: 2rem; font-weight: 300; color: #111; line-height: 1.1; }
-.card-metric .lbl { font-size: .65rem; text-transform: uppercase; letter-spacing: .07em; color: #888; margin-top: 2px; }
+/* The question-led headings. These ARE the story of the report. */
+.subsection-label { font-family: var(--serif); font-size: 1.18rem; font-weight: 600;
+  text-transform: none; letter-spacing: -.01em; color: var(--ink);
+  margin: 2.1rem 0 .3rem; line-height: 1.3; }
+.subsection-desc { font-size: .855rem; line-height: 1.6; color: var(--ink-2);
+  max-width: 82ch; margin: 0 0 .9rem; }
 
-#drop-zone { border: 2px dashed #111; border-radius: 0; padding: 4rem 2rem;
-  cursor: pointer; transition: .2s; text-align: center; background: #fff; }
-#drop-zone:hover, #drop-zone.drag-over { background: #f5f5f5; }
+/* ── Hero count ──────────────────────────────────────────────────── */
+.card-metric { text-align: left; padding: .1rem 1.5rem .1rem 0; background: none;
+  border: 0; border-right: 1px solid var(--rule-2); margin-right: .4rem; }
+.card-metric .big { font-family: var(--sans); font-size: 2.5rem; font-weight: 300;
+  color: var(--ink); line-height: 1; letter-spacing: -.03em; }
+.card-metric .lbl { font-size: .68rem; text-transform: uppercase;
+  letter-spacing: .14em; color: var(--ink-3); margin-top: .25rem; }
 
-.entity-block { border-left: 4px solid #ccc; padding-left: 1rem; margin-bottom: 1.2rem; }
-.entity-title { font-weight: 600; font-size: .88rem; color: #111; margin-bottom: .6rem; display: flex; align-items: center; gap: .5rem; }
-.section-subtitle { font-size: .78rem; color: #666; margin: -.6rem 0 1rem; }
-.subsection-label { font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: #888; margin: .9rem 0 .35rem; }
-.subsection-desc { font-size: .72rem; color: #777; margin: -.2rem 0 .5rem; }
-.charts-row { display: flex; flex-wrap: wrap; gap: 10px; overflow-x: auto; }
+/* ── Structure chips (mask / label) ──────────────────────────────── */
+.cs-chip { display: inline-flex; align-items: center; gap: .32rem; padding: .12rem .5rem;
+  font-family: var(--sans); font-size: .72rem; line-height: 1.5; white-space: nowrap;
+  border: 1px solid var(--rule-2); border-radius: 999px; color: var(--ink-2);
+  background: var(--surface); }
+.cs-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ink-3); }
+.cs-chip-mask::before { background: var(--series-1); }
+.cs-chip-label::before { background: var(--series-3); }
+.cs-chip-source::before { background: var(--rule-2); }
+.cs-chip-kind { font-size: .62rem; text-transform: uppercase; letter-spacing: .1em;
+  padding: 0 .38rem; color: var(--ink-3); }
+
+/* ── Landing ─────────────────────────────────────────────────────── */
+#drop-zone { border: 1px dashed var(--rule-2); border-radius: 3px; padding: 4rem 2rem;
+  cursor: pointer; transition: .18s; text-align: center; background: var(--surface); }
+#drop-zone:hover, #drop-zone.drag-over { background: var(--surface-2); border-color: var(--accent); }
+#drop-zone .fs-6 { font-family: var(--serif); font-size: 1.1rem !important; color: var(--ink); }
+
+.entity-block { border-left: 2px solid var(--rule-2); padding-left: 1.2rem; margin-bottom: 1.6rem; }
+.entity-title { font-family: var(--serif); font-size: 1.28rem; font-weight: 600;
+  color: var(--ink); margin-bottom: .5rem; display: flex; align-items: center; gap: .5rem; }
+.charts-row { display: flex; flex-wrap: wrap; gap: 18px 22px; overflow-x: auto; }
 .chart-cell { flex-shrink: 0; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: .25rem 1.1rem; font-size: .76rem;
+  color: var(--ink-2); margin-bottom: .7rem; }
+.fit-note { display: flex; flex-wrap: wrap; gap: .1rem .85rem; font-size: .74rem;
+  color: var(--ink-2); margin-top: .35rem; }
+.fit-note-lbl { text-transform: uppercase; letter-spacing: .1em; font-size: .64rem;
+  color: var(--ink-3); width: 100%; }
+.fit-note-item { display: inline-flex; align-items: center; gap: .3rem;
+  font-variant-numeric: tabular-nums; }
+.fit-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.callout { background: var(--surface-2); border-left: 2px solid var(--accent);
+  padding: .7rem 1rem; font-size: .9rem; color: var(--ink); margin: .2rem 0 1.4rem; }
 
-/* ── Footer ── */
-.cs-footer { background: #212529; color: #adb5bd; font-size: .75rem; margin-top: auto; }
-.cs-footer-inner { max-width: 1600px; margin: 0 auto; padding: 1rem 1.2rem;
+/* ── Tables: hairlines, tabular figures, quiet heads ─────────────── */
+.table { --bs-table-bg: transparent; --bs-table-hover-bg: var(--surface-2);
+  --bs-table-color: var(--ink-2); font-size: .84rem; margin: 0; }
+.table > :not(caption) > * > * { padding: .42rem .6rem; border-bottom-color: var(--rule);
+  background: none; box-shadow: none; }
+.table > thead { --bs-table-bg: transparent; }
+.table thead th, .table > thead.table-light th { background: none !important;
+  font-family: var(--sans); font-size: .68rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .1em; color: var(--ink-3); border-bottom: 1px solid var(--rule-2) !important;
+  vertical-align: bottom; }
+.table tbody td { font-variant-numeric: tabular-nums; }
+.table tbody tr:last-child td { border-bottom-color: var(--rule-2); }
+.cs-missing { background: var(--danger-bg); color: var(--danger); font-weight: 600; }
+.table-wrap { overflow-x: auto; background: var(--surface);
+  border: 1px solid var(--rule); border-radius: 3px; }
+
+/* ── Controls ────────────────────────────────────────────────────── */
+.form-select, .form-control { font-family: var(--sans); font-size: .84rem;
+  color: var(--ink-2); background-color: var(--surface); border-color: var(--rule-2);
+  border-radius: 3px; }
+.form-select:focus, .form-control:focus { border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(28,92,171,.14); }
+.btn-outline-dark { --bs-btn-color: var(--ink); --bs-btn-border-color: var(--rule-2);
+  --bs-btn-hover-bg: var(--ink); --bs-btn-hover-border-color: var(--ink);
+  --bs-btn-focus-shadow-rgb: 28,92,171; border-radius: 3px; font-size: .82rem; }
+.form-range { accent-color: var(--accent); }
+.text-muted { color: var(--ink-3) !important; }
+.small, small { font-size: .8rem; }
+
+/* ── Footer ──────────────────────────────────────────────────────── */
+.cs-footer { background: #221f19; color: #b4ab9b; font-size: .8rem; margin-top: auto; }
+.cs-footer-inner { max-width: 1500px; margin: 0 auto; padding: 1.2rem 1.6rem;
   display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: .75rem; }
 .cs-footer-left { display: flex; align-items: center; gap: .9rem; }
 .cs-footer-logo { height: 36px; width: auto; }
 .cs-footer-right { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
-.cs-footer a { color: #adb5bd; text-decoration: none; }
-.cs-footer a:hover { color: #dee2e6; text-decoration: underline; }
-.cs-footer-link-light { color: #dee2e6 !important; }
+.cs-footer a { color: #b4ab9b; text-decoration: none; }
+.cs-footer a:hover { color: #efe9dd; text-decoration: underline; }
+.cs-footer-link-light { color: #efe9dd !important; }
 </style>
 </head>
 <body>
@@ -138,9 +250,9 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
     <p class="section-subtitle">An overview of the input files — one row per structure per cell.</p>
     <div class="row g-3">
       <div class="col-12">
-        <div style="max-height:480px;overflow-y:auto">
+        <div class="table-wrap" style="max-height:480px;overflow-y:auto">
           <table class="table table-sm table-hover mb-0">
-            <thead class="table-light sticky-top">
+            <thead class="sticky-top" style="background:var(--surface)">
               <tr><th>cell</th><th>entity</th><th>kind</th><th class="text-end">instances</th><th class="text-end">vol (μm³)</th><th class="text-end">area (μm²)</th><th class="text-end">sphericity</th><th class="text-end">aspect ratio</th><th class="text-end">size</th><th>modified</th></tr>
             </thead>
             <tbody id="file-table-body"></tbody>
@@ -173,17 +285,18 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
       <div style="width:260px">
         <label class="form-label small mb-1">Gap &le; <span id="ct-thr-val">–</span> µm</label>
         <input type="range" id="ct-thr" class="form-range" min="0" max="0.5" step="0.005" value="0.5">
-        <div class="d-flex justify-content-between" style="font-size:.62rem;color:#999"><span>touching (0)</span><span id="ct-thr-max">max</span></div>
+        <div class="d-flex justify-content-between" style="font-size:.7rem;color:var(--ink-3)"><span>touching (0)</span><span id="ct-thr-max">max</span></div>
       </div>
       <span id="ct-count" class="small text-muted align-self-end pb-1"></span>
     </div>
-    <p id="ct-summary" class="mb-3" style="font-size:.86rem;color:#222;background:#f8f8f8;border-left:3px solid #111;padding:.6rem .8rem"></p>
+    <p id="ct-summary" class="callout"></p>
 
     <div id="ct-compare-wrap" class="d-none">
       <div class="subsection-label mt-1" id="ct-compare-title"></div>
       <p class="subsection-desc" id="ct-compare-desc"></p>
+      <div class="chart-legend" id="ct-legend"></div>
       <div class="charts-row" id="ct-compare-charts"></div>
-      <div id="ct-compare-table" style="overflow-x:auto" class="mt-2"></div>
+      <div id="ct-compare-table" class="table-wrap mt-3"></div>
     </div>
 
     <div id="ct-span-wrap" class="d-none">
@@ -219,33 +332,79 @@ var ALL = [], COLS = [];
 var st = { group: '', cell: '', entity: '', statsEntity: null };
 var plotGroupBy = 'cell';
 
-// Color caches
+// ══════════════════════════════════════════════════════════════
+//  Chart theme — the JS half of the stylesheet
+// ══════════════════════════════════════════════════════════════
+// Kept in sync with the :root tokens by hand (Plotly needs real values, not
+// var() references). CS.series is the validated categorical order: assign by
+// index, never cycle a 9th generated hue — past the 8th, series fold to grey.
+var CS = {
+  serif: 'Iowan Old Style, Palatino Linotype, Palatino, Book Antiqua, Charter, Source Serif 4, Noto Serif, Georgia, Liberation Serif, serif',
+  sans:  'system-ui, -apple-system, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif',
+  ink: '#17150f', ink2: '#4a453c', ink3: '#7d7566',
+  rule: '#e6e0d3', rule2: '#cdc4b1', accent: '#1c5cab', grey: '#a8a091',
+  series: ['#2a78d6','#eb6834','#1baf7a','#eda100','#e87ba4','#008300','#4a3aa7','#e34948']
+};
+// Axis defaults: hairline solid grid one shade off the paper, no zero line, ticks
+// outside, and automargin everywhere so a long tick label steals margin instead of
+// being clipped by a fixed chart height.
+var CS_AXIS = {
+  gridcolor: CS.rule, zeroline: false, linecolor: CS.rule2, ticks: 'outside',
+  tickcolor: CS.rule2, ticklen: 3, automargin: true,
+  tickfont: { family: CS.sans, size: 10.5, color: CS.ink3 },
+  title: { font: { family: CS.sans, size: 10.5, color: CS.ink3 } }
+};
+var CS_TEMPLATE = { layout: {
+  font: { family: CS.sans, size: 11, color: CS.ink2 },
+  paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+  colorway: CS.series,
+  // Chart titles sit flush left above the plot, like a figure caption. Leave y/yref
+  // alone: title.yref defaults to the container, so anchoring y:1 pushes the title
+  // off the top edge and it disappears.
+  title: { font: { family: CS.sans, size: 12, color: CS.ink }, x: 0, xanchor: 'left',
+           xref: 'paper' },
+  xaxis: CS_AXIS, yaxis: CS_AXIS,
+  legend: { font: { family: CS.sans, size: 10, color: CS.ink2 }, bgcolor: 'rgba(0,0,0,0)' },
+  hoverlabel: { bgcolor: '#221f19', bordercolor: '#221f19',
+                font: { family: CS.sans, size: 11, color: '#faf8f4' } },
+  boxgap: 0.45, bargap: 0.28
+} };
+// Every chart inherits the theme: wrapping newPlot beats restating fonts and
+// grid colours at a dozen call sites (and drifting between them).
+(function(){
+  var _newPlot = Plotly.newPlot;
+  Plotly.newPlot = function(gd, data, layout, config) {
+    layout = layout || {};
+    if (!layout.template) layout.template = CS_TEMPLATE;
+    return _newPlot.call(Plotly, gd, data, layout, config);
+  };
+})();
+
+// Color caches. Identity colours follow the entity (cell/group/structure), never
+// its rank, so filtering a series out never repaints the survivors.
 var _cellPal = null, _entPal = null, _grpPal = null;
+function assignSeries(keys) {
+  var m = {};
+  keys.forEach(function(k, i){ m[k] = i < CS.series.length ? CS.series[i] : CS.grey; });
+  return m;
+}
+// Series colours are opaque hex; area fills want the same hue, translucent.
+function withAlpha(hex, a) {
+  var h = String(hex).replace('#', '');
+  if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  var n = parseInt(h, 16);
+  return 'rgba(' + [(n>>16)&255, (n>>8)&255, n&255].join(',') + ',' + a + ')';
+}
 function cellPalette() {
-  if (!_cellPal) {
-    var cs = uniq(ALL.map(function(r){ return r.cell_id; }).filter(Boolean));
-    var p = chroma.scale('Set2').colors(Math.max(cs.length, 3));
-    _cellPal = {};
-    cs.forEach(function(c,i){ _cellPal[c] = p[i % p.length]; });
-  }
+  if (!_cellPal) _cellPal = assignSeries(uniq(ALL.map(function(r){ return r.cell_id; }).filter(Boolean)));
   return _cellPal;
 }
-var _ENT_COLORS = ['#FF8080','#80AAFF','#80DD99','#FFB366','#CC88FF','#FF88BB','#66DDCC','#AABB55','#FFD966','#FF99EE'];
 function entPalette() {
-  if (!_entPal) {
-    var es = uniq(ALL.map(function(r){ return r.entity_name; }));
-    _entPal = {};
-    es.forEach(function(e,i){ _entPal[e] = _ENT_COLORS[i % _ENT_COLORS.length]; });
-  }
+  if (!_entPal) _entPal = assignSeries(uniq(ALL.map(function(r){ return r.entity_name; })));
   return _entPal;
 }
 function groupPalette() {
-  if (!_grpPal) {
-    var gs = uniq(ALL.map(function(r){ return r.group_id; }).filter(Boolean));
-    var p = chroma.scale('Dark2').colors(Math.max(gs.length, 3));
-    _grpPal = {};
-    gs.forEach(function(g,i){ _grpPal[g] = p[i % p.length]; });
-  }
+  if (!_grpPal) _grpPal = assignSeries(uniq(ALL.map(function(r){ return r.group_id; }).filter(Boolean)));
   return _grpPal;
 }
 function cellColor(c)  { return (cellPalette()[c]  || '#aaa'); }
@@ -455,10 +614,16 @@ function shortFacetLabels(labels) {
   strs.forEach(function(s){ while (suf && s.slice(s.length - suf.length) !== suf) suf = suf.slice(1); });
   pre = pre.replace(/[^_\- ]*$/, '');   // back off to a separator so tokens stay whole
   suf = suf.replace(/^[^_\- ]*/, '');
-  return strs.map(function(s){
-    var out = s.slice(pre.length, s.length - suf.length).replace(/^[_\- ]+|[_\- ]+$/g, '');
-    return truncMid(out || s, 22);
+  var trimmed = strs.map(function(s){
+    return s.slice(pre.length, s.length - suf.length).replace(/^[_\- ]+|[_\- ]+$/g, '') || s;
   });
+  // Widen the tick budget until truncation stops mapping two distinct names onto the same
+  // label: identical labels become ONE Plotly category, silently summing/merging their bars.
+  for (var n = 22; n <= 64; n += 6) {
+    var out = trimmed.map(function(s){ return truncMid(s, n); });
+    if (uniq(out).length === out.length) return out;
+  }
+  return trimmed;   // names differ only past 64 chars (or are truly identical) — show them raw
 }
 
 function filtered(rowType) {
@@ -537,14 +702,21 @@ function distColLabel(col) {
 function histSpan(rows, key) {
   var minCol = 'distance_to_' + key + '_hist_min_um', maxCol = 'distance_to_' + key + '_hist_max_um';
   var histCol = 'distance_to_' + key + '_hist_um';
-  var gmin = Infinity, gmax = -Infinity;
+  var gmin = Infinity, gmax = -Infinity, widths = [];
   rows.forEach(function(r) {
     if (r[histCol] == null || r[minCol] == null || r[maxCol] == null) return;
     if (!isFinite(r[minCol]) || !isFinite(r[maxCol])) return;
     if (r[minCol] < gmin) gmin = r[minCol];
     if (r[maxCol] > gmax) gmax = r[maxCol];
+    // Bin width this instance's stored histogram was built at — the real resolution
+    // limit of everything downstream.
+    var n = 0; try { n = JSON.parse(r[histCol]).length; } catch(e){ n = 0; }
+    if (n > 0 && r[maxCol] > r[minCol]) widths.push((r[maxCol] - r[minCol]) / n);
   });
-  return (isFinite(gmin) && gmax > gmin) ? { min: gmin, max: gmax } : null;
+  if (!isFinite(gmin) || gmax <= gmin) return null;
+  widths.sort(function(a,b){ return a-b; });
+  return { min: gmin, max: gmax,
+           srcWidth: widths.length ? widths[Math.floor(widths.length/2)] : null };
 }
 
 // Aggregate per-instance histograms (stored as JSON in rows) onto a grid. Pass `span`
@@ -562,6 +734,25 @@ function aggregateHistograms(rows, key, numBins, span) {
   var gmin = span ? span.min : valid.reduce(function(m, r){ return Math.min(m, r[minCol]); }, Infinity);
   var gmax = span ? span.max : valid.reduce(function(m, r){ return Math.max(m, r[maxCol]); }, -Infinity);
   if (!isFinite(gmin) || gmax <= gmin) return null;
+
+  // Never ask for a finer grid than the stored histograms carry. Each instance ships
+  // its bins over ITS OWN [min,max], so over the wider shared span those bins are
+  // coarser than they look: requesting 30 bins from 20-bin sources leaves output bins
+  // that no source bin can reach, and the curve combs into spikes-and-zeros that read
+  // as real oscillation. Cap at the median source bin width, on the shared grid so
+  // every facet stays aligned.
+  var srcW = span && span.srcWidth ? span.srcWidth : null;
+  if (!srcW) {
+    var ws = [];
+    valid.forEach(function(r) {
+      var n = 0; try { n = JSON.parse(r[histCol]).length; } catch(e){ n = 0; }
+      if (n > 0 && r[maxCol] > r[minCol]) ws.push((r[maxCol] - r[minCol]) / n);
+    });
+    ws.sort(function(a,b){ return a-b; });
+    srcW = ws.length ? ws[Math.floor(ws.length/2)] : null;
+  }
+  if (srcW > 0) numBins = Math.max(4, Math.min(numBins, Math.round((gmax - gmin) / srcW)));
+
   var bw = (gmax - gmin) / numBins;
   var counts = new Array(numBins).fill(0);
   valid.forEach(function(r) {
@@ -571,9 +762,17 @@ function aggregateHistograms(rows, key, numBins, span) {
     var sbw = (hmax - hmin) / n;
     hist.forEach(function(c, i) {
       if (!c) return;
-      var center = hmin + (i + 0.5) * sbw;
-      var bi = Math.max(0, Math.min(numBins - 1, Math.floor((center - gmin) / bw)));
-      counts[bi] += c;
+      // Spread each source bin across the output bins it overlaps, proportional to the
+      // overlap, instead of dumping it all into the bin holding its centre. Total count
+      // is preserved either way; only this way is the shape preserved too.
+      var lo = hmin + i * sbw, hi = lo + sbw;
+      var b0 = Math.max(0, Math.floor((lo - gmin) / bw));
+      var b1 = Math.min(numBins - 1, Math.floor((hi - gmin) / bw));
+      for (var b = b0; b <= b1; b++) {
+        var blo = gmin + b * bw, bhi = blo + bw;
+        var ov = Math.min(hi, bhi) - Math.max(lo, blo);
+        if (ov > 0) counts[b] += c * ov / sbw;
+      }
     });
   });
   var total = counts.reduce(function(a, b){ return a + b; }, 0);
@@ -921,8 +1120,29 @@ function renderContactCompare(scopeCells, thr, pair, pt) {
   var labels = rows.map(function(o){ return String(o.facet); });
   var shortLabels = shortFacetLabels(labels);
   var facetColors = rows.map(function(o){ return gColor(o.facet); });
-  var xCat = { type:'category', categoryorder:'array', categoryarray:shortLabels,
-               tickangle:-30, automargin:true, tickfont:{size:9} };
+  // A fresh axis object per chart: Plotly takes ownership of the layout object it
+  // is handed, so sharing one across plots lets them mutate each other. Short
+  // labels ("1G", "5G") stay upright — rotation is only for names long enough to
+  // collide with their neighbour.
+  var tiltTicks = shortLabels.some(function(s){ return s.length > 8; });
+  // With more than one facet the legend below names them all, so the categories go
+  // unlabelled rather than repeating eight rotated cell paths under every chart.
+  var showCatTicks = rows.length < 2;
+  function catAxis() {
+    return { type:'category', categoryorder:'array', categoryarray:shortLabels.slice(),
+             showticklabels: showCatTicks, ticks: showCatTicks ? 'outside' : '',
+             tickangle: tiltTicks ? -30 : 0 };
+  }
+  document.getElementById('ct-legend').innerHTML = rows.length < 2 ? '' :
+    rows.map(function(o){
+      return '<span class="d-inline-flex align-items-center gap-1">'
+        + '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+gColor(o.facet)+'"></span>'
+        + o.facet + '</span>';
+    }).join('');
+  // Largest contact group in scope — sets the y tick step below.
+  var maxSize = rows.reduce(function(m,o){ return Math.max(m, o.largest || 0); }, 0);
+  // Keep bars thin: with only two facets the default gap leaves two big slabs.
+  var facetBargap = rows.length <= 2 ? 0.62 : rows.length <= 4 ? 0.5 : 0.34;
   chartsEl.innerHTML = '';
 
   // Chart 1 — contact-group size per facet.
@@ -936,9 +1156,14 @@ function renderContactCompare(scopeCells, thr, pair, pt) {
                hovertemplate:'%{y} instances/group<extra>'+labels[i]+'</extra>' };
     });
     Plotly.newPlot(box, boxTraces,
-      { margin:{l:40,r:10,t:30,b:70}, height:280, font:{size:9},
-        title:{text:'contact-group size, by '+nounS+' (members ≥ 2)', font:{size:11}},
-        xaxis:xCat, yaxis:{title:'instances per group', dtick:1, rangemode:'tozero'} },
+      { margin:{l:40,r:10,t:30,b:70}, height:280, boxgap:facetBargap,
+        title:{text:'contact-group size, by '+nounS+' (members ≥ 2)'},
+        xaxis:catAxis(),
+        // Whole-number ticks, but never one per unit: when granules chain into a
+        // group of 300, dtick:1 draws 300 tick labels on top of each other and the
+        // axis turns into an unreadable black smear.
+        yaxis:{ title:'instances per group', rangemode:'tozero', tickformat:'d',
+                dtick: Math.max(1, Math.ceil(maxSize / 6)) } },
       {responsive:true, displayModeBar:false});
   } else {
     box.innerHTML = '<div class="text-muted small">No contact groups of 2+ at this gap for '+pairName+'.</div>';
@@ -959,9 +1184,9 @@ function renderContactCompare(scopeCells, thr, pair, pt) {
         text: rows.map(function(o){ return o.aTouch+'/'+o.totalA; }), textposition:'outside', cliponaxis:false,
         hovertemplate:'%{y:.1f}% (%{text})<extra>%{customdata}</extra>',
         marker:{color: facetColors} }],
-      { margin:{l:45,r:10,t:46,b:70}, height:280, font:{size:9},
-        title:{text:'% '+tA+' touching another '+tA+', by '+nounS, font:{size:11}},
-        xaxis:xCat, yaxis:{title:'% touching', rangemode:'tozero', ticksuffix:'%'} },
+      { margin:{l:45,r:10,t:46,b:70}, height:280, bargap:facetBargap,
+        title:{text:'% '+tA+' touching another '+tA+', by '+nounS},
+        xaxis:catAxis(), yaxis:{title:'% touching', rangemode:'tozero', ticksuffix:'%'} },
       {responsive:true, displayModeBar:false});
   } else if (tA) {
     barNote.innerHTML = 'Solid = <b>'+tA+'→'+tB+'</b> (share of '+tA+' touching a '+tB+') · hatched = <b>'+tB+'→'+tA+'</b>.';
@@ -976,9 +1201,9 @@ function renderContactCompare(scopeCells, thr, pair, pt) {
         text: rows.map(function(o){ return o.bTouch+'/'+o.totalB; }), textposition:'outside', cliponaxis:false,
         hovertemplate:tB+'→'+tA+': %{y:.1f}% (%{text})<extra>%{customdata}</extra>',
         marker:{color: facetColors, pattern:{shape:'/', size:5, solidity:0.35}} }],
-      { barmode:'group', margin:{l:45,r:10,t:46,b:70}, height:280, font:{size:9}, showlegend:false,
-        title:{text:'% touching, by '+nounS+' — '+tA+' ↔ '+tB, font:{size:11}},
-        xaxis:xCat, yaxis:{title:'% touching', rangemode:'tozero', ticksuffix:'%'} },
+      { barmode:'group', margin:{l:45,r:10,t:46,b:70}, height:280, showlegend:false, bargap:facetBargap,
+        title:{text:'% touching, by '+nounS+' — '+tA+' ↔ '+tB},
+        xaxis:catAxis(), yaxis:{title:'% touching', rangemode:'tozero', ticksuffix:'%'} },
       {responsive:true, displayModeBar:false});
   } else {
     barNote.innerHTML = 'Share of instances that land in a contact group of 2+.';
@@ -987,9 +1212,9 @@ function renderContactCompare(scopeCells, thr, pair, pt) {
         text: rows.map(function(o){ return o.inGroups+'/'+o.instTotal; }), textposition:'outside', cliponaxis:false,
         hovertemplate:'%{y:.1f}% (%{text})<extra>%{customdata}</extra>',
         marker:{color: facetColors} }],
-      { margin:{l:45,r:10,t:46,b:70}, height:280, font:{size:9},
-        title:{text:'% instances grouped, by '+nounS, font:{size:11}},
-        xaxis:xCat, yaxis:{title:'% grouped', rangemode:'tozero', ticksuffix:'%'} },
+      { margin:{l:45,r:10,t:46,b:70}, height:280, bargap:facetBargap,
+        title:{text:'% instances grouped, by '+nounS},
+        xaxis:catAxis(), yaxis:{title:'% grouped', rangemode:'tozero', ticksuffix:'%'} },
       {responsive:true, displayModeBar:false});
   }
 
@@ -1058,7 +1283,7 @@ function renderContactSpan(scopeCells, thr, pair, pt) {
   if (!defY || defY === defX) defY = targets.find(function(c){ return c !== defX; }) || targets[1];
 
   chartsEl.innerHTML = '';
-  var panel = document.createElement('div'); panel.className = 'chart-cell'; panel.style.width = '440px';
+  var panel = document.createElement('div'); panel.className = 'chart-cell'; panel.style.width = '760px';
   chartsEl.appendChild(panel);
   var ctrl = document.createElement('div');
   ctrl.className = 'd-flex flex-wrap gap-2 align-items-center mb-1'; ctrl.style.fontSize = '.7rem';
@@ -1073,7 +1298,7 @@ function renderContactSpan(scopeCells, thr, pair, pt) {
   var yL = document.createElement('span'); yL.textContent = 'y: closest to';
   ctrl.append(xL, xSel, yL, ySel);
   panel.appendChild(ctrl);
-  var plotEl = document.createElement('div'); plotEl.style.cssText = 'width:440px;height:320px';
+  var plotEl = document.createElement('div'); plotEl.style.cssText = 'width:760px;height:340px';
   panel.appendChild(plotEl);
 
   var draw = function() {
@@ -1112,10 +1337,13 @@ function renderContactSpan(scopeCells, thr, pair, pt) {
       return;
     }
     Plotly.newPlot(plotEl, traces, {
-      margin:{l:55,r:10,t:10,b:45}, height:320, font:{size:9},
+      // Legend to the right, not below: these names are long enough that a horizontal
+      // legend wraps to one row per facet and lands on the x-axis title.
+      margin:{l:55, r:250, t:10, b:45}, height:340,
       xaxis:{title:'closest approach to '+distColLabel(cx)+' (µm)', rangemode:'tozero'},
       yaxis:{title:'closest approach to '+distColLabel(cy)+' (µm)', rangemode:'tozero'},
-      showlegend:true, legend:{orientation:'h', y:-0.25, font:{size:8}},
+      showlegend:true,
+      legend:{orientation:'v', x:1.02, xanchor:'left', y:1, yanchor:'top', itemsizing:'constant'},
     }, {responsive:true, displayModeBar:false});
   };
   xSel.onchange = draw; ySel.onchange = draw;
@@ -1143,8 +1371,7 @@ function renderOverview() {
   var nonSource = colDefs.filter(function(c){ return c.kind !== 'source'; });
 
   var badges = nonSource.map(function(c){
-    var cls = c.kind==='mask' ? 'bg-info text-dark' : 'bg-primary';
-    return '<span class="badge rounded-pill '+cls+'">'+c.name+'</span>';
+    return '<span class="cs-chip cs-chip-'+c.kind+'">'+c.name+'</span>';
   }).join('');
   document.getElementById('overview-cards').innerHTML =
     '<div class="card-metric"><div class="big">'+(allCells.length||1)+'</div><div class="lbl">Cells</div></div>'
@@ -1165,8 +1392,8 @@ function renderOverview() {
     + (hasGroups ? '<th>group</th>' : '')
     + '<th>cell</th>'
     + nonSource.map(function(c){
-        var cls = c.kind==='mask' ? 'bg-info text-dark' : 'bg-primary';
-        return '<th class="text-center">'+c.name+'<br><span class="badge rounded-pill '+cls+'" style="font-size:.6rem">'+c.kind+'</span></th>';
+        return '<th class="text-center">'+c.name
+          + '<br><span class="cs-chip-kind">'+c.kind+'</span></th>';
       }).join('')
     + '</tr>';
   var tbody = rowCells.map(function(cid){
@@ -1177,7 +1404,7 @@ function renderOverview() {
       + '<td>'+(cid||'(no cell)')+'</td>'
       + nonSource.map(function(c){
           var r = presenceMap[cid+'|'+c.name];
-          if (!r) return '<td class="text-center" style="background:#f8d7da;color:#842029" title="'+c.name+' not found for '+(cid||'this cell')+'">missing</td>';
+          if (!r) return '<td class="text-center cs-missing" title="'+c.name+' not found for '+(cid||'this cell')+'">missing</td>';
           if (c.kind==='mask') return '<td class="text-center">✓</td>';
           var n = r.instance_count;
           return '<td class="text-center">'+(n!=null?(+n).toLocaleString():'–')+'</td>';
@@ -1185,7 +1412,7 @@ function renderOverview() {
       + '</tr>';
   }).join('');
   document.getElementById('overview-table-wrap').innerHTML =
-    '<div style="overflow-x:auto"><table class="table table-sm table-hover mb-0">'
+    '<div class="table-wrap"><table class="table table-sm table-hover mb-0">'
     + '<thead class="table-light">'+thead+'</thead>'
     + '<tbody>'+tbody+'</tbody></table></div>';
 
@@ -1203,10 +1430,10 @@ function renderOverview() {
     return '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+color+'"></span>';
   }
   if (byGroup) {
-    volContainer.insertAdjacentHTML('beforeend', '<div class="mb-2 d-flex flex-wrap gap-3" style="font-size:.72rem;color:#555">'
+    volContainer.insertAdjacentHTML('beforeend', '<div class="chart-legend">'
       + ovGroups.map(function(g){ return '<span class="d-inline-flex align-items-center gap-1">'+legendDot(groupColor(g))+g+'</span>'; }).join('') + '</div>');
   } else if (allCells.length > 1) {
-    volContainer.insertAdjacentHTML('beforeend', '<div class="mb-2 d-flex flex-wrap gap-3" style="font-size:.72rem;color:#555">'
+    volContainer.insertAdjacentHTML('beforeend', '<div class="chart-legend">'
       + allCells.map(function(c){ return '<span class="d-inline-flex align-items-center gap-1">'+legendDot(cellColor(c))+c+'</span>'; }).join('') + '</div>');
   }
 
@@ -1226,7 +1453,11 @@ function renderOverview() {
     row.appendChild(panel);
 
     var traces, layout;
-    var axisStyle = {title:{text:'volume (μm³)', font:{size:9}}, tickfont:{size:8}};
+    var volAxis = { title:'volume (μm³)' };
+    // The colour legend above the row already names every cell/group, and it is shared by all
+    // five charts — repeating the names as (truncated, rotated) ticks under each one just eats
+    // vertical space. Bars stay identifiable by colour, with the full name on hover.
+    var noTicks = {showticklabels:false, ticks:'', fixedrange:true};
     if (byGroup) {
       var ovShort = shortFacetLabels(ovGroups);
       traces = ovGroups.map(function(g, gi){
@@ -1235,8 +1466,8 @@ function renderOverview() {
         return { type:'box', name:ovShort[gi], x:ys.map(function(){ return ovShort[gi]; }), y:ys, marker:{color:groupColor(g)},
                  boxpoints:'all', jitter:0.4, pointpos:0, showlegend:false, hovertemplate:'%{y:.3g}<extra>'+g+'</extra>' };
       });
-      layout = { margin:{l:48,r:8,t:6,b:34}, height:190, font:{size:9},
-        xaxis:{tickfont:{size:8}, automargin:true}, yaxis:axisStyle, showlegend:false };
+      layout = { margin:{l:48,r:8,t:6,b:10}, height:190,
+        xaxis:noTicks, yaxis:volAxis, showlegend:false };
     } else if (allCells.length > 1) {
       var cellShort = shortFacetLabels(allCells);
       traces = [{ type:'bar', x:cellShort, customdata:allCells, marker:{color:allCells.map(cellColor)}, showlegend:false,
@@ -1244,14 +1475,14 @@ function renderOverview() {
           var r = fileRows.find(function(r){ return r.cell_id===c && r.entity_name===e; });
           return r && r.total_volume_um3 != null ? r.total_volume_um3 : 0;
         }), hovertemplate:'%{customdata}: %{y:.3g}<extra></extra>' }];
-      layout = { margin:{l:48,r:8,t:6,b:34}, height:190, font:{size:9},
-        xaxis:{tickfont:{size:8}, automargin:true}, yaxis:axisStyle, showlegend:false };
+      layout = { margin:{l:48,r:8,t:6,b:10}, height:190,
+        xaxis:noTicks, yaxis:volAxis, showlegend:false };
     } else {
       var r = fileRows.find(function(r){ return r.entity_name===e; });
       traces = [{ type:'bar', x:[''], marker:{color:entColor(e)}, showlegend:false,
         y:[r && r.total_volume_um3 != null ? r.total_volume_um3 : 0] }];
-      layout = { margin:{l:48,r:8,t:6,b:18}, height:190, font:{size:9},
-        xaxis:{visible:false}, yaxis:axisStyle, showlegend:false };
+      layout = { margin:{l:48,r:8,t:6,b:18}, height:190,
+        xaxis:{visible:false}, yaxis:volAxis, showlegend:false };
     }
     Plotly.newPlot(plotEl, traces, layout, {responsive:true, displayModeBar:false});
   });
@@ -1268,8 +1499,7 @@ function renderStructure() {
     .map(function(r){
       var sz = r.file_size_bytes ? (r.file_size_bytes/1e6).toFixed(2)+' MB' : '';
       var mt = r.file_mtime ? r.file_mtime.slice(0,16).replace('T',' ') : '';
-      var kindMap = {source:'bg-secondary', mask:'bg-info text-dark', label:'bg-primary'};
-      var badge = '<span class="badge '+(kindMap[r.entity_kind]||'bg-light text-dark')+' rounded-pill">'+r.entity_kind+'</span>';
+      var badge = '<span class="cs-chip cs-chip-'+(r.entity_kind||'')+'">'+r.entity_kind+'</span>';
       var grpDot = r.group_id ? '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+groupColor(r.group_id)+';margin-right:4px;flex-shrink:0"></span>' : '';
       return '<tr><td style="display:flex;align-items:center">'+grpDot+(r.cell_id||'')+'</td><td>'+r.entity_name+'</td><td>'+badge+'</td>'
         +'<td class="text-end">'+(r.instance_count!=null?r.instance_count.toLocaleString():'')+'</td>'
@@ -1300,7 +1530,20 @@ function renderEntityStats() {
   var _shortG = {};
   shortFacetLabels(allGroups).forEach(function(s, i){ _shortG[allGroups[i]] = s; });
   function gShort(g){ return _shortG[g] != null ? _shortG[g] : String(g); }
-  var xTick = { automargin:true, tickfont:{size:8} };
+  function xTick() { return { automargin:true }; }
+  // The facet (cell or group) is identical across every chart in a block, so name it
+  // ONCE in a legend at the top instead of under each small multiple: as rotated tick
+  // labels these long shared paths cost more height than the plots themselves.
+  function facetLegend() {
+    if (!multiGroup) return '';
+    return '<div class="chart-legend">' + allGroups.map(function(g){
+      return '<span class="d-inline-flex align-items-center gap-1">'
+        + '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+gColor(g)+'"></span>'
+        + g + '</span>';
+    }).join('') + '</div>';
+  }
+  // Facet charts drop their tick labels only when that legend is there to replace them.
+  function facetAxis() { return multiGroup ? { showticklabels:false, ticks:'' } : { automargin:true }; }
 
   var allLabelFileRows = ALL.filter(function(r){ return r.row_type==='file' && r.entity_kind==='label'; });
   var singleLabelEnts = new Set(
@@ -1343,8 +1586,9 @@ function renderEntityStats() {
     var block = document.createElement('div');
     block.className = 'entity-block';
     block.style.borderLeftColor = color;
-    var badge = '<span class="badge bg-primary rounded-pill" style="font-size:.65rem">label</span>';
+    var badge = '<span class="cs-chip cs-chip-label">label</span>';
     block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
+      +facetLegend()
       +'<div class="subsection-label">How big and what shape is each '+ent+'?</div>'
       +'<p class="subsection-desc">One box per '+(multiGroup?(plotGroupBy==='group'?'group':'cell'):ent)+'. The box is the middle 50% of instances, the line the median, dots individual '+ent+'s.</p>'
       +'<div class="charts-row mb-3" id="mc-'+ent+'"></div>'
@@ -1394,10 +1638,10 @@ function renderEntityStats() {
           y: valid.map(function(r){ return r[metric]; }) }];
       }
       Plotly.newPlot(el, traces, {
-        margin:{l:50,r:5,t:28,b:50}, height:230, font:{size:9},
+        margin:{l:50,r:5,t:28,b:50}, height:230,
         showlegend: false,
-        title:{text:axisColLabel(metric), font:{size:10}},
-        xaxis:xTick, yaxis:{title:axisColUnit(metric)||null},
+        title:{text:axisColLabel(metric)},
+        xaxis:facetAxis(), yaxis:{title:axisColUnit(metric)||null},
       }, {responsive:true, displayModeBar:false});
     });
 
@@ -1451,8 +1695,8 @@ function renderEntityStats() {
           }
         }
         Plotly.newPlot(el, traces, {
-          barmode:'group', margin:{l:50,r:5,t:28,b:40}, height:230, font:{size:9},
-          title:{text:lbl, font:{size:10}}, xaxis:xTick, yaxis:{title:'μm'},
+          barmode:'group', margin:{l:50,r:5,t:28,b:40}, height:230,
+          title:{text:lbl}, xaxis:facetAxis(), yaxis:{title:'μm'},
           showlegend:false,
         }, {responsive:true, displayModeBar:false});
       });
@@ -1521,10 +1765,12 @@ function renderEntityStats() {
         }
         if (!traces.length) { Plotly.purge(d2plot); return; }
         Plotly.newPlot(d2plot, traces, {
-          margin:{l:55,r:10,t:10,b:45}, height:300, font:{size:9},
+          margin:{l:55,r:10,t:10,b:45}, height:300,
           xaxis:{title:lblX+' (μm)', rangemode:'tozero'},
           yaxis:{title:lblY+' (μm)', rangemode:'tozero'},
-          showlegend:multiGroup, legend:{orientation:'h', y:-0.28, font:{size:8}},
+          // Identity is in the block's shared legend; a per-chart one would repeat it
+          // and, with eight long cell names, collide with the x-axis title.
+          showlegend:false,
         }, {responsive:true, displayModeBar:false});
       };
       xSel2.onchange = drawD2; ySel2.onchange = drawD2;
@@ -1556,7 +1802,7 @@ function renderEntityStats() {
             traces.push({
               type:'scatter', mode:'lines', name:gShort(g),
               x:agg.centers, y:agg.density,
-              line:{color:gColor(g), width:2, shape:'spline'},
+              line:{color:gColor(g), width:2, shape:'hv'},
               hovertemplate:'%{x:.2f} μm: %{y:.4f}<extra>'+g+'</extra>',
             });
           });
@@ -1566,8 +1812,8 @@ function renderEntityStats() {
             traces.push({
               type:'scatter', mode:'lines', name:ent, fill:'tozeroy',
               x:agg.centers, y:agg.density,
-              line:{color:color, width:2, shape:'spline'},
-              fillcolor: chroma(color).alpha(0.25).css(),
+              line:{color:color, width:2, shape:'hv'},
+              fillcolor: withAlpha(color, 0.22),
               hovertemplate:'%{x:.2f} μm: %{y:.4f}<extra></extra>',
             });
           }
@@ -1575,12 +1821,11 @@ function renderEntityStats() {
 
         if (!traces.length) return;
         Plotly.newPlot(el, traces, {
-          margin:{l:50,r:5,t:30,b:50}, height:270, font:{size:9},
-          title:{text:'proximity of '+ent+' to '+lbl+' (all voxels)', font:{size:10}},
+          margin:{l:50,r:5,t:30,b:50}, height:270,
+          title:{text:'proximity of '+ent+' to '+lbl+' (all voxels)'},
           xaxis:{title:'distance to '+lbl+' (μm)', rangemode:'tozero'},
           yaxis:{title:'voxel density', rangemode:'tozero'},
-          showlegend:multiGroup,
-          legend:{orientation:'h', y:-0.3, font:{size:8}},
+          showlegend:false,   // facets are named by the block's shared legend
         }, {responsive:true, displayModeBar:false});
       });
     }
@@ -1625,12 +1870,19 @@ function renderEntityStats() {
       var plotEl = document.createElement('div');
       plotEl.style.cssText = 'width:380px;height:280px';
       wrap.appendChild(plotEl);
+      // Per-facet fit quality goes here rather than into the chart legend: as legend
+      // entries these lines wrap one-per-row over the x-axis title, and as text they
+      // stay readable and selectable.
+      var fitEl = document.createElement('div');
+      fitEl.className = 'fit-note';
+      wrap.appendChild(fitEl);
 
       function drawCorr() {
         var colX = xSel.value, colY = ySel.value;
         var lblX = axisColTitle(colX), lblY = axisColTitle(colY);
         var traces = [];
         var subtitle = '';
+        var fits = [];
 
         if (multiGroup) {
           allGroups.forEach(function(g) {
@@ -1642,9 +1894,9 @@ function renderEntityStats() {
             });
             if (!xs.length) return;
             var rr = pearsonR(xs, ys);
-            var nameWithR2 = gShort(g) + (rr!=null ? ' (R²='+(rr*rr).toFixed(2)+', n='+xs.length+')' : ' (n='+xs.length+')');
+            fits.push({ facet:g, r2: rr!=null ? (rr*rr) : null, n: xs.length });
             traces.push({
-              type:'scatter', mode:'markers', name:nameWithR2,
+              type:'scatter', mode:'markers', name:gShort(g),
               x:xs, y:ys,
               marker:{color:gColor(g), size:5, opacity:0.6},
               hovertemplate:lblX+': %{x:.3g}<br>'+lblY+': %{y:.3g}<extra>'+g+'</extra>',
@@ -1688,14 +1940,21 @@ function renderEntityStats() {
           }
         }
 
+        fitEl.innerHTML = fits.length
+          ? '<span class="fit-note-lbl">fit per '+(plotGroupBy==='group'?'group':'cell')+'</span>'
+            + fits.map(function(f){
+                return '<span class="fit-note-item"><span class="fit-dot" style="background:'+gColor(f.facet)+'"></span>'
+                  + gShort(f.facet) + ' <b>R²&nbsp;' + (f.r2!=null ? f.r2.toFixed(2) : '–')
+                  + '</b> <span class="text-muted">n=' + f.n + '</span></span>';
+              }).join('')
+          : '';
         if (!traces.length) { Plotly.purge(plotEl); return; }
         Plotly.newPlot(plotEl, traces, {
-          margin:{l:55,r:5,t:30,b:50}, height:280, font:{size:9},
-          title:{text:lblY+' vs '+lblX+subtitle, font:{size:10}},
+          margin:{l:55, r:5, t:30, b:50}, height:280,
+          title:{text:lblY+' vs '+lblX+subtitle},
           xaxis:{title:lblX},
           yaxis:{title:lblY},
-          showlegend:multiGroup,
-          legend:{orientation:'h', y:-0.32, font:{size:8}},
+          showlegend:false,   // facets are named by the block's shared legend
         }, {responsive:true, displayModeBar:false});
       }
 
@@ -1711,8 +1970,9 @@ function renderEntityStats() {
     var color = entColor(ent);
     var block = document.createElement('div');
     block.className = 'entity-block'; block.style.borderLeftColor = color;
-    var badge = '<span class="badge bg-info text-dark rounded-pill" style="font-size:.65rem">mask</span>';
+    var badge = '<span class="cs-chip cs-chip-mask">mask</span>';
     block.innerHTML = '<div class="entity-title"><span>'+ent+'</span>'+badge+'</div>'
+      +facetLegend()
       +'<div class="subsection-label">Shape &amp; size (whole structure)</div>'
       +'<div class="charts-row" id="mk-'+ent+'"></div>';
     container.appendChild(block);
@@ -1741,15 +2001,15 @@ function renderEntityStats() {
                    boxpoints:'all', jitter:0.4, pointpos:0, hovertemplate:'%{y:.3g}<extra>'+g+'</extra>' };
         });
         layout = { margin:{l:70,r:10,t:28,b:40}, height:230,
-          title:{text:m.label, font:{size:10}},
-          xaxis:xTick, yaxis:{title:m.unit||null}, showlegend:false };
+          title:{text:m.label},
+          xaxis:facetAxis(), yaxis:{title:m.unit||null}, showlegend:false };
       } else {
         var vx = mRows.map(function(r){ return r[gKey]||'?'; });
         traces = [{ type:'bar', x:vx.map(gShort), customdata:vx, y:mRows.map(function(r){ return r[m.col]!=null?+r[m.col]:null; }),
           marker:{color:vx.map(gColor)}, hovertemplate:'%{customdata}: %{y:.3g}<extra></extra>' }];
         layout = { margin:{l:70,r:10,t:28,b:60}, height:220,
-          title:{text:m.label, font:{size:10}},
-          xaxis:xTick, yaxis:{title:m.unit||null}, showlegend:false };
+          title:{text:m.label},
+          xaxis:facetAxis(), yaxis:{title:m.unit||null}, showlegend:false };
       }
       Plotly.newPlot(el, traces, layout, {responsive:true, displayModeBar:false});
     });
