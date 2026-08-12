@@ -1247,6 +1247,28 @@ def compute_contacts(
     return pd.DataFrame(rows)
 
 
+def contacts_to_rows(contacts: pd.DataFrame, cell_id: str, group_id: str) -> list[dict]:
+    """Convert a contacts edge list into report rows tagged ``row_type='contact'``.
+
+    The pairwise edge list rides inside report.csv/parquet as extra rows rather
+    than a separate report_contacts file, so a single report loads everything.
+    The viewers split these rows back out on load (row_type == 'contact').
+    """
+    rows = []
+    for rec in contacts.to_dict("records"):
+        rows.append({
+            "cell_id": cell_id,
+            "group_id": group_id,
+            "row_type": "contact",
+            "entity_a": rec["entity_a"],
+            "label_a": rec["label_a"],
+            "entity_b": rec["entity_b"],
+            "label_b": rec["label_b"],
+            "gap_um": rec["gap_um"],
+        })
+    return rows
+
+
 def collect_cell_dirs(root: Path) -> list[tuple[Path, str]]:
     """Return (cell_dir, group_name) pairs, supporting up to two levels of nesting.
 
@@ -1349,17 +1371,14 @@ def run_single_cell(args: argparse.Namespace, cell_dir: Path, out_dir: Path, gro
         generated_masks_dir=out_dir / "masks_for_analysis",
         cell_center_zyx_um=cell_center_zyx_um,
     )
-    write_report_csv(report_csv, rows)
-
     if args.with_contacts:
         print(f"Computing instance contacts (≤{args.contact_max_um} µm)...", flush=True)
         contacts = compute_contacts(volumes, dataset.entities, label_keys, mask_keys,
                                     voxel_size_zyx, args.contact_max_um)
-        contacts.insert(0, "cell_id", cell_dir.name)
-        contacts.insert(1, "group_id", group_id)
-        contacts_path = out_dir / "report_contacts.csv"
-        contacts.to_csv(contacts_path, index=False)
-        print(f"Wrote {contacts_path.name} ({len(contacts)} contacts)", flush=True)
+        rows.extend(contacts_to_rows(contacts, cell_dir.name, group_id))
+        print(f"Embedded {len(contacts)} contacts as row_type='contact' in the report", flush=True)
+
+    write_report_csv(report_csv, rows)
 
     print("Cell analysis complete.", flush=True)
 
@@ -1386,22 +1405,17 @@ def main() -> None:
         run_single_cell(args, cell_dir, out_dir, group_id=group_id)
 
     if batch:
-        # Joint stats — concatenate per-cell report.csv into a single parquet (no b64, safe to load in browser)
+        # Joint stats — concatenate per-cell report.csv into a single parquet (no b64, safe to
+        # load in browser). Contact edges ride along as row_type='contact' rows, so this one
+        # parquet carries the contacts too — no separate report_contacts file.
         dfs = [pd.read_csv(od / "report.csv") for od in out_dirs if (od / "report.csv").exists()]
         if dfs:
             joint = pd.concat(dfs, ignore_index=True)
             joint_path = args.out_dir / "report.parquet"
             joint.to_parquet(joint_path, index=False)
             kb = joint_path.stat().st_size // 1024
-            print(f"Joint report.parquet: {len(joint)} rows, {kb} KB → {joint_path}", flush=True)
-
-        if args.with_contacts:
-            cdfs = [pd.read_csv(od / "report_contacts.csv") for od in out_dirs if (od / "report_contacts.csv").exists()]
-            if cdfs:
-                cjoint = pd.concat(cdfs, ignore_index=True)
-                cpath = args.out_dir / "report_contacts.parquet"
-                cjoint.to_parquet(cpath, index=False)
-                print(f"Joint report_contacts.parquet: {len(cjoint)} rows → {cpath}", flush=True)
+            n_contacts = int((joint.get("row_type") == "contact").sum()) if "row_type" in joint else 0
+            print(f"Joint report.parquet: {len(joint)} rows ({n_contacts} contacts), {kb} KB → {joint_path}", flush=True)
 
     print("Done.", flush=True)
     print("  Stats viewer  → open stats_viewer.html, load report.csv (single cell) or report.parquet (joint)", flush=True)

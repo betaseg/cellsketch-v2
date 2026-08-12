@@ -185,6 +185,12 @@ body { font-size: .82rem; background: #fff; margin: 0; display: flex; flex-direc
       <div class="charts-row" id="ct-compare-charts"></div>
       <div id="ct-compare-table" style="overflow-x:auto" class="mt-2"></div>
     </div>
+
+    <div id="ct-span-wrap" class="d-none">
+      <div class="subsection-label mt-3">Does a contact group reach two structures at once?</div>
+      <p class="subsection-desc" id="ct-span-desc"></p>
+      <div class="charts-row" id="ct-span-charts"></div>
+    </div>
   </div>
 
 </div><!-- /main -->
@@ -714,6 +720,29 @@ function contactGroupSizes(cid, thr, pairFilter, instRows) {
   return { multiSizes: multi, singletons: singles, instCount: Object.keys(parent).length };
 }
 
+// Same union-find as contactGroupSizes, but returns the member keys ('entity|label') of each
+// multi-member (≥2) contact group so callers can inspect the instances that make up a group.
+function contactGroupMembers(cid, thr, pairFilter, instRows) {
+  var parent = {};
+  function find(x){ while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+  function ensure(k){ if (!(k in parent)) parent[k] = k; }
+  function key(e, l){ return e + '|' + l; }
+  instRows.forEach(function(r){ ensure(key(r.entity_name, r.label_id)); });
+  CONTACTS.forEach(function(e){
+    if (cid !== undefined && e.cell_id !== cid) return;
+    if (e.gap_um == null || e.gap_um > thr) return;
+    if (pairFilter === 'same' && e.entity_a !== e.entity_b) return;
+    if (pairFilter && pairFilter !== 'same'
+        && [e.entity_a, e.entity_b].sort().join(' ↔ ') !== pairFilter) return;
+    var ka = key(e.entity_a, e.label_a), kb = key(e.entity_b, e.label_b);
+    ensure(ka); ensure(kb);
+    parent[find(ka)] = find(kb);
+  });
+  var groups = {};
+  Object.keys(parent).forEach(function(k){ var r = find(k); (groups[r] = groups[r] || []).push(k); });
+  return Object.keys(groups).map(function(r){ return groups[r]; }).filter(function(m){ return m.length > 1; });
+}
+
 var _ctInited = false;
 function initContactsControls() {
   var pairSel = document.getElementById('ct-pair');
@@ -814,6 +843,7 @@ function renderContacts() {
     'gap ≤ ' + fmtGap(thr) + ' µm · ' + (nCells || 1) + ' cell(s) in scope';
 
   renderContactCompare(scopeCells, thr, pair, pt);
+  renderContactSpan(scopeCells, thr, pair, pt);
 }
 
 // The core view: break the SELECTED contact pair down by cell or cell-group (following the
@@ -992,6 +1022,104 @@ function renderContactCompare(scopeCells, thr, pair, pt) {
   tableEl.innerHTML = '<table class="table table-sm table-hover mb-0" style="min-width:420px">'
     + '<thead class="table-light">'+thead+'</thead><tbody>'+tbody+'</tbody></table>'
     + (pt ? '' : '<div class="text-muted small mt-1">Pick a specific <b>Touching pair</b> above to focus on one structure pair.</div>');
+}
+
+// "Does a contact group bridge two structures?" — one dot per contact group of the selected
+// pair, positioned at its CLOSEST approach to two chosen structures (the nearest any member
+// gets). Bottom-left = the group reaches both. Dot size = group size, colour = cell/group.
+function renderContactSpan(scopeCells, thr, pair, pt) {
+  var wrap = document.getElementById('ct-span-wrap');
+  var chartsEl = document.getElementById('ct-span-charts');
+
+  // Available closest-point distance targets across the pair's instances in scope.
+  var allPairRows = [];
+  scopeCells.forEach(function(cid){ if (cid !== undefined) allPairRows = allPairRows.concat(instRowsForPair(cid, pt)); });
+  var targets = distCols(allPairRows);
+  if (targets.length < 2) { wrap.classList.add('d-none'); return; }
+  wrap.classList.remove('d-none');
+
+  var mode = plotGroupBy === 'group' ? 'group' : 'cell';
+  var nounS = mode === 'group' ? 'group' : 'cell';
+  var cellFacet = {};
+  ALL.forEach(function(r){
+    if (r.cell_id == null) return;
+    cellFacet[r.cell_id] = mode === 'group' ? (r.group_id != null ? r.group_id : '(no group)') : r.cell_id;
+  });
+  var facetVals = uniq(scopeCells.filter(function(c){ return c !== undefined; }).map(function(c){ return cellFacet[c] != null ? cellFacet[c] : c; }));
+  var shortArr = shortFacetLabels(facetVals);
+  var facetShort = {}; facetVals.forEach(function(f,i){ facetShort[f] = shortArr[i]; });
+
+  document.getElementById('ct-span-desc').innerHTML =
+    'Each dot is one contact group at the current gap (members chained by the selected pair\'s contacts). Its position is the group\'s <b>closest approach</b> to each structure — the nearest any member gets. <b>Bottom-left = the group reaches both.</b> Dot size grows with the number of instances in the group; colour marks the ' + nounS + '.';
+
+  var pick = function(re){ return targets.find(function(c){ return re.test(c); }); };
+  var defX = pick(/membrane|plasma|(^|_)pm(_|$)/i) || targets[0];
+  var defY = pick(/nucl/i);
+  if (!defY || defY === defX) defY = targets.find(function(c){ return c !== defX; }) || targets[1];
+
+  chartsEl.innerHTML = '';
+  var panel = document.createElement('div'); panel.className = 'chart-cell'; panel.style.width = '440px';
+  chartsEl.appendChild(panel);
+  var ctrl = document.createElement('div');
+  ctrl.className = 'd-flex flex-wrap gap-2 align-items-center mb-1'; ctrl.style.fontSize = '.7rem';
+  var xSel = document.createElement('select'), ySel = document.createElement('select');
+  xSel.className = ySel.className = 'form-select form-select-sm';
+  xSel.style.cssText = ySel.style.cssText = 'width:auto;font-size:.7rem';
+  targets.forEach(function(c){
+    xSel.innerHTML += '<option value="'+c+'"'+(c===defX?' selected':'')+'>'+distColLabel(c)+'</option>';
+    ySel.innerHTML += '<option value="'+c+'"'+(c===defY?' selected':'')+'>'+distColLabel(c)+'</option>';
+  });
+  var xL = document.createElement('span'); xL.textContent = 'x: closest to';
+  var yL = document.createElement('span'); yL.textContent = 'y: closest to';
+  ctrl.append(xL, xSel, yL, ySel);
+  panel.appendChild(ctrl);
+  var plotEl = document.createElement('div'); plotEl.style.cssText = 'width:440px;height:320px';
+  panel.appendChild(plotEl);
+
+  var draw = function() {
+    var cx = xSel.value, cy = ySel.value;
+    var byFacet = {};
+    scopeCells.forEach(function(cid){
+      if (cid === undefined) return;
+      var instRows = instRowsForPair(cid, pt);
+      var rowByKey = {}; instRows.forEach(function(r){ rowByKey[r.entity_name + '|' + r.label_id] = r; });
+      var facet = cellFacet[cid] != null ? cellFacet[cid] : cid;
+      contactGroupMembers(cid, thr, pair, instRows).forEach(function(mem){
+        var minX = Infinity, minY = Infinity;
+        mem.forEach(function(k){
+          var r = rowByKey[k]; if (!r) return;
+          if (r[cx] != null && isFinite(r[cx])) minX = Math.min(minX, r[cx]);
+          if (r[cy] != null && isFinite(r[cy])) minY = Math.min(minY, r[cy]);
+        });
+        if (isFinite(minX) && isFinite(minY)) {
+          (byFacet[facet] = byFacet[facet] || []).push({ x: minX, y: minY, n: mem.length, cell: cid });
+        }
+      });
+    });
+    var traces = Object.keys(byFacet).sort(function(a,b){ return String(a).localeCompare(String(b), undefined, {numeric:true}); })
+      .map(function(f){
+        var pts = byFacet[f];
+        return { type:'scatter', mode:'markers', name:(facetShort[f]||f)+' (n='+pts.length+')',
+          x:pts.map(function(p){ return p.x; }), y:pts.map(function(p){ return p.y; }),
+          customdata:pts.map(function(p){ return [p.n, p.cell]; }),
+          marker:{ color:gColor(f), opacity:0.6, line:{width:0.5, color:'#fff'},
+                   size:pts.map(function(p){ return Math.min(6 + (p.n - 2) * 3, 26); }) },
+          hovertemplate:distColLabel(cx)+': %{x:.3g} µm<br>'+distColLabel(cy)+': %{y:.3g} µm<br>%{customdata[0]} instances · %{customdata[1]}<extra></extra>' };
+      });
+    if (!traces.length) {
+      Plotly.purge(plotEl);
+      plotEl.innerHTML = '<div class="text-muted small">No contact groups of 2+ at this gap for the selected pair.</div>';
+      return;
+    }
+    Plotly.newPlot(plotEl, traces, {
+      margin:{l:55,r:10,t:10,b:45}, height:320, font:{size:9},
+      xaxis:{title:'closest approach to '+distColLabel(cx)+' (µm)', rangemode:'tozero'},
+      yaxis:{title:'closest approach to '+distColLabel(cy)+' (µm)', rangemode:'tozero'},
+      showlegend:true, legend:{orientation:'h', y:-0.25, font:{size:8}},
+    }, {responsive:true, displayModeBar:false});
+  };
+  xSel.onchange = draw; ySel.onchange = draw;
+  draw();
 }
 
 // ══════════════════════════════════════════════════════════════

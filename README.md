@@ -46,8 +46,8 @@ For each detected cell, the script:
 4. Builds/uses distance-transform cache in `.dt_cache`.
 5. Computes file-level and instance-level morphology + distance metrics.
 6. Writes per-cell `report.csv` and (if `--with-mesh`) `report_meshes.csv`.
-7. If `--with-contacts`, writes per-cell `report_contacts.csv` (pairwise instance gaps ≤ `--contact-max-um`).
-8. In batch mode, also writes a joint `report.parquet` (and joint `report_contacts.parquet` when `--with-contacts`) at the root of `--out-dir`.
+7. If `--with-contacts`, computes pairwise instance gaps (≤ `--contact-max-um`) and embeds them **inside** `report.csv`/`report.parquet` as `row_type = contact` rows (no separate file).
+8. In batch mode, also writes a joint `report.parquet` at the root of `--out-dir` (contacts included).
 
 ## Input data layout options
 
@@ -109,13 +109,11 @@ Output tree:
 
 ```text
 <OUTPUT_ROOT>/
-  report.parquet             # batch mode only — joint report across all cells
-  report_contacts.parquet    # batch mode + --with-contacts — joint contact edge list
+  report.parquet             # batch mode only — joint report across all cells (contacts included)
   <group>/<cell>/            # grouped mode
   <cell>/                    # flat mode
-    report.csv
+    report.csv               # contacts included as row_type=contact (with --with-contacts)
     report_meshes.csv        # only when --with-mesh
-    report_contacts.csv      # only when --with-contacts
     masks_for_analysis/
     .dt_cache/
 ```
@@ -124,6 +122,7 @@ Row types (in `report.csv` / `report.parquet`):
 
 - `row_type = file`: one row per entity file per cell (entity summary metrics)
 - `row_type = instance`: one row per labeled object (instance metrics + distances)
+- `row_type = contact`: one row per pair of instances within `--contact-max-um` (only with `--with-contacts`)
 
 Important columns:
 
@@ -134,11 +133,12 @@ Important columns:
 - mesh payload: `mesh_b64` (only in `report_meshes.csv`)
 - skeleton payload: `skeleton_b64` (only in `report_meshes.csv`) — per-instance skeleton as line segments, overlaid on the mesh in `mesh_viewer.html`
 
-`report_contacts.csv` / `report_contacts.parquet` (only with `--with-contacts`) is a separate
-edge list — one row per pair of instances within `--contact-max-um` of each other:
-`cell_id, group_id, entity_a, label_a, entity_b, label_b, gap_um` (surface-to-surface gap; 0 =
-touching, `label` is null for whole-structure masks). The plasma membrane is excluded (its
-proximity is already `distance_to_membrane_um`). The viewers threshold this list interactively.
+`row_type = contact` rows (only with `--with-contacts`) are an embedded edge list — one row per
+pair of instances within `--contact-max-um` of each other, using the contact-only columns
+`entity_a, label_a, entity_b, label_b, gap_um` (plus `cell_id, group_id`). `gap_um` is the
+surface-to-surface gap (0 = touching); `label` is null for whole-structure masks. The plasma
+membrane is excluded (its proximity is already `distance_to_membrane_um`). The viewers split these
+rows out on load and threshold them interactively.
 
 ## Viewers and how to use them
 
@@ -147,14 +147,14 @@ Live hosted viewers: [https://betaseg.github.io/cellsketch-v2/](https://betaseg.
 - `stats_viewer.html` (multi-cell stats):
   - load: drag/drop a joint `report.parquet` (batch mode) or a per-cell `report.csv`
   - use for: overview plots, component distributions, table + filtering by group/cell/entity
-  - contacts: click **🔗 Contacts** to also load a `report_contacts` file — adds a "Contacts & Groups" section with a pair selector + gap-threshold slider showing group counts/sizes and a touch-count table (all recomputed live, no reprocessing)
+  - contacts: when the report was built with `--with-contacts`, a "Contacts & Groups" section appears automatically (a pair selector + gap-threshold slider showing group counts/sizes and a touch-count table, all recomputed live). It also **compares across cells or cell-groups** — following the **Group plots by** control — with per-facet group-size box plots, a per-pair touch-fraction bar chart (e.g. does ER touch granules more in group 1 vs 2), and a comparison table.
 
 - `mesh_viewer.html` (single-cell 3D):
   - load: drag/drop a per-cell `report_meshes.csv`
   - requirement: analysis must be run with `--with-mesh`
   - use for: interactive 3D meshes and per-instance inspection
   - click any instance to open it in 3D; when a `skeleton_b64` is present the skeleton is drawn as an overlay with the mesh shown semi-transparent around it (toggle the skeleton and adjust mesh opacity in the modal header)
-  - contacts: click **🔗 Contacts** to load a `report_contacts` file, then choose **Color by → Contact group** with a pair selector + gap-threshold slider to colour instances by their touching cluster
+  - contacts: when the report was built with `--with-contacts`, choose **Color by → Contact group** with a pair selector + gap-threshold slider to colour instances by their touching cluster
 
 ## Blender
 
