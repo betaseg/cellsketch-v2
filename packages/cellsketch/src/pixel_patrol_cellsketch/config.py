@@ -14,6 +14,8 @@ once per worker process. Every value has the same default as the corresponding
                                   PixelPatrol already runs cells in parallel
                                   (0 = all cores)
     CELLSKETCH_CONTACT_MAX_UM     largest instance-pair gap recorded, in µm
+    CELLSKETCH_POLARITY_SPREAD    1 -> per-instance angular spread on the polarity sphere
+    CELLSKETCH_DISTANCE_HISTOGRAMS  1 -> per-instance distance distributions, not just minima
 """
 
 from __future__ import annotations
@@ -72,6 +74,10 @@ class CellSketchConfig:
     # failed attempt per cell before it falls back. Cells already run in parallel.
     num_threads: int = 1
     contact_max_um: float = 0.5
+    # Both walk every voxel of every instance, so they are opt-in, as the equivalent
+    # analyze_cell.py flags were.
+    polarity_spread: bool = False
+    distance_histograms: bool = False
 
     @classmethod
     def from_env(cls) -> "CellSketchConfig":
@@ -82,4 +88,6 @@ class CellSketchConfig:
             max_skeleton_voxels=_env_int("CELLSKETCH_MAX_SKELETON_VOXELS", 500_000),
             num_threads=_env_int("CELLSKETCH_NUM_THREADS", 1),
             contact_max_um=_env_float("CELLSKETCH_CONTACT_MAX_UM", 0.5),
+            polarity_spread=_env_flag("CELLSKETCH_POLARITY_SPREAD"),
+            distance_histograms=_env_flag("CELLSKETCH_DISTANCE_HISTOGRAMS"),
         )

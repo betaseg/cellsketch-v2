@@ -68,6 +68,50 @@ def _source_header(source_path: Path) -> Tuple[Tuple[int, int, int], str]:
     return shape, dtype  # type: ignore[return-value]
 
 
+def _label_dtype(volumes: Dict[str, np.ndarray], cell_id: str) -> np.dtype:
+    """The narrowest integer type that holds every label id in this cell.
+
+    Segmentations are often stored as float32 or int32 whatever their ids need, and the
+    stack is the single largest allocation in a run: a 371×1257×1176 cell with five
+    entities is 10.5 GB as int32 and 5.2 GB as uint16. Nothing here rounds ids - a
+    non-integral value would mean the volume is not a segmentation, and says so.
+    """
+    highest = 0
+    for name, vol in volumes.items():
+        if vol.size == 0:
+            continue
+        if np.issubdtype(vol.dtype, np.floating):
+            finite = vol[np.isfinite(vol)]
+            if finite.size and not np.all(np.equal(np.mod(finite, 1), 0)):
+                raise ValueError(
+                    f"{cell_id}: entity '{name}' has non-integer values, so it is not a "
+                    "label or mask volume"
+                )
+        lo, hi = float(vol.min()), float(vol.max())
+        if lo < 0:
+            raise ValueError(f"{cell_id}: entity '{name}' has negative label ids ({lo})")
+        highest = max(highest, hi)
+    for dtype in (np.uint8, np.uint16, np.uint32):
+        if highest <= np.iinfo(dtype).max:
+            return np.dtype(dtype)
+    return np.dtype(np.uint64)
+
+
+def _stack_narrowest(volumes: Dict[str, np.ndarray], keys: List[str], cell_id: str) -> np.ndarray:
+    """Stack the entities along C, converting one at a time and freeing as we go.
+
+    Written channel by channel into a preallocated array rather than via np.stack, so the
+    source volumes and the stack are never both fully in memory.
+    """
+    dtype = _label_dtype(volumes, cell_id)
+    first = volumes[keys[0]]
+    stack = np.empty((len(keys), *first.shape), dtype=dtype)
+    for i, key in enumerate(keys):
+        np.copyto(stack[i], volumes[key], casting="unsafe")
+        volumes[key] = np.empty((0, 0, 0), dtype=dtype)  # release the source volume
+    return stack
+
+
 def _channel_order(dataset: Dataset) -> List[str]:
     """Entity keys in C order: membrane first, then the rest by name.
 
@@ -189,14 +233,14 @@ class CellLoader:
             promote_multicomponent_masks(volumes, dataset.entities, membrane_key)
 
         keys = _channel_order(dataset)
-        stack = np.stack([volumes[k].astype(np.int32, copy=False) for k in keys], axis=0)
+        stack = _stack_narrowest(volumes, keys, cell_dir.name)
 
         meta: Dict[str, Any] = {
             "dim_order": "CZYX",
             "dim_names": ["C", "Z", "Y", "X"],
             "shape": list(stack.shape),
             "ndim": 4,
-            "dtype": "int32",
+            "dtype": str(stack.dtype),
             "n_images": 1,
             "channel_names": [dataset.entities[k].name for k in keys],
             "entity_kinds": [dataset.entities[k].kind for k in keys],
@@ -211,14 +255,15 @@ class CellLoader:
         }
         # The membrane centroid is the origin for every polarity metric. Computed here,
         # once, so a processor that sees only one entity can still measure against it.
-        center = cell_center_um(volumes[membrane_key], voxel_size_zyx)
+        # Read from the stack: _stack_narrowest has released the source volumes by now.
+        center = cell_center_um(stack[keys.index(membrane_key)], voxel_size_zyx)
         if center is not None:
             meta["cell_center_z_um"], meta["cell_center_y_um"], meta["cell_center_x_um"] = center
         logger.info(
-            "cellsketch: %s — %d entities, %s voxels, voxel size (z,y,x) µm: %.4g, %.4g, %.4g "
-            "(source dtype %s)",
+            "cellsketch: %s — %d entities, %s voxels as %s (%.1f GB), "
+            "voxel size (z,y,x) µm: %.4g, %.4g, %.4g",
             cell_dir.name, len(keys), "×".join(str(s) for s in stack.shape[1:]),
-            *voxel_size_zyx, source_dtype,
+            stack.dtype, stack.nbytes / 1024**3, *voxel_size_zyx,
         )
         return record_from(stack, meta, kind=CELL_KIND)
 

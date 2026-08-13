@@ -76,10 +76,11 @@ def test_distances_are_one_element_per_instance_and_target():
     er = _blocks((1, (6, 6, 6), (2, 2, 2)))
     row = InstanceProcessor().run_chunk(_cell(mito=(mito, "label"), er=(er, "label")))
 
-    # 3 instances, each measured to the one entity that is not its own.
+    # 3 instances, each measured to the one entity that is not its own. Grouped by
+    # target, because only one distance transform is alive at a time.
     assert len(row["distance_um"]) == 3
     assert list(zip(row["distance_entity"], row["distance_target"])) == [
-        ("mito", "er"), ("mito", "er"), ("er", "mito"),
+        ("er", "mito"), ("mito", "er"), ("mito", "er"),
     ]
 
 
@@ -150,6 +151,61 @@ def test_a_cell_with_no_labelled_instances_emits_null_lists():
     # with the typed lists written for cells that do have instances.
     assert row["instance_volume_um3"] is None
     assert row["distance_um"] is None
+
+
+def test_polarity_spread_is_off_unless_asked_for():
+    pm = np.zeros(SHAPE, dtype=np.int32)
+    pm[1:9, 1:19, 1:19] = 1
+    row = InstanceProcessor().run_chunk(
+        _cell(pm=(pm, "mask"), mito=(_blocks((1, (4, 4, 4), (2, 2, 2))), "label"))
+    )
+
+    # It walks every voxel of every instance, so it is opt-in like the analyze_cell flag.
+    assert np.isnan(row["instance_polar_spread_deg"]).all()
+
+
+def test_polarity_spread_grows_with_the_directions_an_instance_covers(monkeypatch):
+    monkeypatch.setenv("CELLSKETCH_POLARITY_SPREAD", "1")
+    pm = np.zeros(SHAPE, dtype=np.int32)
+    pm[1:9, 1:19, 1:19] = 1
+    compact = _blocks((1, (4, 9, 15), (2, 2, 2)))                 # a blob off to one side
+    sprawling = np.zeros(SHAPE, dtype=np.int32)
+    sprawling[4:6, 2:18, 5:7] = 2                                 # a strand along Y, elsewhere
+    row = InstanceProcessor().run_chunk(
+        _cell(pm=(pm, "mask"), mito=((compact + sprawling), "label"))
+    )
+
+    spreads = dict(zip(row["instance_label"], row["instance_polar_spread_deg"]))
+    assert spreads[2] > spreads[1] > 0
+
+
+def test_distance_histograms_are_off_unless_asked_for():
+    mito = _blocks((1, (2, 2, 2), (3, 3, 3)))
+    nucleus = _blocks((1, (2, 2, 8), (3, 3, 3)))
+    row = InstanceProcessor().run_chunk(_cell(mito=(mito, "label"), nucleus=(nucleus, "mask")))
+
+    assert "distance_hist_counts" not in row
+    assert "distance_mean_um" not in row
+
+
+def test_distance_histograms_share_their_bins_across_an_entity(monkeypatch):
+    import json
+
+    monkeypatch.setenv("CELLSKETCH_DISTANCE_HISTOGRAMS", "1")
+    mito = _blocks((1, (2, 2, 2), (3, 3, 3)), (2, (2, 2, 14), (3, 3, 3)))
+    nucleus = _blocks((1, (2, 2, 8), (3, 3, 3)))
+    row = InstanceProcessor().run_chunk(_cell(mito=(mito, "label"), nucleus=(nucleus, "mask")))
+
+    # Shared bounds per entity/target pair, unlike analyze_cell.py's per-instance range:
+    # shared bins are what makes two instances' distributions comparable.
+    assert len(set(row["distance_hist_min_um"])) == 1
+    assert len(set(row["distance_hist_max_um"])) == 1
+    for counts, mean, minimum in zip(row["distance_hist_counts"], row["distance_mean_um"],
+                                     row["distance_um"]):
+        bins = json.loads(counts)
+        assert len(bins) == 20
+        assert sum(bins) == 27          # every voxel of the instance is counted
+        assert mean >= minimum          # the mean cannot beat the closest voxel
 
 
 def test_partial_cell_is_refused():

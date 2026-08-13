@@ -4,7 +4,15 @@ import polars as pl
 import pytest
 from click.testing import CliRunner
 
-from pixel_patrol_cellsketch.cli import SLICE_SIZE, _apply_analysis_env, auto_mb_per_task, cli, find_cell_dirs
+from pixel_patrol_cellsketch.cli import (
+    SLICE_SIZE,
+    _apply_analysis_env,
+    auto_mb_per_task,
+    cli,
+    estimate_peak_gb,
+    find_cell_dirs,
+    suggest_max_workers,
+)
 from synthetic import make_cell, make_dataset
 
 
@@ -34,6 +42,30 @@ def test_leaf_blocks_are_configured_to_be_whole_entity_volumes():
 def test_task_budget_is_sized_so_no_cell_gets_split(dataset):
     # Synthetic cells are tiny, so the floor applies; the point is that it is a floor.
     assert auto_mb_per_task(find_cell_dirs(dataset)) >= 512
+
+
+def test_peak_memory_estimate_scales_with_the_cell(tmp_path):
+    small = make_cell(tmp_path / "small", prefix="s")   # 3 entities, 20×40×40
+    big = tmp_path / "big"
+    make_cell(big, prefix="b")
+
+    # Same shape here, so the estimate is about entity count and voxels, not file size.
+    assert estimate_peak_gb(tmp_path / "small") == pytest.approx(estimate_peak_gb(big))
+    assert 0 < estimate_peak_gb(tmp_path / "small") < 0.01
+
+
+def test_worker_count_is_bounded_by_memory_and_cpus(dataset):
+    cells = find_cell_dirs(dataset)
+
+    workers = suggest_max_workers(cells)
+    assert 1 <= workers <= (os.cpu_count() or 1)
+
+
+def test_a_folder_with_no_source_estimates_nothing(tmp_path):
+    (tmp_path / "empty").mkdir()
+
+    assert estimate_peak_gb(tmp_path / "empty") == 0.0
+    assert suggest_max_workers([tmp_path / "empty"]) == 1
 
 
 def test_analysis_flags_travel_as_environment_variables(monkeypatch):

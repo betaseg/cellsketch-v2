@@ -8,8 +8,8 @@ discovery, reporting, and HTML viewers with PixelPatrol's pipeline and report.
 distances, polarity and instance contacts are in place, plus two viewer widgets, so a
 run produces a PixelPatrol table carrying everything `analyze_cell.py`'s
 `report.parquet` does except meshes and skeleton geometry. Still to port: the mesh and
-skeleton payloads (and with them `mesh_viewer.html`), and a contacts widget with the
-gap-threshold slider and grouping that `stats_viewer.html` has. `analyze_cell.py`
+skeleton payloads (and with them `mesh_viewer.html` and the Blender export), and a
+contacts widget with the grouping that `stats_viewer.html` has. `analyze_cell.py`
 remains the complete tool until then.
 
 ## Data model
@@ -86,6 +86,13 @@ cellsketch process experiment/ -o report.parquet -p control -p treated
 cellsketch view report.parquet --significance
 ```
 
+On a real dataset (eight vEM alpha cells, 2.5–10.5 GB stacked, five entities each) that
+prints:
+
+```
+8 cell folder(s); 15,691 MB per task; 4 worker(s) (largest cell needs ~17.9 GB each)
+```
+
 `cellsketch` is a thin wrapper over `pixel-patrol`. It exists because two of that
 command's options are requirements of this loader rather than tuning knobs, and because
 PixelPatrol's CLI cannot pass plugin options, so the analysis flags
@@ -97,6 +104,14 @@ variables. The wrapper sets:
 - `--mb-per-task` sized from the largest cell (`n_entities × Z × Y × X × 4` bytes, with
   headroom). Below that PixelPatrol splits a cell to fit its budget, and the processors
   refuse the fragment rather than measuring part of a cell.
+- `--max-workers` from how many cells fit in RAM at once. Measured peak on a
+  133-megavoxel five-entity cell is 4.4 GB; the estimate predicted 4.7 GB.
+
+Two things keep that peak down, both worth knowing if you profile a run: entity volumes
+are stacked in the narrowest integer type their label ids need (usually `uint16`, halving
+a `float32`/`int32` segmentation), and the instance processor holds **one** whole-volume
+distance transform at a time, reducing it over every entity's labels with one pass before
+freeing it.
 
 The underlying command still works if you prefer it, flags and all:
 
@@ -146,6 +161,8 @@ options, so the analysis knobs are environment variables (defaults match the
 | `CELLSKETCH_MAX_SKELETON_VOXELS` | `500000` | `--max-skeleton-voxels` |
 | `CELLSKETCH_NUM_THREADS` | `1` (cells already run in parallel) | `--num-threads` |
 | `CELLSKETCH_CONTACT_MAX_UM` | `0.5` | `--contact-max-um` |
+| `CELLSKETCH_POLARITY_SPREAD` | `0` | `--polarity-spread-labels` (all label entities) |
+| `CELLSKETCH_DISTANCE_HISTOGRAMS` | `0` | `--dist-histogram-labels` (all label entities) |
 
 `cellsketch process` sets these from flags of the same name, so you only need the
 variables when driving `pixel-patrol` directly. `--with-contacts` has no equivalent:

@@ -36,21 +36,21 @@ def distance_transform_um(
         return distance_transform_edt(inverted, sampling=anisotropy)
 
 
-def build_distance_targets(
-    volumes: Mapping[str, np.ndarray],
-    kinds: Mapping[str, str],
-) -> Dict[str, np.ndarray]:
-    """Binary target per entity: what "distance to this entity" measures.
+def distance_target(volume: np.ndarray, name: str, kind: str) -> np.ndarray:
+    """Binary target for one entity: what "distance to this entity" measures.
 
     A label entity's target is the union of its instances. The plasma membrane is a
     *filled* volume, so its target is inverted - distance to the membrane means distance
     to the cell boundary, measured from inside.
+
+    One target at a time, on purpose: a whole-cell distance transform is float32 over
+    every voxel, so holding one per entity is the difference between ~2 GB and ~11 GB on
+    a 550-megavoxel cell.
     """
-    targets: Dict[str, np.ndarray] = {}
-    for name, vol in volumes.items():
-        mask = vol > 0
-        targets[name] = ~mask if (kinds[name] != "label" and is_membrane_name(name)) else mask
-    return targets
+    mask = volume > 0
+    if kind != "label" and is_membrane_name(name):
+        return ~mask
+    return mask
 
 
 def cell_center_um(

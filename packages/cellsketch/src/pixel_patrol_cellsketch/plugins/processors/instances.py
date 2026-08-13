@@ -9,7 +9,7 @@ list uses. One unnest gives back ``analyze_cell.py``'s ``row_type=instance`` tab
     SELECT cell_id, unnest(instance_entity) AS entity_name,
                     unnest(instance_label)  AS label,
                     unnest(instance_volume_um3) AS volume_um3
-    FROM pp_data WHERE obs_level = 1 IS NOT TRUE
+    FROM pp_data WHERE obs_level = 0
 
 Distances are a second, longer list group (one element per instance × target) because
 PixelPatrol drops columns a processor did not declare, and target names come from the
@@ -17,28 +17,36 @@ data. Unnesting that group yields one row per instance per target:
 
     SELECT cell_id, unnest(distance_entity) AS entity_name, unnest(distance_label) AS label,
                     unnest(distance_target) AS target, unnest(distance_um) AS distance_um
-    FROM pp_data
+    FROM pp_data WHERE obs_level = 0
 
 Instances come from label entities. A whole-structure mask has no instances; its
 morphology is on its own entity row, from cellsketch-morphology.
+
+Memory is the design constraint here - a real cell is ~550 megavoxels across five
+entities - so the two passes are arranged to keep at most one whole-volume float32
+array alive: morphology walks instances one at a time, and distances walk *targets* one
+at a time, reducing each transform over every entity's labels before freeing it.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+import math
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from pixel_patrol_base.core.contracts import ChunkKind
 from pixel_patrol_base.core.record import Record
 from pixel_patrol_base.core.specs import RecordSpec
+from scipy import ndimage
 from scipy.spatial.distance import cdist
 from skimage.measure import regionprops
 
 from pixel_patrol_cellsketch.config import CellSketchConfig
 from pixel_patrol_cellsketch.distances import (
-    build_distance_targets,
     cell_center_um,
+    distance_target,
     distance_transform_um,
     polarity_from_offset,
 )
@@ -52,6 +60,8 @@ from pixel_patrol_cellsketch.geometry import (
 from pixel_patrol_cellsketch.plugins.loaders.cell_loader import CELL_KIND
 
 logger = logging.getLogger(__name__)
+
+DISTANCE_HISTOGRAM_BINS = 20
 
 # One element per instance.
 _INSTANCE_COLUMNS: Dict[str, Any] = {
@@ -68,6 +78,7 @@ _INSTANCE_COLUMNS: Dict[str, Any] = {
     "instance_polar_dist_um": list,
     "instance_polar_az_deg": list,
     "instance_polar_el_deg": list,
+    "instance_polar_spread_deg": list,
 }
 
 # One element per instance × target entity.
@@ -76,6 +87,10 @@ _DISTANCE_COLUMNS: Dict[str, Any] = {
     "distance_label": list,
     "distance_target": list,
     "distance_um": list,
+    "distance_mean_um": list,
+    "distance_hist_min_um": list,
+    "distance_hist_max_um": list,
+    "distance_hist_counts": list,
 }
 
 _CELL_COLUMNS: Dict[str, Any] = {
@@ -96,12 +111,27 @@ _DESCRIPTIONS: Dict[str, str] = {
     "instance_polar_dist_um": "Distance in µm from the cell centre to the instance centroid.",
     "instance_polar_az_deg": "Azimuth in degrees of the instance centroid as seen from the cell centre.",
     "instance_polar_el_deg": "Elevation in degrees of the instance centroid as seen from the cell centre.",
+    "instance_polar_spread_deg": "Angular spread in degrees of the instance's voxels on the polarity sphere: how much of a direction range it covers as seen from the cell centre. Null unless polarity spread is enabled.",
     "distance_entity": "Entity of the instance being measured, in list order shared by all distance_* columns.",
     "distance_label": "Label id of the instance being measured.",
     "distance_target": "Entity measured to; for the plasma membrane this is the distance to the cell boundary.",
     "distance_um": "Smallest distance in µm from the instance's voxels to the target entity.",
+    "distance_mean_um": "Mean distance in µm over the instance's voxels. Null unless distance histograms are enabled.",
+    "distance_hist_min_um": "Lower bound of the histogram range, shared by every instance of this entity/target pair.",
+    "distance_hist_max_um": "Upper bound of the histogram range, shared by every instance of this entity/target pair.",
+    "distance_hist_counts": "Per-instance voxel counts over the histogram range, as a JSON array of fixed-width bins.",
     "cell_volume_um3": "Volume in µm³ enclosed by the plasma-membrane mask.",
 }
+
+
+def channel_view(arr: np.ndarray, c_axis: int, index: int) -> np.ndarray:
+    """One channel of a CZYX array, as a view - never a copy.
+
+    np.take would copy, which on a 550-megavoxel channel is a gigabyte per entity.
+    """
+    key: List[Any] = [slice(None)] * arr.ndim
+    key[c_axis] = index
+    return arr[tuple(key)]
 
 
 def _as_list(values: List[Any]) -> Optional[List[Any]]:
@@ -150,40 +180,35 @@ class InstanceProcessor:
             float(meta["pixel_size_Y"]),
             float(meta["pixel_size_X"]),
         )
-        volumes = {name: np.take(arr, i, axis=c_axis) for i, name in enumerate(names)}
+        views = {name: channel_view(arr, c_axis, i) for i, name in enumerate(names)}
         kinds_by_name = dict(zip(names, kinds))
         membrane_name = meta.get("membrane_name")
 
         out: Dict[str, Any] = {}
-        if membrane_name in volumes:
+        if membrane_name in views:
             voxel_um3 = float(np.prod(voxel_size_zyx))
-            out["cell_volume_um3"] = float((volumes[membrane_name] > 0).sum() * voxel_um3)
+            out["cell_volume_um3"] = float((views[membrane_name] > 0).sum() * voxel_um3)
 
         # The loader computed the membrane centroid, so polarity here and on the entity
         # rows is measured from the same origin.
         from_meta = [meta.get(f"cell_center_{ax}_um") for ax in "zyx"]
         if all(c is not None for c in from_meta):
             center = tuple(float(c) for c in from_meta)
-        elif membrane_name in volumes:
-            center = cell_center_um(volumes[membrane_name], voxel_size_zyx)
+        elif membrane_name in views:
+            center = cell_center_um(views[membrane_name], voxel_size_zyx)
         else:
             center = None
 
-        # One distance transform per target, reused by every instance measured against it.
-        targets = build_distance_targets(volumes, kinds_by_name)
-        transforms = {
-            name: distance_transform_um(mask, voxel_size_zyx, self._config.num_threads)
-            for name, mask in targets.items()
-        }
-
+        label_names = [n for n in names if kinds_by_name[n] == "label"]
         inst: Dict[str, List[Any]] = {col: [] for col in _INSTANCE_COLUMNS}
-        dist: Dict[str, List[Any]] = {col: [] for col in _DISTANCE_COLUMNS}
-        for name in names:
-            if kinds_by_name[name] != "label":
-                continue
-            self._measure_entity(
-                name, volumes[name], voxel_size_zyx, transforms, center, inst, dist
+        ids_by_entity: Dict[str, List[int]] = {}
+        for name in label_names:
+            ids_by_entity[name] = self._measure_morphology(
+                name, views[name], voxel_size_zyx, center, inst
             )
+
+        dist = self._measure_distances(views, kinds_by_name, label_names, ids_by_entity,
+                                       voxel_size_zyx)
 
         logger.info(
             "cellsketch: %s — %d instances, %d instance-target distances",
@@ -204,24 +229,22 @@ class InstanceProcessor:
 
         return agg
 
-    # ── per entity ────────────────────────────────────────────────────────────
+    # ── morphology, one instance at a time ────────────────────────────────────
 
-    def _measure_entity(
+    def _measure_morphology(
         self,
         entity: str,
         labels: np.ndarray,
         voxel_size_zyx: Sequence[float],
-        transforms: Dict[str, np.ndarray],
         center: tuple[float, float, float] | None,
         inst: Dict[str, List[Any]],
-        dist: Dict[str, List[Any]],
-    ) -> None:
+    ) -> List[int]:
+        """Append one element per instance to every instance_* list; return the label ids."""
         cfg = self._config
         voxel_um3 = float(np.prod(voxel_size_zyx))
-        labels = labels.astype(np.int32, copy=False)
-        props = regionprops(labels)
+        props = regionprops(np.ascontiguousarray(labels))
         if not props:
-            return
+            return []
 
         # One TEASAR pass over the whole entity yields a skeleton per instance.
         skels = compute_curve_skeletons(
@@ -230,6 +253,7 @@ class InstanceProcessor:
         )
         unmeasured = {"branches": float("nan"), "length_um": float("nan"), "tortuosity": float("nan")}
 
+        ids: List[int] = []
         centroids = []
         for rp in props:
             vol_um3 = float(rp.area * voxel_um3)
@@ -240,6 +264,7 @@ class InstanceProcessor:
             else:
                 skel = skeleton_graph_metrics(skels.get(int(rp.label)))
 
+            ids.append(int(rp.label))
             inst["instance_entity"].append(entity)
             inst["instance_label"].append(int(rp.label))
             inst["instance_volume_um3"].append(vol_um3)
@@ -254,25 +279,18 @@ class InstanceProcessor:
 
             centroid_um = np.array(rp.centroid) * np.array(voxel_size_zyx)
             centroids.append(centroid_um)
-            if center is None:
-                polar = {"polar_dist_um": float("nan"), "polar_az_deg": float("nan"),
-                         "polar_el_deg": float("nan")}
-            else:
-                polar = polarity_from_offset(*(centroid_um - np.array(center)))
+            polar = (
+                polarity_from_offset(*(centroid_um - np.array(center))) if center is not None
+                else {"polar_dist_um": float("nan"), "polar_az_deg": float("nan"),
+                      "polar_el_deg": float("nan")}
+            )
             inst["instance_polar_dist_um"].append(polar["polar_dist_um"])
             inst["instance_polar_az_deg"].append(polar["polar_az_deg"])
             inst["instance_polar_el_deg"].append(polar["polar_el_deg"])
-
-            # Distance to every other entity. An instance's distance to its own entity
-            # would be zero by construction, so its own target is skipped.
-            for target, dt in transforms.items():
-                if target == entity:
-                    continue
-                vals = dt[tuple(rp.coords.T)] if rp.coords.size else np.array([], dtype=np.float32)
-                dist["distance_entity"].append(entity)
-                dist["distance_label"].append(int(rp.label))
-                dist["distance_target"].append(target)
-                dist["distance_um"].append(float(vals.min()) if vals.size else float("nan"))
+            inst["instance_polar_spread_deg"].append(
+                _polar_spread_deg(rp.coords, voxel_size_zyx, center)
+                if (cfg.polarity_spread and center is not None) else float("nan")
+            )
 
         # Nearest neighbour of the same entity, centroid to centroid. Appended in one go
         # after the loop, in the same order the instances were appended above.
@@ -283,3 +301,104 @@ class InstanceProcessor:
         else:
             nearest = [float("nan")] * len(props)
         inst["instance_distance_to_closest_same_type_um"].extend(nearest)
+        return ids
+
+    # ── distances, one target at a time ──────────────────────────────────────
+
+    def _measure_distances(
+        self,
+        views: Dict[str, np.ndarray],
+        kinds_by_name: Dict[str, str],
+        label_names: List[str],
+        ids_by_entity: Dict[str, List[int]],
+        voxel_size_zyx: Sequence[float],
+    ) -> Dict[str, List[Any]]:
+        """One row per (instance, target), reducing each transform over every entity.
+
+        Targets are the outer loop so only one distance transform exists at a time, and
+        every instance of every entity is reduced against it with one labelled ndimage
+        pass - no per-instance coordinate arrays.
+        """
+        cfg = self._config
+        # The histogram columns are only created when they are being filled: a column of
+        # nothing but nulls cannot be written as a parquet list.
+        columns = list(_DISTANCE_COLUMNS) if cfg.distance_histograms else [
+            "distance_entity", "distance_label", "distance_target", "distance_um",
+        ]
+        dist: Dict[str, List[Any]] = {col: [] for col in columns}
+        for target, target_view in views.items():
+            measured = [
+                name for name in label_names if name != target and ids_by_entity.get(name)
+            ]
+            if not measured:
+                continue
+            transform = distance_transform_um(
+                distance_target(target_view, target, kinds_by_name[target]),
+                voxel_size_zyx, cfg.num_threads,
+            )
+            for name in measured:
+                labels, ids = views[name], ids_by_entity[name]
+                mins = ndimage.minimum(transform, labels=labels, index=ids)
+                stats = self._distance_stats(transform, labels, ids) if cfg.distance_histograms else None
+                for position, label_id in enumerate(ids):
+                    dist["distance_entity"].append(name)
+                    dist["distance_label"].append(int(label_id))
+                    dist["distance_target"].append(target)
+                    dist["distance_um"].append(float(np.atleast_1d(mins)[position]))
+                    if stats is not None:
+                        dist["distance_mean_um"].append(stats["mean"][position])
+                        dist["distance_hist_min_um"].append(stats["lo"])
+                        dist["distance_hist_max_um"].append(stats["hi"])
+                        dist["distance_hist_counts"].append(stats["counts"][position])
+            del transform
+        return dist
+
+    @staticmethod
+    def _distance_stats(transform: np.ndarray, labels: np.ndarray, ids: List[int]) -> Dict[str, Any]:
+        """Mean and a binned distribution per instance, over one entity/target pair.
+
+        The histogram range is shared by every instance of the pair, unlike
+        ``analyze_cell.py``'s per-instance range: shared bins are what makes two
+        instances' distributions comparable, and one labelled pass computes them all.
+        """
+        means = np.atleast_1d(ndimage.mean(transform, labels=labels, index=ids))
+        lo = float(np.atleast_1d(ndimage.minimum(transform, labels=labels, index=ids)).min())
+        hi = float(np.atleast_1d(ndimage.maximum(transform, labels=labels, index=ids)).max())
+        if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
+            hi = lo + 1.0
+        counts = ndimage.histogram(
+            transform, lo, hi, DISTANCE_HISTOGRAM_BINS, labels=labels, index=ids
+        )
+        per_instance = [counts] if len(ids) == 1 and np.ndim(counts) == 1 else list(counts)
+        return {
+            "mean": [float(m) for m in means],
+            "lo": lo,
+            "hi": hi,
+            "counts": [json.dumps([int(c) for c in row]) for row in per_instance],
+        }
+
+
+def _polar_spread_deg(
+    coords: np.ndarray,
+    voxel_size_zyx: Sequence[float],
+    center: Tuple[float, float, float],
+) -> float:
+    """Angular spread of an instance's voxels on the polarity sphere, in degrees.
+
+    How wide a range of directions the instance covers as seen from the cell centre: a
+    compact granule reads near zero, a strand wrapping the cell reads large.
+    """
+    if coords.shape[0] < 3:
+        return float("nan")
+    offsets = coords * np.array(voxel_size_zyx) - np.array(center)
+    radius = np.linalg.norm(offsets, axis=1)
+    valid = radius > 0
+    if valid.sum() < 3:
+        return float("nan")
+    unit = offsets[valid] / radius[valid, None]
+    mean_dir = unit.mean(axis=0)
+    length = float(np.linalg.norm(mean_dir))
+    if length > 0:
+        mean_dir = mean_dir / length
+    dots = np.clip(unit @ mean_dir, -1.0, 1.0)
+    return float(np.degrees(np.arccos(dots)).std())

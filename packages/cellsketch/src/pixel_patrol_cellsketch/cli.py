@@ -27,10 +27,15 @@ logger = logging.getLogger(__name__)
 # axis keeps its full extent.
 SLICE_SIZE = {"C": 1, "Z": -1, "Y": -1, "X": -1}
 
-# Headroom over the largest cell's stacked size, for the copies a processor makes
-# (distance transforms are float32 per target, skeletons hold their own arrays).
-_MB_PER_TASK_HEADROOM = 4.0
+# Headroom over the largest cell's stacked size. Only has to be enough that PixelPatrol
+# never splits a cell; peak memory is a separate estimate (see estimate_peak_gb).
+_MB_PER_TASK_HEADROOM = 1.5
 _MIN_MB_PER_TASK = 512.0
+
+# Peak resident memory per worker, as a multiple of (stack + one distance transform).
+# Calibrated against a real 133-megavoxel cell with five entities: predicted 4.7 GB,
+# measured 4.4 GB. Rough by nature - raise --max-workers or lower it by hand if needed.
+_PEAK_OVERHEAD = 2.5
 
 
 def find_cell_dirs(root: Path) -> list[Path]:
@@ -43,18 +48,51 @@ def find_cell_dirs(root: Path) -> list[Path]:
     return sorted(d for d in root.rglob("*") if d.is_dir() and loader.is_folder_supported(d))
 
 
-def _stacked_mb(cell_dir: Path) -> float:
-    """Megabytes one cell occupies as an int32 CZYX stack, from TIFF headers only."""
+def _cell_extent(cell_dir: Path) -> Tuple[int, int]:
+    """(voxels per entity, entity count) for one cell, from TIFF headers only."""
     d = inspect_cell_dir(cell_dir)
     if d.source is None:
-        return 0.0
+        return 0, 0
     try:
         with tifffile.TiffFile(d.source) as tf:
             shape = tf.series[0].shape
     except Exception:
-        return 0.0
-    voxels = math.prod(int(s) for s in shape)
-    return voxels * max(1, len(d.entities)) * 4 / 1024 / 1024
+        return 0, 0
+    return math.prod(int(s) for s in shape), max(1, len(d.entities))
+
+
+def _stacked_mb(cell_dir: Path) -> float:
+    """Megabytes one cell occupies as a CZYX stack, worst case (4 bytes per label id).
+
+    The loader narrows the stack to the smallest integer type the labels need, usually
+    uint16, so this is an over-estimate - which is the safe direction for a budget whose
+    only job is to stay above the real size.
+    """
+    voxels, entities = _cell_extent(cell_dir)
+    return voxels * entities * 4 / 1024 / 1024
+
+
+def estimate_peak_gb(cell_dir: Path) -> float:
+    """Rough peak resident memory for processing one cell, in GB.
+
+    The stack (2 bytes per voxel per entity) plus one whole-volume float32 distance
+    transform - the processors keep only one alive - times measured overhead.
+    """
+    voxels, entities = _cell_extent(cell_dir)
+    return voxels * (2 * entities + 4) * _PEAK_OVERHEAD / 1024**3
+
+
+def suggest_max_workers(cell_dirs: Iterable[Path]) -> int:
+    """How many cells fit in memory at once, leaving a fifth of RAM free."""
+    peak = max((estimate_peak_gb(d) for d in cell_dirs), default=0.0)
+    if peak <= 0:
+        return 1
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().total / 1024**3 * 0.8
+    except Exception:
+        return 1
+    return max(1, min(os.cpu_count() or 1, int(available_gb // peak)))
 
 
 def auto_mb_per_task(cell_dirs: Iterable[Path]) -> float:
@@ -70,6 +108,8 @@ def _apply_analysis_env(
     contact_max_um: float | None,
     max_skeleton_voxels: int | None,
     num_threads: int | None,
+    polarity_spread: bool = False,
+    distance_histograms: bool = False,
 ) -> None:
     """Plugin options travel as environment variables; see config.CellSketchConfig."""
     settings = {
@@ -79,6 +119,8 @@ def _apply_analysis_env(
         "CELLSKETCH_CONTACT_MAX_UM": contact_max_um,
         "CELLSKETCH_MAX_SKELETON_VOXELS": max_skeleton_voxels,
         "CELLSKETCH_NUM_THREADS": num_threads,
+        "CELLSKETCH_POLARITY_SPREAD": "1" if polarity_spread else None,
+        "CELLSKETCH_DISTANCE_HISTOGRAMS": "1" if distance_histograms else None,
     }
     for key, value in settings.items():
         if value is not None:
@@ -109,6 +151,10 @@ def cli() -> None:
               help="Skip curve skeletons for instances above this voxel count (default: 500000).")
 @click.option("--num-threads", type=int, default=None, metavar="N",
               help="kimimaro worker count (default: 1; cells already run in parallel).")
+@click.option("--polarity-spread", is_flag=True,
+              help="Also measure each instance's angular spread on the polarity sphere.")
+@click.option("--distance-histograms", is_flag=True,
+              help="Also measure per-instance distance distributions, not just the minimum.")
 @click.option("--no-contacts", is_flag=True, help="Skip the instance contact edge list.")
 @click.option("--no-instances", is_flag=True,
               help="Skip per-instance measurements: entity-level morphology only.")
@@ -118,8 +164,9 @@ def cli() -> None:
 def process(
     cell_dir: Path, output: Path, paths: Tuple[str, ...], voxel_size_um: str | None,
     auto_clip_to_pm: bool, auto_label_masks: bool, contact_max_um: float | None,
-    max_skeleton_voxels: int | None, num_threads: int | None, no_contacts: bool,
-    no_instances: bool, mb_per_task: float | None, max_workers: int | None,
+    max_skeleton_voxels: int | None, num_threads: int | None, polarity_spread: bool,
+    distance_histograms: bool, no_contacts: bool, no_instances: bool,
+    mb_per_task: float | None, max_workers: int | None,
 ) -> None:
     """Analyse every cell folder under CELL_DIR and write one report."""
     from pixel_patrol_base import api
@@ -132,14 +179,20 @@ def process(
             "what was rejected and why."
         )
     _apply_analysis_env(voxel_size_um, auto_clip_to_pm, auto_label_masks,
-                        contact_max_um, max_skeleton_voxels, num_threads)
+                        contact_max_um, max_skeleton_voxels, num_threads,
+                        polarity_spread, distance_histograms)
 
     budget = mb_per_task if mb_per_task is not None else auto_mb_per_task(cells)
+    workers = max_workers if max_workers is not None else suggest_max_workers(cells)
+    peak = max((estimate_peak_gb(d) for d in cells), default=0.0)
     excluded = {"cellsketch-contacts"} if no_contacts else set()
     if no_instances:
         excluded.add("cellsketch-instances")
 
-    click.echo(f"{len(cells)} cell folder(s); {budget:,.0f} MB per task")
+    click.echo(
+        f"{len(cells)} cell folder(s); {budget:,.0f} MB per task; {workers} worker(s) "
+        f"(largest cell needs ~{peak:.1f} GB each)"
+    )
     project = api.create_project(output.stem, cell_dir, loader="cellsketch", output_path=output)
     if paths:
         api.add_paths(project, list(paths))
@@ -147,7 +200,7 @@ def process(
         project,
         slice_size=SLICE_SIZE,
         mb_per_task=budget,
-        max_workers=max_workers,
+        max_workers=workers,
         processors_excluded=excluded or None,
     )
     click.echo(f"Report written to {output}")
@@ -196,7 +249,10 @@ def dry_run(cell_dir: Path) -> None:
     for key, count in sorted(entity_presence.items()):
         missing = "" if count == len(cells) else "   ← missing in some cells"
         click.echo(f"  {key:24s} {count}/{len(cells)}{missing}")
-    click.echo(f"\nSuggested --mb-per-task: {auto_mb_per_task(cells):.0f}")
+    click.echo(f"\nSuggested --mb-per-task: {auto_mb_per_task(cells):,.0f}"
+               f"   --max-workers: {suggest_max_workers(cells)}"
+               f"   (~{max((estimate_peak_gb(d) for d in cells), default=0.0):.1f} GB "
+               "peak per worker)")
     if problems:
         click.echo(f"{problems} problem(s) found.")
         raise SystemExit(1)

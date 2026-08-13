@@ -28,6 +28,7 @@ from pixel_patrol_base.core.specs import RecordSpec
 from pixel_patrol_cellsketch.config import CellSketchConfig
 from pixel_patrol_cellsketch.contacts import pairwise_instance_gaps
 from pixel_patrol_cellsketch.plugins.loaders.cell_loader import CELL_KIND
+from pixel_patrol_cellsketch.plugins.processors.instances import channel_view
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,8 @@ class ContactsProcessor:
                 "raise --mb-per-task above the size of one cell"
             )
 
-        volumes = {name: np.take(arr, i, axis=c_axis) for i, name in enumerate(names)}
+        # Views, not copies: np.take would duplicate every entity volume.
+        volumes = {name: channel_view(arr, c_axis, i) for i, name in enumerate(names)}
         kinds_by_name = dict(zip(names, kinds))
         voxel_size_zyx = (
             float(meta["pixel_size_Z"]),
