@@ -117,11 +117,22 @@ class MorphologyProcessor:
         volume = np.squeeze(arr, axis=c_axis)
         expected_zyx = [int(v) for v in (meta.get("cell_shape_zyx") or [])]
         if expected_zyx and list(volume.shape) != expected_zyx:
-            # PixelPatrol split the cell spatially to stay inside its memory budget.
-            # Volumes and areas measured on a fragment are wrong, not just partial.
+            # A fragment gives wrong answers, not partial ones, so refuse it - and name
+            # the cause: an axis sliced down to 1 is the leaf configuration, anything
+            # else is PixelPatrol splitting the volume to fit its memory budget.
+            sliced = [
+                ax for ax, got, want in zip("ZYX", volume.shape, expected_zyx)
+                if got == 1 and want > 1
+            ]
+            cause = (
+                f"pass --slice-size {' '.join(f'{ax}=-1' for ax in sliced)} so a leaf block "
+                "is one whole entity volume"
+                if sliced else
+                "raise --mb-per-task above the size of one cell"
+            )
             raise ValueError(
                 f"entity '{names[c_index]}' arrived as a {volume.shape} fragment of a "
-                f"{tuple(expected_zyx)} volume — raise --mb-per-task above the size of one cell"
+                f"{tuple(expected_zyx)} volume — {cause}"
             )
 
         voxel_size_zyx = (

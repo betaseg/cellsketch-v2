@@ -97,11 +97,20 @@ def test_empty_label_entity_counts_zero():
     assert row["total_volume_um3"] == 0.0
 
 
-def test_spatial_fragment_is_refused():
+def test_memory_chunked_fragment_is_refused():
     volume = _cube((10, 20, 20), (2, 5, 5), (4, 6, 6))
     record = _leaf(volume, name="mito", kind="label", cell_shape=(10, 40, 40))
 
     with pytest.raises(ValueError, match="mb-per-task"):
+        MorphologyProcessor().run_chunk(record)
+
+
+def test_a_single_plane_leaf_blames_the_leaf_configuration_not_memory():
+    """Forgetting --slice-size Z=-1 gives per-plane leaves; say so, don't blame memory."""
+    plane = _cube((1, 20, 20), (0, 5, 5), (1, 6, 6))
+    record = _leaf(plane, name="mito", kind="label", cell_shape=(10, 20, 20))
+
+    with pytest.raises(ValueError, match=r"--slice-size Z=-1"):
         MorphologyProcessor().run_chunk(record)
 
 

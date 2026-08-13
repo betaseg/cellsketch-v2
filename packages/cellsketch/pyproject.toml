@@ -22,6 +22,9 @@ dependencies = [
     "psutil",
 ]
 
+[project.scripts]
+cellsketch = "pixel_patrol_cellsketch.cli:cli"
+
 [project.entry-points."pixel_patrol.loader_plugins"]
 cellsketch_loaders = "pixel_patrol_cellsketch.plugin_registry:register_loader_plugins"
 

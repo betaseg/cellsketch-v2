@@ -81,26 +81,32 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e . \
 ## Run
 
 ```bash
-pixel-patrol process <cells-root> -o report.parquet --loader cellsketch \
-  --slice-size C=1 --slice-size Z=-1 --mb-per-task 4096
-pixel-patrol view report.parquet
+cellsketch dry-run experiment/                       # what will be analysed, and why not
+cellsketch process experiment/ -o report.parquet -p control -p treated
+cellsketch view report.parquet --significance
 ```
 
-For experimental groups, import each group as its own path:
+`cellsketch` is a thin wrapper over `pixel-patrol`. It exists because two of that
+command's options are requirements of this loader rather than tuning knobs, and because
+PixelPatrol's CLI cannot pass plugin options, so the analysis flags
+(`--voxel-size-um`, `--auto-clip-to-pm`, `--contact-max-um`, …) travel as environment
+variables. The wrapper sets:
+
+- `--slice-size C=1 Z=-1 Y=-1 X=-1`, so one leaf block is one whole entity volume.
+  Without it PixelPatrol defaults `Z` to 1 and hands the processors 2D planes.
+- `--mb-per-task` sized from the largest cell (`n_entities × Z × Y × X × 4` bytes, with
+  headroom). Below that PixelPatrol splits a cell to fit its budget, and the processors
+  refuse the fragment rather than measuring part of a cell.
+
+The underlying command still works if you prefer it, flags and all:
 
 ```bash
 pixel-patrol process experiment/ -o report.parquet --loader cellsketch \
   -p control -p treated --slice-size C=1 --slice-size Z=-1 --mb-per-task 4096
 ```
 
-Two flags matter and are not optional:
-
-- `--slice-size C=1 --slice-size Z=-1` makes one leaf block one whole entity volume.
-  Without it PixelPatrol defaults `Z` to 1 and measures 2D planes.
-- `--mb-per-task` must exceed the stacked size of one cell
-  (`n_entities × Z × Y × X × 4` bytes). Below that PixelPatrol splits the volume
-  spatially and the processor refuses the fragment rather than reporting metrics
-  measured on part of a cell.
+Skip the expensive parts with `--no-instances` / `--no-contacts` (equivalently,
+`--processors-exclude cellsketch-instances`).
 
 ## Viewer widgets
 
@@ -141,8 +147,9 @@ options, so the analysis knobs are environment variables (defaults match the
 | `CELLSKETCH_NUM_THREADS` | `1` (cells already run in parallel) | `--num-threads` |
 | `CELLSKETCH_CONTACT_MAX_UM` | `0.5` | `--contact-max-um` |
 
-`--with-contacts` has no equivalent: contacts are a processor, so they are on by default
-and skipped with `--processors-exclude cellsketch-contacts`.
+`cellsketch process` sets these from flags of the same name, so you only need the
+variables when driving `pixel-patrol` directly. `--with-contacts` has no equivalent:
+contacts are a processor, so they are on by default and skipped with `--no-contacts`.
 
 ## Tests
 
