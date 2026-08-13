@@ -27,6 +27,7 @@ from pixel_patrol_cellsketch.config import CellSketchConfig
 from pixel_patrol_cellsketch.mesh import MeshOptions, mesh_rows_for_cell, write_mesh_csv
 from pixel_patrol_cellsketch.plugins.loaders.cell_loader import CELL_KIND
 from pixel_patrol_cellsketch.plugins.processors.instances import channel_view
+from pixel_patrol_cellsketch.skeletons import CACHE
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,9 @@ class MeshProcessor:
             )
 
         cell_id = str(meta.get("cell_id") or "cell")
+        # Whatever cellsketch-instances already measured for this cell, so the CSV carries
+        # the same metrics without measuring them twice. Empty when that processor is off.
+        metrics = CACHE.get_or_compute(cell_id, ("instance_metrics",), arr, dict)
         rows = mesh_rows_for_cell(
             {name: channel_view(arr, c_axis, i) for i, name in enumerate(names)},
             dict(zip(names, kinds)),
@@ -87,6 +91,7 @@ class MeshProcessor:
                 num_threads=cfg.num_threads,
                 contact_max_um=cfg.contact_max_um,
             ),
+            metrics=metrics,
         )
         path = write_mesh_csv(Path(cfg.mesh_dir) / cell_id / "report_meshes.csv", rows)
         with_mesh = sum(1 for row in rows if row["mesh_b64"])

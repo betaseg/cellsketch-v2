@@ -45,6 +45,11 @@ _COLUMNS: Dict[str, Any] = {
     "polar_dist_um":            np.float64,
     "polar_az_deg":             np.float64,
     "polar_el_deg":             np.float64,
+    "polar_nz":                 np.float64,
+    "polar_ny":                 np.float64,
+    "polar_nx":                 np.float64,
+    "file_name":                str,
+    "file_size_bytes":          np.int64,
 }
 
 _DESCRIPTIONS: Dict[str, str] = {
@@ -59,6 +64,11 @@ _DESCRIPTIONS: Dict[str, str] = {
     "polar_dist_um":            "Distance in µm from the cell centre to this structure's centroid (mask entities).",
     "polar_az_deg":             "Azimuth in degrees of this structure's centroid as seen from the cell centre (mask entities).",
     "polar_el_deg":             "Elevation in degrees of this structure's centroid as seen from the cell centre (mask entities).",
+    "polar_nz":                 "Z component of the unit vector from the cell centre to this structure's centroid.",
+    "polar_ny":                 "Y component of the unit vector from the cell centre to this structure's centroid.",
+    "polar_nx":                 "X component of the unit vector from the cell centre to this structure's centroid.",
+    "file_name":                "Name of the TIFF this entity was read from.",
+    "file_size_bytes":          "Size on disk of that TIFF, in bytes.",
 }
 
 # Only the instance count adds up across entities: it counts labelled objects, and mask
@@ -145,6 +155,14 @@ class MorphologyProcessor:
         voxel_um3 = float(np.prod(voxel_size_zyx))
 
         row: Dict[str, Any] = {"entity_name": entity_name, "entity_kind": entity_kind}
+        # Provenance per entity: which file this row came from, and how big it was. The
+        # record is a folder, so PixelPatrol's own name/size_bytes describe the whole cell.
+        files = list(meta.get("entity_files") or [])
+        sizes = list(meta.get("entity_file_bytes") or [])
+        if c_index < len(files):
+            row["file_name"] = files[c_index]
+        if c_index < len(sizes):
+            row["file_size_bytes"] = int(sizes[c_index])
         if entity_kind == "mask":
             binary = volume > 0
             vol_um3 = float(binary.sum() * voxel_um3)

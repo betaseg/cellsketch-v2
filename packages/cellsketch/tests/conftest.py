@@ -1,16 +1,32 @@
 """One real pipeline run, shared by the tests that inspect its output."""
 
+import os
 from pathlib import Path
 
 import polars as pl
 import pytest
 from pixel_patrol_base import api
 
+from pixel_patrol_cellsketch.skeletons import CACHE
 from synthetic import make_dataset
 
 # One leaf block = one whole entity volume. Z must be pinned to full extent
 # explicitly: PixelPatrol's default leaf shape steps every non-XY dim by 1.
 SLICE_SIZE = {"C": 1, "Z": -1}
+
+
+@pytest.fixture(autouse=True)
+def isolated_state(monkeypatch):
+    """No CELLSKETCH_* setting and no cached per-cell work crosses a test boundary.
+
+    Plugin options travel through the environment and the per-cell cache is module-level,
+    so without this the suite's result depends on the order it happens to run in.
+    """
+    for key in [k for k in os.environ if k.startswith("CELLSKETCH_")]:
+        monkeypatch.delenv(key, raising=False)
+    CACHE.clear()
+    yield
+    CACHE.clear()
 
 
 @pytest.fixture(scope="session")

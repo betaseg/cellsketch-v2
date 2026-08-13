@@ -56,7 +56,7 @@ from pixel_patrol_cellsketch.geometry import (
     skeleton_graph_metrics,
     sphericity,
 )
-from pixel_patrol_cellsketch.skeletons import skeletons_for, wants_skeletons
+from pixel_patrol_cellsketch.skeletons import CACHE, skeletons_for, wants_skeletons
 from pixel_patrol_cellsketch.plugins.loaders.cell_loader import CELL_KIND
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,9 @@ _INSTANCE_COLUMNS: Dict[str, Any] = {
     "instance_polar_dist_um": list,
     "instance_polar_az_deg": list,
     "instance_polar_el_deg": list,
+    "instance_polar_nz": list,
+    "instance_polar_ny": list,
+    "instance_polar_nx": list,
     "instance_polar_spread_deg": list,
 }
 
@@ -111,6 +114,9 @@ _DESCRIPTIONS: Dict[str, str] = {
     "instance_polar_dist_um": "Distance in µm from the cell centre to the instance centroid.",
     "instance_polar_az_deg": "Azimuth in degrees of the instance centroid as seen from the cell centre.",
     "instance_polar_el_deg": "Elevation in degrees of the instance centroid as seen from the cell centre.",
+    "instance_polar_nz": "Z component of the unit vector from the cell centre to the instance centroid.",
+    "instance_polar_ny": "Y component of the unit vector from the cell centre to the instance centroid.",
+    "instance_polar_nx": "X component of the unit vector from the cell centre to the instance centroid.",
     "instance_polar_spread_deg": "Angular spread in degrees of the instance's voxels on the polarity sphere: how much of a direction range it covers as seen from the cell centre. Null unless polarity spread is enabled.",
     "distance_entity": "Entity of the instance being measured, in list order shared by all distance_* columns.",
     "distance_label": "Label id of the instance being measured.",
@@ -144,6 +150,22 @@ def null_if_not_finite(value: Any) -> Any:
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
+
+
+def _metrics_by_instance(inst: Dict[str, List[Any]]) -> Dict[tuple, Dict[str, Any]]:
+    """The instance lists as {(entity, label): {metric: value}}, for joining elsewhere.
+
+    Keys drop the "instance_" prefix, so the mesh CSV can carry the same column names
+    analyze_cell.py used (volume_um3, polar_nx, ...).
+    """
+    keys = [c for c in inst if c not in ("instance_entity", "instance_label")]
+    return {
+        (entity, int(label)): {
+            col.removeprefix("instance_"): null_if_not_finite(inst[col][i])
+            for col in keys if i < len(inst[col])
+        }
+        for i, (entity, label) in enumerate(zip(inst["instance_entity"], inst["instance_label"]))
+    }
 
 
 def _as_list(values: List[Any]) -> Optional[List[Any]]:
@@ -234,6 +256,14 @@ class InstanceProcessor:
         )
         out.update({col: _as_list(vals) for col, vals in inst.items()})
         out.update({col: _as_list(vals) for col, vals in dist.items()})
+
+        # Publish the instance table for the mesh writer: report_meshes.csv carries the same
+        # per-instance metrics (mesh_viewer.html offers any numeric column as a sort key and
+        # reads polar_n* as a direction), and recomputing them there would be waste.
+        CACHE.get_or_compute(
+            str(meta.get("cell_id") or "cell"), ("instance_metrics",), arr,
+            lambda: _metrics_by_instance(inst),
+        )
         return out
 
     def get_aggregation(self, name: str):
@@ -304,12 +334,12 @@ class InstanceProcessor:
             centroids.append(centroid_um)
             polar = (
                 polarity_from_offset(*(centroid_um - np.array(center))) if center is not None
-                else {"polar_dist_um": float("nan"), "polar_az_deg": float("nan"),
-                      "polar_el_deg": float("nan")}
+                else dict.fromkeys(
+                    ("polar_dist_um", "polar_az_deg", "polar_el_deg",
+                     "polar_nz", "polar_ny", "polar_nx"), float("nan"))
             )
-            inst["instance_polar_dist_um"].append(polar["polar_dist_um"])
-            inst["instance_polar_az_deg"].append(polar["polar_az_deg"])
-            inst["instance_polar_el_deg"].append(polar["polar_el_deg"])
+            for axis in ("dist_um", "az_deg", "el_deg", "nz", "ny", "nx"):
+                inst[f"instance_polar_{axis}"].append(polar[f"polar_{axis}"])
             inst["instance_polar_spread_deg"].append(
                 _polar_spread_deg(rp.coords, voxel_size_zyx, center)
                 if (cfg.polarity_spread and center is not None) else float("nan")

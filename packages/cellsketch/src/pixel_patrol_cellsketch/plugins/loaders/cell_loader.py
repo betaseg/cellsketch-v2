@@ -112,6 +112,13 @@ def _stack_narrowest(volumes: Dict[str, np.ndarray], keys: List[str], cell_id: s
     return stack
 
 
+def _file_size(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
 def _channel_order(dataset: Dataset) -> List[str]:
     """Entity keys in C order: membrane first, then the rest by name.
 
@@ -144,6 +151,8 @@ class CellLoader:
         "cell_id": str,
         "membrane_name": str,
         "entity_kinds": list,
+        "entity_files": list,
+        "entity_file_bytes": list,
         "n_entities": int,
         "cell_shape_zyx": list,
         "voxel_size_source": str,
@@ -155,6 +164,8 @@ class CellLoader:
         "cell_id": "Name of the cell folder the entity volumes were read from.",
         "membrane_name": "Entity name of the plasma-membrane mask that defines the cell.",
         "entity_kinds": "Kind ('label' or 'mask') of each entity, in channel_names order.",
+        "entity_files": "File each entity was read from, in channel_names order.",
+        "entity_file_bytes": "Size on disk of each entity's file, in channel_names order.",
         "n_entities": "Number of entity volumes stacked along C for this cell.",
         "cell_shape_zyx": "Voxel extent (Z, Y, X) of the analysed volume after cropping to the membrane bounding box.",
         "voxel_size_source": "Where the voxel size came from: 'tiff-metadata' or 'config'.",
@@ -244,6 +255,8 @@ class CellLoader:
             "n_images": 1,
             "channel_names": [dataset.entities[k].name for k in keys],
             "entity_kinds": [dataset.entities[k].kind for k in keys],
+            "entity_files": [dataset.entities[k].path.name for k in keys],
+            "entity_file_bytes": [_file_size(dataset.entities[k].path) for k in keys],
             "n_entities": len(keys),
             "cell_id": cell_dir.name,
             "membrane_name": dataset.membrane_name,

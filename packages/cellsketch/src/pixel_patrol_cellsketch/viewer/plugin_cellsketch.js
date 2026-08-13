@@ -96,6 +96,29 @@ function note(container, text) {
   container.appendChild(p);
 }
 
+/**
+ * The question a chart answers, and how to read the answer.
+ *
+ * stats_viewer.html carried this alongside every section, and it is worth keeping: these
+ * charts have conventions a reader cannot guess (a distance of 0 means overlap, a curve
+ * that climbs early means proximity, an instance "touches" iff its group has two members).
+ * Accepts HTML so key phrases can be emphasised the way they were there.
+ */
+function describe(container, html) {
+  const p = document.createElement('p');
+  p.style.cssText = 'font-size:.8rem;color:#444;line-height:1.45;margin:.2rem 0 .7rem;max-width:70ch';
+  p.innerHTML = html;
+  container.appendChild(p);
+}
+
+/** A caption under one chart, for what that panel in particular shows. */
+function caption(container, html) {
+  const p = document.createElement('p');
+  p.style.cssText = 'font-size:.75rem;color:#666;line-height:1.4;margin:.1rem .2rem .4rem';
+  p.innerHTML = html;
+  container.appendChild(p);
+}
+
 function emptyState(container, text) {
   const p = document.createElement('p');
   p.style.cssText = 'font-size:.85rem;color:#666';
@@ -204,7 +227,12 @@ const instanceMorphology = {
       const source = unnestedSource(ctx, ['instance_entity', ...metrics]);
       const where = `WHERE ${ctx.sql.q('instance_entity')} = ${esc(entity)}`;
       const [{ n }] = await ctx.queryRows(`SELECT COUNT(*) AS n FROM ${source} ${where}`);
-      note(plots, `One point per ${entity} instance; n=${Number(n).toLocaleString()}.`);
+      describe(plots,
+        `Every <b>${entity}</b> instance in the report, measured on its own — `
+        + `<b>${Number(n).toLocaleString()}</b> of them. One violin per group, so a shift `
+        + 'between violins is a difference between conditions rather than between cells. '
+        + 'Turn on <b>Show significance</b> in the sidebar for Mann-Whitney brackets, '
+        + 'Bonferroni corrected across the pairs shown.');
 
       const nextCell = plotGrid(plots, ctx.groups.length <= 2 ? 3 : 2);
       for (const metric of metrics) {
@@ -237,6 +265,18 @@ const instanceDistances = {
 
   requires(schema) {
     return schema.allCols.includes('distance_um');
+  },
+
+  async overviewMessage(ctx) {
+    const [row] = await ctx.queryRows(
+      `SELECT COUNT(*) AS n,
+              SUM(CASE WHEN ${ctx.sql.q('distance_um')} = 0 THEN 1 ELSE 0 END) AS overlapping
+       FROM ${unnestedSource(ctx, ['distance_entity', 'distance_target', 'distance_um'])}`
+    );
+    if (!row || !Number(row.n)) return null;
+    const share = (Number(row.overlapping) / Number(row.n)) * 100;
+    return `<strong>${Number(row.n).toLocaleString()}</strong> instance-to-structure distances; `
+      + `<strong>${share.toFixed(1)}%</strong> read 0, meaning the two overlap.`;
   },
 
   async overviewPlot(container, ctx) {
@@ -277,11 +317,12 @@ const instanceDistances = {
           draw();
         })
       );
-      note(
-        plots,
-        `Smallest distance from each ${entity} instance to the named structure. ` +
-          'Measured voxel centre to voxel centre, so 0 means they overlap.'
-      );
+      describe(plots,
+        `For each <b>${entity}</b> instance, the smallest distance from its voxels to the `
+        + 'named structure — how close it gets at its closest point. Measured voxel centre to '
+        + 'voxel centre, so <b>one voxel step means touching</b> and <b>0 means the two '
+        + 'overlap</b>. A violin pressed against the bottom is a population sitting on that '
+        + 'structure; one lifted off it is a population keeping its distance.');
 
       const source = unnestedSource(ctx, ['distance_entity', 'distance_target', 'distance_um']);
       const nextCell = plotGrid(plots, targets.length <= 1 ? 1 : 2);
@@ -337,6 +378,17 @@ const instanceReach = {
     return schema.allCols.includes('distance_um');
   },
 
+  async overviewMessage(ctx) {
+    const [row] = await ctx.queryRows(
+      `SELECT COUNT(DISTINCT ${ctx.sql.q('distance_target')}) AS targets
+       FROM ${unnestedSource(ctx, ['distance_entity', 'distance_target', 'distance_um'])}`
+    );
+    const targets = Number(row?.targets ?? 0);
+    if (targets < 2) return null;
+    return `How close instances get to <strong>two</strong> structures at once, over `
+      + `<strong>${(targets * (targets - 1)) / 2}</strong> pair(s) of structures.`;
+  },
+
   async overviewPlot(container, ctx) {
     // One pair's curves, as a taste of the matrix the full widget draws.
     const [entity] = await distinctValues(ctx, 'unnest(distance_entity)');
@@ -387,12 +439,14 @@ const instanceReach = {
         return;
       }
 
-      note(
-        plots,
-        `For every ${entity} instance, the larger of its two distances — the distance at ` +
-          'which it is close to both structures. The curve is the share of instances at or ' +
-          'below each value, so one that climbs early and steeply means most sit against both.'
-      );
+      describe(plots,
+        'One panel per pair of structures, so you can read every combination at once. For each '
+        + `<b>${entity}</b> instance we take the <b>larger</b> of its two distances — the `
+        + 'distance at which it is close to <b>both</b> structures — and the curve shows the '
+        + 'share of instances at or below it. A curve that <b>climbs early and steeply</b> '
+        + 'means most instances sit against both; one <b>pushed to the right</b> means few do. '
+        + 'Every panel shares the same axes, so panels are directly comparable, and the '
+        + 'reading is the same whether a cell holds one instance or ten thousand.');
 
       const asNumbers = (q) => Array.from(q ?? [], Number);
       // A shared X range makes every panel directly comparable.
@@ -608,10 +662,10 @@ const contactsAndGroups = {
          FROM ${edgeSource} WHERE ${conditions.join(' AND ')} LIMIT ${MAX_EDGES}`
       );
       if (edges.length >= MAX_EDGES) {
-        ctx.plot.prependWarning(
-          plots,
-          `Only the first ${MAX_EDGES.toLocaleString()} contacts were grouped - lower the gap.`
-        );
+        ctx.plot.prependWarning(plots, {
+          html: `Only the first ${MAX_EDGES.toLocaleString()} contacts were grouped - `
+            + 'lower the gap threshold to see the real grouping.',
+        });
       }
 
       const groups = contactGroups(
@@ -622,17 +676,21 @@ const contactsAndGroups = {
       const present = ctx.groups.filter((g) => byFacet.has(g));
       const ordered = present.length ? present : [...byFacet.keys()];
 
-      note(
-        plots,
-        `A contact group is a cluster of instances chained together by contacts of `
-        + `${gapUm.toFixed(3)} µm or less. An instance touches something exactly when it `
-        + `lands in a group of two or more, so the two charts always agree.`
-      );
+      describe(plots,
+        'Both charts are built from the same contacts: pairs whose surfaces come within '
+        + `<b>${gapUm.toFixed(3)} µm</b> of each other. A <b>contact group</b> is a cluster of `
+        + 'instances chained together by those contacts — so yes, this is exactly "instances '
+        + 'that are close to each other". <b>Left:</b> how many instances chain together. '
+        + '<b>Right:</b> the share of instances that touch a partner at all — an instance '
+        + 'touches iff it lands in a group of two or more, so the two views always agree. '
+        + 'Drag the threshold down to break the clusters apart and see which contacts survive.');
 
       const nextCell = plotGrid(plots, 2);
+      const sizeCell = nextCell();
+      const touchCell = nextCell();
       // Left: how many instances chain together.
       ctx.plot.append(
-        nextCell(),
+        sizeCell,
         ordered.map((facet) => ({
           type: 'box',
           name: ctx.groupLabel(facet),
@@ -647,9 +705,12 @@ const contactsAndGroups = {
           showlegend: false,
         }
       );
+      caption(sizeCell,
+        'Groups of one are left out here — an instance touching nothing is counted on the '
+        + 'right instead. A tall box means long chains of structures in contact.');
       // Right: the share of instances that touch anything at all.
       ctx.plot.append(
-        nextCell(),
+        touchCell,
         [{
           type: 'bar',
           x: ordered.map((f) => ctx.groupLabel(f)),
@@ -667,10 +728,14 @@ const contactsAndGroups = {
           showlegend: false,
         }
       );
+      caption(touchCell,
+        'Out of every instance present, not only those with a contact — 100% would mean '
+        + 'nothing in this condition stands alone at this threshold.');
 
-      ctx.plot.statTable(plots, {
-        headers: ['', 'instances', 'groups', 'largest', 'mean size', 'touching'],
-        rows: ordered.map((facet) => {
+      // statTable(headers, rows) returns the element; it does not take a container.
+      plots.appendChild(ctx.plot.statTable(
+        ['', 'instances', 'groups', 'largest', 'mean size', 'touching'],
+        ordered.map((facet) => {
           const e = byFacet.get(facet);
           const mean = e.sizes.length ? e.sizes.reduce((a, b) => a + b, 0) / e.sizes.length : 0;
           return [
@@ -681,8 +746,8 @@ const contactsAndGroups = {
             mean.toFixed(2),
             e.instances ? `${((e.touching / e.instances) * 100).toFixed(1)}%` : '-',
           ];
-        }),
-      });
+        })
+      ));
     };
 
     controls.appendChild(selector('Contacts', pairOptions, pairChoice, (value) => {

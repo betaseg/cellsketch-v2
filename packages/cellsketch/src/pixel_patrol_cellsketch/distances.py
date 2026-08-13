@@ -70,9 +70,12 @@ def polarity_from_offset(dz: float, dy: float, dx: float) -> Dict[str, float]:
     row: Dict[str, float] = {"polar_dist_um": dist_um}
     if dist_um > 0:
         nz, ny, nx_ = dz / dist_um, dy / dist_um, dx / dist_um
+        # The unit vector itself, not only its angles: mesh_viewer.html reads
+        # (polar_nx, polar_ny, polar_nz) as a direction to draw.
+        row["polar_nz"], row["polar_ny"], row["polar_nx"] = nz, ny, nx_
         row["polar_az_deg"] = math.degrees(math.atan2(ny, nx_))
         row["polar_el_deg"] = math.degrees(math.asin(max(-1.0, min(1.0, nz))))
     else:
-        row["polar_az_deg"] = float("nan")
-        row["polar_el_deg"] = float("nan")
+        for key in ("polar_nz", "polar_ny", "polar_nx", "polar_az_deg", "polar_el_deg"):
+            row[key] = float("nan")
     return row

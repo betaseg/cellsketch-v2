@@ -34,9 +34,19 @@ logger = logging.getLogger(__name__)
 
 # The columns mesh_viewer.html and csv_to_blender.py read. Geometry last, so the file
 # stays readable when truncated in a terminal.
+# Per-instance metrics carried alongside the geometry when the instance processor has
+# already measured them: mesh_viewer.html offers any numeric column as a sort key, and
+# reads polar_n* as a direction to draw.
+CARRIED_METRICS = [
+    "aspect_ratio_major_minor", "branches", "length_um", "tortuosity",
+    "distance_to_closest_same_type_um",
+    "polar_dist_um", "polar_az_deg", "polar_el_deg", "polar_nz", "polar_ny", "polar_nx",
+    "polar_spread_deg",
+]
+
 MESH_CSV_COLUMNS = [
     "cell_id", "group_id", "entity_name", "entity_kind", "row_type", "label_id",
-    "volume_um3", "surface_area_um2", "sphericity",
+    "volume_um3", "surface_area_um2", "sphericity", *CARRIED_METRICS,
     # row_type='contact' rows, which the viewer's contact-group colouring reads
     "entity_a", "label_a", "entity_b", "label_b", "gap_um",
     "mesh_b64", "skeleton_b64",
@@ -176,6 +186,7 @@ def mesh_rows_for_cell(
     cell_id: str,
     group_id: str = "",
     options: MeshOptions = MeshOptions(),
+    metrics: Optional[Mapping[tuple, Mapping[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """One row per label instance and per whole-structure mask, with its geometry.
 
@@ -230,7 +241,9 @@ def mesh_rows_for_cell(
                 (rp.bbox[3] - rp.bbox[0]) * (rp.bbox[4] - rp.bbox[1]) * (rp.bbox[5] - rp.bbox[2])
             )
             fill_ratio = rp.area / bbox_extent if bbox_extent > 0 else float("nan")
+            carried = (metrics or {}).get((name, int(rp.label))) or {}
             rows.append({
+                **{k: v for k, v in carried.items() if k in CARRIED_METRICS},
                 "cell_id": cell_id, "group_id": group_id, "entity_name": name,
                 "entity_kind": kind, "row_type": "instance", "label_id": int(rp.label),
                 "volume_um3": vol_um3, "surface_area_um2": area_um2, "sphericity": sph,
