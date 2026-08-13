@@ -1,23 +1,19 @@
 """Loader that turns one cell folder into one PixelPatrol record.
 
-A cell folder holds a source image plus its entity volumes
-(``<prefix>_<name>_label.tif`` / ``_mask.tif``). PixelPatrol discovers *files*, so
-this loader is driven by the source TIFF and picks up its siblings: the record it
-returns is all entity volumes stacked along a C axis (``CZYX``), with
-``channel_names`` naming the entities.
+The unit of analysis is a *folder*: a source image plus its entity volumes
+(``<prefix>_<name>_label.tif`` / ``_mask.tif``). ``is_folder_supported`` claims such
+a folder, so PixelPatrol hands the directory itself to ``read_header`` / ``load``
+and never descends into it — the TIFFs inside are not records of their own.
 
-Two consequences of that shape, both deliberate:
+``load`` returns every entity volume stacked along a C axis (``CZYX``), with
+``channel_names`` naming the entities. Two consequences of that shape, both
+deliberate:
 
 * one row per cell at ``obs_level=0`` and one row per entity at ``obs_level=1``
   (``dim_c``) — process with ``--slice-size C=1 --slice-size Z=-1`` so a leaf block
   is one whole entity volume;
 * every entity of a cell is in one record, so cross-entity metrics (distances,
   contacts) can be computed by a single processor.
-
-The entity TIFFs are discovered as files too, and are declined by returning
-``None`` from ``load()``. That is the only batch-safe way to opt out: raising
-inside ``load()`` fails the *whole* task, taking the sibling source image with it,
-whereas ``None`` is skipped per file (``processing._execute_batch_task``).
 """
 
 from __future__ import annotations
@@ -25,7 +21,7 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Set, Tuple
 
 import numpy as np
 import tifffile
@@ -55,22 +51,10 @@ logger = logging.getLogger(__name__)
 # so skip these records, which are label maps where pixel statistics are meaningless.
 CELL_KIND = "cell/segmentation"
 
-# Shape a declined (entity/ignored) file reports from read_header. It is a routing
-# hint only — load() returns None for these files, so the number is never used for
-# anything but keeping them on the cheap batch path.
-_DECLINED_INFO = FileInfo(shape=(1, 1, 1), dtype=np.dtype("uint8"), dim_order="ZYX", n_images=1)
-
-
 @lru_cache(maxsize=256)
 def _cached_inspect(cell_dir: str):
-    """Cache discovery per folder: every TIFF in a cell folder asks the same question."""
+    """Cache discovery per folder: discovery, read_header and load all ask for it."""
     return inspect_cell_dir(Path(cell_dir))
-
-
-def _is_source(file_path: Path) -> bool:
-    """True when this file is the source image of its cell folder (the record anchor)."""
-    d = _cached_inspect(str(file_path.parent))
-    return d.source is not None and d.source == file_path
 
 
 def _source_header(source_path: Path) -> Tuple[Tuple[int, int, int], str]:
@@ -103,7 +87,10 @@ class CellLoader:
         "as one record with the entity volumes stacked along C."
     )
 
-    SUPPORTED_EXTENSIONS: Set[str] = {"tif", "tiff"}
+    # A cell is a folder, never a file: nothing is loaded by extension, and a cell
+    # folder carries no suffix to declare in FOLDER_EXTENSIONS — is_folder_supported
+    # recognises one by what is inside it.
+    SUPPORTED_EXTENSIONS: Set[str] = set()
     FOLDER_EXTENSIONS: Set[str] = set()
     CONTAINER_EXTENSIONS: Set[str] = set()
 
@@ -130,19 +117,29 @@ class CellLoader:
         self._config = CellSketchConfig.from_env()
 
     def is_folder_supported(self, path: Path) -> bool:
-        return False
+        """True for a folder holding a source image and at least one label/mask volume.
 
-    def read_header(self, file_path: Path) -> FileInfo:
+        Called for every directory while scanning, so it must stay cheap: one glob of
+        the folder's TIFF names, no pixel data. Folders that hold cells rather than
+        being one (a group folder, the batch root) have no entity files of their own
+        and are walked into as usual.
+        """
+        if not path.is_dir():
+            return False
+        d = _cached_inspect(str(path))
+        return d.source is not None and bool(d.entities)
+
+    def read_header(self, cell_dir: Path) -> FileInfo:
         """Shape/dtype of the stacked cell record, for task routing only.
 
         The reported extent is the *uncropped* source extent times the entity count —
         an over-estimate once load() crops to the membrane bounding box, which is the
         safe direction for PixelPatrol's memory budget.
         """
-        if not _is_source(file_path):
-            return _DECLINED_INFO
-        d = _cached_inspect(str(file_path.parent))
-        (nz, ny, nx), _ = _source_header(file_path)
+        d = _cached_inspect(str(cell_dir))
+        if d.source is None:
+            raise ValueError(f"{cell_dir}: no source image found")
+        (nz, ny, nx), _ = _source_header(d.source)
         n_entities = max(1, len(d.entities))
         return FileInfo(
             shape=(n_entities, nz, ny, nx),
@@ -151,12 +148,8 @@ class CellLoader:
             n_images=1,
         )
 
-    def load(self, file_path: Path) -> Optional[Record]:
-        """Return the cell record for a source image, or None for any other TIFF."""
-        if not _is_source(file_path):
-            return None
-
-        cell_dir = file_path.parent
+    def load(self, cell_dir: Path) -> Record:
+        """Return one record holding every entity volume of this cell folder."""
         dataset = discover_dataset(cell_dir)
         cfg = self._config
 

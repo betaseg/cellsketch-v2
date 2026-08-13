@@ -64,12 +64,12 @@ def test_entity_rows_are_keyed_by_dim_c(table):
     assert row["entity_kind"].to_list() == ["mask", "label", "mask"]
 
 
-def test_entity_files_produce_no_rows_of_their_own(table):
-    # 4 cells × (1 cell row + 3 entity rows); the 12 label/mask TIFFs are declined.
+def test_the_discovered_unit_is_the_cell_folder(table):
+    # 4 cells × (1 cell row + 3 entity rows). The TIFFs inside a claimed folder are
+    # never records of their own, so nothing has to be skipped or declined.
     assert table.height == 4 * 4
-    assert table["name"].unique().sort().to_list() == [
-        "sample_a.tif", "sample_b.tif", "sample_c.tif", "sample_d.tif"
-    ]
+    assert table["name"].unique().sort().to_list() == ["cell_a", "cell_b", "cell_c", "cell_d"]
+    assert table["parent"].unique().sort().to_list() == ["control", "treated"]
 
 
 def test_group_comes_from_the_import_path(table):

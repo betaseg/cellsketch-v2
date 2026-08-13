@@ -10,7 +10,9 @@ once per worker process. Every value has the same default as the corresponding
     CELLSKETCH_AUTO_CLIP_TO_PM    1 → clip non-membrane entities to the membrane
     CELLSKETCH_AUTO_LABEL_MASKS   1 → promote multi-component masks to labels
     CELLSKETCH_MAX_SKELETON_VOXELS  skip skeletons above this instance size
-    CELLSKETCH_NUM_THREADS        skeleton/DT thread count (0 = all cores)
+    CELLSKETCH_NUM_THREADS        kimimaro worker count; 1 by default because
+                                  PixelPatrol already runs cells in parallel
+                                  (0 = all cores)
 """
 
 from __future__ import annotations
@@ -54,7 +56,10 @@ class CellSketchConfig:
     auto_clip_to_pm: bool = False
     auto_label_masks: bool = False
     max_skeleton_voxels: int = 500_000
-    num_threads: int = 0
+    # 1, not analyze_cell.py's 0: processors run inside Dask worker processes, which
+    # cannot fork children of their own, so asking kimimaro for a process pool costs a
+    # failed attempt per cell before it falls back. Cells already run in parallel.
+    num_threads: int = 1
 
     @classmethod
     def from_env(cls) -> "CellSketchConfig":
@@ -63,5 +68,5 @@ class CellSketchConfig:
             auto_clip_to_pm=_env_flag("CELLSKETCH_AUTO_CLIP_TO_PM"),
             auto_label_masks=_env_flag("CELLSKETCH_AUTO_LABEL_MASKS"),
             max_skeleton_voxels=_env_int("CELLSKETCH_MAX_SKELETON_VOXELS", 500_000),
-            num_threads=_env_int("CELLSKETCH_NUM_THREADS", 0),
+            num_threads=_env_int("CELLSKETCH_NUM_THREADS", 1),
         )

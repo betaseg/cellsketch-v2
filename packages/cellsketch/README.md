@@ -11,13 +11,14 @@ the complete tool until they are.
 
 ## Data model
 
-PixelPatrol discovers files and gives each record one row per dimension slice. A cell
-is a *folder* of volumes that must be measured together, which maps onto that model
-like this:
+A cell is a *folder* of volumes that must be measured together. The loader claims such
+a folder via `is_folder_supported`, so PixelPatrol treats the directory as one dataset
+and never descends into it — the TIFFs inside are not records of their own. Each record
+then gets one row per dimension slice, which maps onto CellSketch like this:
 
 | CellSketch concept | PixelPatrol representation |
 | --- | --- |
-| one cell | one record, entity volumes stacked along `C` (`CZYX`) |
+| one cell folder | one record, entity volumes stacked along `C` (`CZYX`) |
 | one entity (organelle) | one row at `obs_level=1`, `dim_c` → `channel_names` |
 | whole cell | one row at `obs_level=0` |
 | one instance (`row_type=instance`) | an element of the `instance_*` list columns |
@@ -32,13 +33,10 @@ FROM pp_data
 WHERE obs_level = 1 AND entity_kind = 'label'
 ```
 
-The entity TIFFs of a cell are discovered as files as well; the loader declines them
-by returning `None` from `load()`, which PixelPatrol skips per file.
-
 ## Install (development)
 
-Until PixelPatrol is released with the version this depends on, install both from a
-local checkout:
+Folder discovery for suffix-less directories needs `pixel-patrol-base` newer than
+0.8.0, so install both from a local checkout:
 
 ```bash
 uv venv --python 3.12 .venv
@@ -82,7 +80,7 @@ options, so the analysis knobs are environment variables (defaults match the
 | `CELLSKETCH_AUTO_CLIP_TO_PM` | `0` | `--auto-clip-to-pm` |
 | `CELLSKETCH_AUTO_LABEL_MASKS` | `0` | `--auto-label-masks` |
 | `CELLSKETCH_MAX_SKELETON_VOXELS` | `500000` | `--max-skeleton-voxels` |
-| `CELLSKETCH_NUM_THREADS` | `0` (all cores) | `--num-threads` |
+| `CELLSKETCH_NUM_THREADS` | `1` (cells already run in parallel) | `--num-threads` |
 
 ## Tests
 
