@@ -10,6 +10,8 @@ once per worker process. Every value has the same default as the corresponding
     CELLSKETCH_AUTO_CLIP_TO_PM    1 → clip non-membrane entities to the membrane
     CELLSKETCH_AUTO_LABEL_MASKS   1 → promote multi-component masks to labels
     CELLSKETCH_MAX_SKELETON_VOXELS  skip skeletons above this instance size
+    CELLSKETCH_SKELETON_ENTITIES  comma-separated entities to skeletonise (default: all)
+    CELLSKETCH_NO_SKELETONS       1 -> skeletonise nothing
     CELLSKETCH_NUM_THREADS        kimimaro worker count; 1 by default because
                                   PixelPatrol already runs cells in parallel
                                   (0 = all cores)
@@ -26,7 +28,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import FrozenSet, Optional, Tuple
+
+from pixel_patrol_cellsketch.skeletons import parse_entity_filter
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -73,6 +77,9 @@ class CellSketchConfig:
     auto_clip_to_pm: bool = False
     auto_label_masks: bool = False
     max_skeleton_voxels: int = 500_000
+    # None = every entity; an empty set = none. Skeletonising dominates a run, and a
+    # blob's skeleton says nothing, so restricting it to filaments is the big lever.
+    skeleton_entities: Optional[FrozenSet[str]] = None
     # 1, not analyze_cell.py's 0: processors run inside Dask worker processes, which
     # cannot fork children of their own, so asking kimimaro for a process pool costs a
     # failed attempt per cell before it falls back. Cells already run in parallel.
@@ -99,6 +106,10 @@ class CellSketchConfig:
             auto_clip_to_pm=_env_flag("CELLSKETCH_AUTO_CLIP_TO_PM"),
             auto_label_masks=_env_flag("CELLSKETCH_AUTO_LABEL_MASKS"),
             max_skeleton_voxels=_env_int("CELLSKETCH_MAX_SKELETON_VOXELS", 500_000),
+            skeleton_entities=parse_entity_filter(
+                os.environ.get("CELLSKETCH_SKELETON_ENTITIES"),
+                none=_env_flag("CELLSKETCH_NO_SKELETONS"),
+            ),
             num_threads=_env_int("CELLSKETCH_NUM_THREADS", 1),
             edt_threads=_env_int("CELLSKETCH_EDT_THREADS", 0),
             contact_max_um=_env_float("CELLSKETCH_CONTACT_MAX_UM", 0.5),

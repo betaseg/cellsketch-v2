@@ -52,11 +52,11 @@ from pixel_patrol_cellsketch.distances import (
 )
 from pixel_patrol_cellsketch.geometry import (
     aspect_ratio_from_coords,
-    compute_curve_skeletons,
     estimate_surface_area_um2,
     skeleton_graph_metrics,
     sphericity,
 )
+from pixel_patrol_cellsketch.skeletons import skeletons_for, wants_skeletons
 from pixel_patrol_cellsketch.plugins.loaders.cell_loader import CELL_KIND
 
 logger = logging.getLogger(__name__)
@@ -204,7 +204,8 @@ class InstanceProcessor:
         ids_by_entity: Dict[str, List[int]] = {}
         for name in label_names:
             ids_by_entity[name] = self._measure_morphology(
-                name, views[name], voxel_size_zyx, center, inst
+                name, views[name], voxel_size_zyx, center, inst,
+                cell_id=str(meta.get("cell_id") or "cell"),
             )
 
         dist = self._measure_distances(views, kinds_by_name, label_names, ids_by_entity,
@@ -238,6 +239,7 @@ class InstanceProcessor:
         voxel_size_zyx: Sequence[float],
         center: tuple[float, float, float] | None,
         inst: Dict[str, List[Any]],
+        cell_id: str = "cell",
     ) -> List[int]:
         """Append one element per instance to every instance_* list; return the label ids."""
         cfg = self._config
@@ -246,10 +248,13 @@ class InstanceProcessor:
         if not props:
             return []
 
-        # One TEASAR pass over the whole entity yields a skeleton per instance.
-        skels = compute_curve_skeletons(
-            labels, tuple(voxel_size_zyx),
-            max_voxels=cfg.max_skeleton_voxels, num_threads=cfg.num_threads,
+        # One TEASAR pass over the whole entity yields a skeleton per instance - shared
+        # with the mesh processor through the per-cell cache, and skipped entirely for
+        # entities where a skeleton says nothing (blobs).
+        skels = (
+            skeletons_for(cell_id, entity, labels, voxel_size_zyx,
+                          cfg.max_skeleton_voxels, cfg.num_threads)
+            if wants_skeletons(entity, cfg.skeleton_entities) else {}
         )
         unmeasured = {"branches": float("nan"), "length_um": float("nan"), "tortuosity": float("nan")}
 
@@ -258,8 +263,9 @@ class InstanceProcessor:
         for rp in props:
             vol_um3 = float(rp.area * voxel_um3)
             area_um2 = estimate_surface_area_um2(rp.image, voxel_size_zyx)
-            if cfg.max_skeleton_voxels is not None and rp.area > cfg.max_skeleton_voxels:
-                # Over the size cap: not-measured (NaN) rather than a misleading zero.
+            if not skels or (cfg.max_skeleton_voxels is not None and rp.area > cfg.max_skeleton_voxels):
+                # Not asked for, or over the size cap: not-measured (NaN) rather than a
+                # misleading zero.
                 skel = unmeasured
             else:
                 skel = skeleton_graph_metrics(skels.get(int(rp.label)))

@@ -124,6 +124,7 @@ def mesh_options(**overrides: Any) -> "MeshOptions":
         step_size=cfg.mesh_step_size,
         target_reduction=cfg.mesh_target_reduction,
         level=cfg.mesh_level,
+        skeleton_entities=cfg.skeleton_entities,
         max_skeleton_voxels=cfg.max_skeleton_voxels,
         num_threads=cfg.num_threads,
         contact_max_um=cfg.contact_max_um,
@@ -175,6 +176,8 @@ def _apply_analysis_env(
     num_threads: int | None,
     polarity_spread: bool = False,
     distance_histograms: bool = False,
+    skeleton_entities: str | None = None,
+    skip_skeletons: bool = False,
 ) -> None:
     """Plugin options travel as environment variables; see config.CellSketchConfig."""
     settings = {
@@ -186,6 +189,8 @@ def _apply_analysis_env(
         "CELLSKETCH_NUM_THREADS": num_threads,
         "CELLSKETCH_POLARITY_SPREAD": "1" if polarity_spread else None,
         "CELLSKETCH_DISTANCE_HISTOGRAMS": "1" if distance_histograms else None,
+        "CELLSKETCH_SKELETON_ENTITIES": skeleton_entities,
+        "CELLSKETCH_NO_SKELETONS": "1" if skip_skeletons else None,
     }
     for key, value in settings.items():
         if value is not None:
@@ -216,6 +221,12 @@ def cli() -> None:
               help="Skip curve skeletons for instances above this voxel count (default: 500000).")
 @click.option("--num-threads", type=int, default=None, metavar="N",
               help="kimimaro worker count (default: 1; cells already run in parallel).")
+@click.option("--skeleton-entities", default=None, metavar="NAMES",
+              help="Only skeletonise these entities, e.g. mito,er. Skeletonising dominates a "
+                   "run and a blob's skeleton says nothing, so naming the filaments is the "
+                   "single biggest saving. Default: every label entity.")
+@click.option("--no-skeletons", "skip_skeletons", is_flag=True,
+              help="Skeletonise nothing: no branches, length or tortuosity, and no overlay.")
 @click.option("--polarity-spread", is_flag=True,
               help="Also measure each instance's angular spread on the polarity sphere.")
 @click.option("--distance-histograms", is_flag=True,
@@ -235,7 +246,8 @@ def cli() -> None:
 def process(
     cell_dir: Path, output: Path, paths: Tuple[str, ...], voxel_size_um: str | None,
     auto_clip_to_pm: bool, auto_label_masks: bool, contact_max_um: float | None,
-    max_skeleton_voxels: int | None, num_threads: int | None, polarity_spread: bool,
+    max_skeleton_voxels: int | None, num_threads: int | None,
+    skeleton_entities: str | None, skip_skeletons: bool, polarity_spread: bool,
     distance_histograms: bool, no_contacts: bool, no_instances: bool,
     mb_per_task: float | None, max_workers: int | None, with_mesh: bool,
     mesh_dir: Path | None, mesh_smooth_sigma: float | None, mesh_step_size: int | None,
@@ -253,7 +265,8 @@ def process(
         )
     _apply_analysis_env(voxel_size_um, auto_clip_to_pm, auto_label_masks,
                         contact_max_um, max_skeleton_voxels, num_threads,
-                        polarity_spread, distance_histograms)
+                        polarity_spread, distance_histograms,
+                        skeleton_entities, skip_skeletons)
 
     meshes_to = (mesh_dir or output.with_name(output.stem + "_meshes")) if with_mesh else None
     _apply_mesh_env(meshes_to, mesh_smooth_sigma, mesh_step_size, mesh_target_reduction, mesh_level)
@@ -353,13 +366,16 @@ def dry_run(cell_dir: Path) -> None:
 @click.option("--auto-clip-to-pm", is_flag=True,
               help="Clip non-membrane entities to the plasma membrane first.")
 @click.option("--no-skeletons", is_flag=True, help="Meshes only, no skeleton overlay.")
+@click.option("--skeleton-entities", default=None, metavar="NAMES",
+              help="Only overlay skeletons for these entities, e.g. mito,er.")
 @click.option("--contact-max-um", type=float, default=None, metavar="T",
               help="Gap threshold for the contact rows the 3D viewer groups by (default: 0.5).")
 @click.option("--no-contacts", is_flag=True, help="Leave the contact rows out of the CSV.")
 @_mesh_flags
 def mesh(
     cell_dir: Path, out_dir: Path, voxel_size_um: str | None, auto_clip_to_pm: bool,
-    no_skeletons: bool, contact_max_um: float | None, no_contacts: bool,
+    no_skeletons: bool, skeleton_entities: str | None, contact_max_um: float | None,
+    no_contacts: bool,
     mesh_smooth_sigma: float | None, mesh_step_size: int | None,
     mesh_target_reduction: float | None, mesh_level: float | None,
 ) -> None:
@@ -375,7 +391,8 @@ def mesh(
     cells = find_cell_dirs(cell_dir)
     if not cells:
         raise click.ClickException(f"No cell folders found under {cell_dir}.")
-    _apply_analysis_env(voxel_size_um, auto_clip_to_pm, False, contact_max_um, None, None)
+    _apply_analysis_env(voxel_size_um, auto_clip_to_pm, False, contact_max_um, None, None,
+                        skeleton_entities=skeleton_entities)
     _apply_mesh_env(None, mesh_smooth_sigma, mesh_step_size, mesh_target_reduction, mesh_level)
     options = mesh_options(with_skeletons=not no_skeletons,
                            **({"contact_max_um": None} if no_contacts else {}))

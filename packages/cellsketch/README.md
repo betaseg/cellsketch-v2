@@ -104,7 +104,30 @@ variables. The wrapper sets:
 - `--max-workers` from how many cells fit in RAM at once. Measured peak on a
   133-megavoxel five-entity cell is 4.4 GB; the estimate predicted 4.7 GB.
 
-Two things keep that peak down, both worth knowing if you profile a run: entity volumes
+### Speed
+
+Measured on one real cell (133 megavoxels, five entities, 6340 instances), with
+distances, histograms, contacts and polarity spread all on:
+
+```
+load          6s     instances    39s     contacts    16s     meshes   133s
+```
+
+Three things got it there, and the first is worth knowing about if you write your own
+processor:
+
+- **`scipy.ndimage.minimum` is unusable at this scale** — 54 s per call on a 197-megavoxel
+  cell, and 57 s when asked for only 50 of the labels, because its cost follows the volume
+  and label count rather than the foreground. Each entity's foreground is indexed once
+  instead (positions sorted by label id), after which a measurement is a gather plus
+  `np.minimum.reduceat`: 0.01 s, same answers.
+- **`--skeleton-entities mito`** — skeletonising dominates everything else (103 s of a
+  2-minute cell), and most of it is usually wasted: a granule's skeleton is one branch the
+  length of its diameter. Naming just the filaments took that cell from 55 s to 36 s.
+- **Skeletons and contacts are computed once per cell**, not once per reader, so
+  `--with-mesh` no longer repeats the expensive parts for its geometry.
+
+Two things keep peak memory down, both worth knowing if you profile a run: entity volumes
 are stacked in the narrowest integer type their label ids need (usually `uint16`, halving
 a `float32`/`int32` segmentation), and the instance processor holds **one** whole-volume
 distance transform at a time, reducing it over every entity's labels with one pass before
@@ -183,6 +206,8 @@ options, so the analysis knobs are environment variables (defaults match the
 | `CELLSKETCH_AUTO_CLIP_TO_PM` | `0` | `--auto-clip-to-pm` |
 | `CELLSKETCH_AUTO_LABEL_MASKS` | `0` | `--auto-label-masks` |
 | `CELLSKETCH_MAX_SKELETON_VOXELS` | `500000` | `--max-skeleton-voxels` |
+| `CELLSKETCH_SKELETON_ENTITIES` | all label entities | — (`--skeleton-entities mito,er`) |
+| `CELLSKETCH_EDT_THREADS` | `0` (all cores) | part of `--num-threads` |
 | `CELLSKETCH_NUM_THREADS` | `1` (cells already run in parallel) | `--num-threads` |
 | `CELLSKETCH_CONTACT_MAX_UM` | `0.5` | `--contact-max-um` |
 | `CELLSKETCH_POLARITY_SPREAD` | `0` | `--polarity-spread-labels` (all label entities) |

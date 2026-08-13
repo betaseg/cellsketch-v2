@@ -26,9 +26,9 @@ from pixel_patrol_base.core.record import Record
 from pixel_patrol_base.core.specs import RecordSpec
 
 from pixel_patrol_cellsketch.config import CellSketchConfig
-from pixel_patrol_cellsketch.contacts import pairwise_instance_gaps
 from pixel_patrol_cellsketch.plugins.loaders.cell_loader import CELL_KIND
 from pixel_patrol_cellsketch.plugins.processors.instances import channel_view
+from pixel_patrol_cellsketch.skeletons import contacts_for
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +99,9 @@ class ContactsProcessor:
             float(meta["pixel_size_X"]),
         )
 
-        contacts = pairwise_instance_gaps(
-            volumes, kinds_by_name, voxel_size_zyx, self._config.contact_max_um
+        contacts = contacts_for(
+            str(meta.get("cell_id") or "cell"), volumes, kinds_by_name, voxel_size_zyx,
+            self._config.contact_max_um,
         )
         logger.info(
             "cellsketch: %s — %d instance pairs within %.3g µm",

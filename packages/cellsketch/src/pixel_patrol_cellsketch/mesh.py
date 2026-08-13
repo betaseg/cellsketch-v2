@@ -22,10 +22,12 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt, gaussian_filter
 from skimage.measure import marching_cubes, regionprops
 
-from pixel_patrol_cellsketch.geometry import (
-    compute_curve_skeletons,
-    estimate_surface_area_um2,
-    sphericity,
+from pixel_patrol_cellsketch.geometry import estimate_surface_area_um2, sphericity
+from pixel_patrol_cellsketch.skeletons import (
+    EntityFilter,
+    contacts_for,
+    skeletons_for,
+    wants_skeletons,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,9 @@ class MeshOptions:
     target_reduction: float = 0.8
     level: Optional[float] = None
     with_skeletons: bool = True
+    # Which entities get a skeleton overlay; None = all. Same filter the metrics use, so
+    # the two share one computation per cell rather than repeating the expensive one.
+    skeleton_entities: EntityFilter = None
     max_skeleton_voxels: Optional[int] = 500_000
     num_threads: int = 1
     # Contacts ride in the same file so "Color by → Contact group" works in the 3D
@@ -212,10 +217,10 @@ def mesh_rows_for_cell(
         if not props:
             continue
         skeletons = (
-            compute_curve_skeletons(labels, tuple(float(v) for v in voxel_size_zyx),
-                                    max_voxels=options.max_skeleton_voxels,
-                                    num_threads=options.num_threads)
-            if options.with_skeletons else {}
+            skeletons_for(cell_id, name, labels, voxel_size_zyx,
+                          options.max_skeleton_voxels, options.num_threads)
+            if options.with_skeletons and wants_skeletons(name, options.skeleton_entities)
+            else {}
         )
         for rp in props:
             vol_um3 = float(rp.area * voxel_um3)
@@ -254,9 +259,7 @@ def _contact_rows(
     max_gap_um: float,
 ) -> List[Dict[str, Any]]:
     """The pairwise edge list, in the row shape the 3D viewer splits out on load."""
-    from pixel_patrol_cellsketch.contacts import pairwise_instance_gaps
-
-    contacts = pairwise_instance_gaps(volumes, kinds, voxel_size_zyx, max_gap_um)
+    contacts = contacts_for(cell_id, volumes, kinds, voxel_size_zyx, max_gap_um)
     return [
         {
             "cell_id": cell_id, "group_id": group_id, "row_type": "contact",
