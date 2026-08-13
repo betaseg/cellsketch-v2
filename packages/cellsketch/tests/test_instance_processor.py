@@ -100,7 +100,9 @@ def test_distance_to_the_membrane_is_distance_to_the_cell_boundary():
 def test_closest_same_type_is_null_for_a_lone_instance():
     row = InstanceProcessor().run_chunk(_cell(mito=(_blocks((1, (2, 2, 2), (3, 3, 3))), "label")))
 
-    assert np.isnan(row["instance_distance_to_closest_same_type_um"]).all()
+    # NULL, not NaN: DuckDB's STDDEV raises on a column holding a NaN, so an unmeasured
+    # instance would take down every widget plotting that metric.
+    assert row["instance_distance_to_closest_same_type_um"] is None
 
 
 def test_closest_same_type_measures_centroid_distance_within_the_entity():
@@ -131,7 +133,7 @@ def test_polarity_is_measured_from_the_membrane_centre():
 def test_polarity_is_null_without_a_membrane():
     row = InstanceProcessor().run_chunk(_cell(mito=(_blocks((1, (2, 2, 2), (3, 3, 3))), "label")))
 
-    assert np.isnan(row["instance_polar_dist_um"]).all()
+    assert row["instance_polar_dist_um"] is None
     assert "cell_volume_um3" not in row
 
 
@@ -161,7 +163,7 @@ def test_polarity_spread_is_off_unless_asked_for():
     )
 
     # It walks every voxel of every instance, so it is opt-in like the analyze_cell flag.
-    assert np.isnan(row["instance_polar_spread_deg"]).all()
+    assert row["instance_polar_spread_deg"] is None
 
 
 def test_polarity_spread_grows_with_the_directions_an_instance_covers(monkeypatch):

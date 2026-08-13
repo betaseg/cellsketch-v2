@@ -30,6 +30,11 @@ const METRIC_LABELS = {
 const METRIC_ORDER = Object.keys(METRIC_LABELS);
 
 const CELL_ROW = '"obs_level" = 0';
+// Columns carrying text rather than a measurement, so the finite guard below skips them.
+const TEXT_COLUMNS = new Set([
+  'instance_entity', 'distance_entity', 'distance_target', 'distance_hist_counts',
+  'contact_entity_a', 'contact_entity_b',
+]);
 const GROUP_ALIAS = '"__cs_group__"';
 
 const esc = (v) => `'${String(v).replace(/'/g, "''")}'`;
@@ -53,8 +58,16 @@ function unnestedSource(ctx, columns) {
   const where = ctx.sql.andWhere(ctx.where, CELL_ROW);
   // cell_id rides along: an instance is identified by cell + entity + label, which is
   // what any join on instances has to match.
-  return `(SELECT "cell_id", ${ctx.sql.groupCol()} AS ${GROUP_ALIAS}, ${selects.join(', ')}
-           FROM pp_data ${where})`;
+  const inner = `(SELECT "cell_id", ${ctx.sql.groupCol()} AS ${GROUP_ALIAS}, ${selects.join(', ')}
+                  FROM pp_data ${where})`;
+  // A NaN in a measurement column makes DuckDB's STDDEV raise "out of range", and turns
+  // min/max/quantiles into nan. The processors write NULL for anything they could not
+  // measure, but reports written before that fix still hold NaNs - so guard here too.
+  const guarded = columns.map((c) => {
+    const q = ctx.sql.q(c);
+    return TEXT_COLUMNS.has(c) ? q : `CASE WHEN isfinite(${q}) THEN ${q} END AS ${q}`;
+  });
+  return `(SELECT "cell_id", ${GROUP_ALIAS}, ${guarded.join(', ')} FROM ${inner})`;
 }
 
 /** A labelled <select>; calls onChange with the new value. */
@@ -119,6 +132,25 @@ function plotGrid(container, perRow) {
   };
 }
 
+/** A box summary per group for one metric: the overview tile's preview.
+ *
+ * A widget without this shows a placeholder icon in the tile grid. maxRawPoints:0 forces
+ * the SQL box summary, because a preview has to stay cheap.
+ */
+function miniDistribution(ctx, container, { numCol, source, where, yLabel }) {
+  return ctx.plot.engine.renderDistribution(container, ctx, {
+    numCol,
+    source: { table: source, where },
+    catSql: GROUP_ALIAS,
+    yLabel,
+    series: { isCategory: true },
+    categoriesOrder: ctx.groups,
+    catLabelFn: ctx.groupLabel,
+    mini: true,
+    maxRawPoints: 0,
+  });
+}
+
 // ── Instance morphology ───────────────────────────────────────────────────────
 
 const instanceMorphology = {
@@ -128,6 +160,28 @@ const instanceMorphology = {
 
   requires(schema) {
     return schema.allCols.includes('instance_entity');
+  },
+
+  async overviewPlot(container, ctx) {
+    const metric = METRIC_ORDER.find((c) => ctx.schema.allCols.includes(c));
+    const [entity] = await distinctValues(ctx, 'unnest(instance_entity)');
+    if (!metric || !entity) return false;
+    return miniDistribution(ctx, container, {
+      numCol: metric,
+      source: unnestedSource(ctx, ['instance_entity', metric]),
+      where: `WHERE ${ctx.sql.q('instance_entity')} = ${esc(entity)}`,
+      yLabel: labelFor(metric),
+    });
+  },
+
+  async overviewMessage(ctx) {
+    const [row] = await ctx.queryRows(
+      `SELECT COUNT(*) AS n, COUNT(DISTINCT ${ctx.sql.q('instance_entity')}) AS entities
+       FROM ${unnestedSource(ctx, ['instance_entity', 'instance_volume_um3'])}`
+    );
+    if (!row || !Number(row.n)) return null;
+    return `<strong>${Number(row.n).toLocaleString()}</strong> instances across `
+      + `<strong>${row.entities}</strong> structure(s), each measured on its own.`;
   },
 
   async render(container, ctx) {
@@ -183,6 +237,15 @@ const instanceDistances = {
 
   requires(schema) {
     return schema.allCols.includes('distance_um');
+  },
+
+  async overviewPlot(container, ctx) {
+    return miniDistribution(ctx, container, {
+      numCol: 'distance_um',
+      source: unnestedSource(ctx, ['distance_entity', 'distance_target', 'distance_um']),
+      where: '',
+      yLabel: 'Distance (µm)',
+    });
   },
 
   async render(container, ctx) {
@@ -272,6 +335,28 @@ const instanceReach = {
 
   requires(schema) {
     return schema.allCols.includes('distance_um');
+  },
+
+  async overviewPlot(container, ctx) {
+    // One pair's curves, as a taste of the matrix the full widget draws.
+    const [entity] = await distinctValues(ctx, 'unnest(distance_entity)');
+    if (!entity) return false;
+    const curves = await ctx.queryRows(`
+      SELECT target_a, target_b, grp,
+             quantile_cont(reach, [${CURVE_PROBABILITIES.join(', ')}]) AS quantiles
+      FROM ${reachSource(ctx, entity)} WHERE reach IS NOT NULL
+      GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`);
+    if (!curves.length) return false;
+    const [first] = curves;
+    ctx.plot.appendMini(container, curves
+      .filter((r) => r.target_a === first.target_a && r.target_b === first.target_b)
+      .map((r) => ({
+        type: 'scatter', mode: 'lines',
+        line: { shape: 'hv', width: 2, color: ctx.color.group(r.grp) },
+        x: Array.from(r.quantiles ?? [], Number),
+        y: CURVE_PROBABILITIES.map((prob) => prob * 100),
+      })), { xaxis: { rangemode: 'tozero' }, yaxis: { ticksuffix: '%', range: [0, 102] } });
+    return true;
   },
 
   async render(container, ctx) {

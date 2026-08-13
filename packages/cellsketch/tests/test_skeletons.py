@@ -66,7 +66,7 @@ def test_excluded_entities_report_skeleton_metrics_as_not_measured(monkeypatch):
 
     by_entity = dict(zip(row["instance_entity"], row["instance_length_um"]))
     assert by_entity["mito"] > 0                    # asked for
-    assert np.isnan(by_entity["granules"])          # not measured, not zero
+    assert by_entity["granules"] is None            # not measured: null, not zero
 
 
 def test_skeleton_metrics_are_measured_for_everything_by_default(monkeypatch):

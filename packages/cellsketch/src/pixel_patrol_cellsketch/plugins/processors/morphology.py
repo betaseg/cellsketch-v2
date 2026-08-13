@@ -29,6 +29,7 @@ from pixel_patrol_cellsketch.geometry import (
     sphericity,
 )
 from pixel_patrol_cellsketch.plugins.loaders.cell_loader import CELL_KIND
+from pixel_patrol_cellsketch.plugins.processors.instances import null_if_not_finite
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,8 @@ class MorphologyProcessor:
                 "instance_count": int(np.unique(labels[labels > 0]).size),
                 "total_volume_um3": float((labels > 0).sum() * voxel_um3),
             })
-        return row
+        # NaN would break the very widgets these scalars exist for: see null_if_not_finite.
+        return {key: null_if_not_finite(value) for key, value in row.items()}
 
     def get_aggregation(self, name: str):
         if name in _SUMMED:

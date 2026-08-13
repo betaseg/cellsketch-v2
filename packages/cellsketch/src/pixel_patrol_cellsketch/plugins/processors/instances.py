@@ -134,10 +134,27 @@ def channel_view(arr: np.ndarray, c_axis: int, index: int) -> np.ndarray:
     return arr[tuple(key)]
 
 
+def null_if_not_finite(value: Any) -> Any:
+    """NaN and infinity become NULL, because that is how a table says "not measured".
+
+    Left as NaN they are not merely untidy: DuckDB's STDDEV raises "out of range" on a
+    column that holds one, so a single unmeasured instance took a whole widget down, and
+    min/max/quantiles came back nan.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _as_list(values: List[Any]) -> Optional[List[Any]]:
-    """None rather than [] for empty: an empty list would type the parquet column
-    List(Null) and clash with the typed list written for cells that have instances."""
-    return values or None
+    """The list with non-finite elements nulled, or None if there is nothing to say.
+
+    Both empty and all-null come back as None: a list of nothing but NULLs types the
+    parquet column List(Null), which cannot be written alongside the List(Double) another
+    cell wrote - the same reason an empty list is not emitted either.
+    """
+    nulled = [null_if_not_finite(v) for v in values]
+    return nulled if any(v is not None for v in nulled) else None
 
 
 class InstanceProcessor:
