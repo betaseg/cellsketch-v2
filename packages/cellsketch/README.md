@@ -4,9 +4,10 @@ CellSketch as a [PixelPatrol](https://pixelpatrol.app/) extension: a loader, a
 processor, and (later) viewer widgets that replace `analyze_cell.py`'s own
 discovery, reporting, and HTML viewers with PixelPatrol's pipeline and report.
 
-**Status: in progress.** The loader, per-entity morphology, and instance contacts are
-in place, so a run produces a PixelPatrol table with one row per cell and one row per
-entity. Per-instance distances, meshes and the viewer widgets are not ported yet;
+**Status: in progress.** The loader, per-entity morphology, per-instance morphology,
+distances, polarity and instance contacts are in place, so a run produces a PixelPatrol
+table carrying everything `analyze_cell.py`'s `report.parquet` does except meshes and
+skeleton geometry. The viewer widgets and the mesh payload are not ported yet;
 `analyze_cell.py` remains the complete tool until they are.
 
 ## Data model
@@ -21,22 +22,36 @@ then gets one row per dimension slice, which maps onto CellSketch like this:
 | one cell folder | one record, entity volumes stacked along `C` (`CZYX`) |
 | one entity (organelle) | one row at `obs_level=1`, `dim_c` → `channel_names` |
 | whole cell | one row at `obs_level=0` |
-| one instance (`row_type=instance`) | an element of the `instance_*` list columns |
+| one instance (`row_type=instance`) | an element of the `instance_*` list columns, on the cell row |
 | one contact (`row_type=contact`) | an element of the `contact_*` list columns, on the cell row |
 | experimental group | a `-p` import path (`imported_path_short`) |
 
-Instances have no row of their own because PixelPatrol has no granularity below a
-dimension slice. Widgets unnest them in SQL instead:
+PixelPatrol emits one row per leaf block, and a leaf is one entity — which is what makes
+`entity_name` a groupable column with scalar metrics the built-in widgets can plot. It
+also means a leaf sees only its own entity, so anything measured *between* entities
+(a distance, a contact) is computed by a cell-level processor that sees every channel,
+and stored as parallel list columns on the cell row. There are three such groups, each
+one `unnest` away, and several `unnest()` calls in one `SELECT` stay row-aligned:
+
+**Instances** — `analyze_cell.py`'s `row_type=instance` table:
 
 ```sql
-SELECT cell_id, entity_name, unnest(instance_volume_um3) AS volume_um3
-FROM pp_data
-WHERE obs_level = 1 AND entity_kind = 'label'
+SELECT cell_id, unnest(instance_entity) AS entity_name, unnest(instance_label) AS label,
+                unnest(instance_volume_um3) AS volume_um3,
+                unnest(instance_sphericity) AS sphericity
+FROM pp_data WHERE obs_level = 0
 ```
 
-Contacts are pairs, so they belong to no single entity and ride on the cell row as a
-parallel edge list. Unnest them the same way (several `unnest()` calls in one `SELECT`
-stay row-aligned) and threshold the gap interactively:
+**Distances**, long format — one element per instance × target entity, because target
+names come from the data and PixelPatrol drops columns a processor did not declare:
+
+```sql
+SELECT cell_id, unnest(distance_entity) AS entity_name, unnest(distance_label) AS label,
+                unnest(distance_target) AS target, unnest(distance_um) AS distance_um
+FROM pp_data WHERE obs_level = 0
+```
+
+**Contacts** — the pairwise edge list, thresholded on `gap_um` interactively:
 
 ```sql
 SELECT cell_id, unnest(contact_entity_a) AS entity_a, unnest(contact_label_a) AS label_a,
@@ -45,9 +60,10 @@ SELECT cell_id, unnest(contact_entity_a) AS entity_a, unnest(contact_label_a) AS
 FROM pp_data WHERE obs_level = 0
 ```
 
-`gap_um` is measured in whole voxel steps, so instances sharing a face read *one voxel
-step*, not zero, and with anisotropic voxels the smallest reportable gap depends on
-direction. `analyze_cell.py` computes exactly the same numbers.
+Distances and gaps are measured voxel centre to voxel centre, so structures sharing a
+face read *one voxel step* rather than zero, and with anisotropic voxels the smallest
+non-overlapping reading depends on direction. Zero means genuine overlap. `analyze_cell.py`
+computes exactly the same numbers.
 
 ## Install (development)
 

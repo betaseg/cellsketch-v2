@@ -48,35 +48,31 @@ def test_mask_entity_reports_whole_structure_morphology():
     assert row["total_volume_um3"] == pytest.approx(row["volume_um3"])
     assert row["surface_area_um2"] > 0
     assert 0 < row["sphericity"] <= 1.2
-    assert "instance_volume_um3" not in row
 
 
-def test_label_entity_reports_one_list_element_per_instance():
+def test_label_entity_reports_counts_and_totals_only():
     volume = _cube((10, 20, 20), (2, 2, 2), (3, 3, 3), value=1)
     volume += _cube((10, 20, 20), (5, 12, 12), (4, 4, 4), value=2)
     row = MorphologyProcessor().run_chunk(_leaf(volume, name="mito", kind="label"))
 
     voxel_um3 = np.prod(VOXEL)
     assert row["instance_count"] == 2
-    assert row["instance_label"] == [1, 2]
-    assert row["instance_volume_um3"] == pytest.approx([27 * voxel_um3, 64 * voxel_um3])
-    assert row["total_volume_um3"] == pytest.approx(sum(row["instance_volume_um3"]))
-    for col in ("instance_surface_area_um2", "instance_sphericity", "instance_aspect_ratio_major_minor"):
-        assert len(row[col]) == 2
-    # Whole-structure columns stay absent for label entities — a label entity's
-    # "sphericity" would be the sphericity of a union of unrelated objects.
+    assert row["total_volume_um3"] == pytest.approx((27 + 64) * voxel_um3)
+    # Per-instance measurements need the rest of the cell (distances, polarity), so they
+    # are the cell-level processor's job, not this one's.
+    assert "instance_volume_um3" not in row
+    # And a label entity has no whole-structure morphology: the "sphericity" of a union
+    # of unrelated objects is meaningless.
     assert "sphericity" not in row
 
 
-def test_empty_label_entity_emits_null_lists_not_empty_ones():
+def test_empty_label_entity_counts_zero():
     row = MorphologyProcessor().run_chunk(
         _leaf(np.zeros((10, 20, 20), dtype=np.int32), name="mito", kind="label")
     )
 
     assert row["instance_count"] == 0
-    # None, not []: an empty list would type the parquet column List(Null) and clash
-    # with the List(Double) written for cells that do have instances.
-    assert row["instance_volume_um3"] is None
+    assert row["total_volume_um3"] == 0.0
 
 
 def test_spatial_fragment_is_refused():
@@ -100,32 +96,3 @@ def test_aggregation_sums_counts_and_drops_per_entity_scalars():
     assert proc.get_aggregation("sphericity")(rows, {}) is None
     assert proc.get_aggregation("sphericity")(rows[:1], {}) == 0.8
     assert proc.get_aggregation("entity_name")(rows[:1], {}) == "mito"
-    # Group size decides, not how many rows carry the column: 'nucleus' has no
-    # instance list, but the cell row must still not inherit 'mito's.
-    assert proc.get_aggregation("instance_volume_um3")(
-        [{"instance_volume_um3": [1.0, 2.0]}, {"entity_name": "nucleus"}], {}
-    ) is None
-
-
-def test_skeleton_metrics_are_measured_per_instance():
-    volume = _cube((10, 20, 20), (2, 2, 2), (3, 3, 3), value=1)
-    volume += _cube((10, 20, 20), (5, 12, 12), (4, 4, 4), value=2)
-    row = MorphologyProcessor().run_chunk(_leaf(volume, name="mito", kind="label"))
-
-    assert len(row["instance_branches"]) == 2
-    assert all(n >= 1 for n in row["instance_branches"])
-    assert all(length > 0 for length in row["instance_length_um"])
-    # Arc/chord is ≥ 1 by construction; a straight branch lands on 1 within float noise.
-    assert all(t >= 1.0 - 1e-9 for t in row["instance_tortuosity"])
-
-
-def test_oversized_instances_report_skeletons_as_not_measured(monkeypatch):
-    monkeypatch.setenv("CELLSKETCH_MAX_SKELETON_VOXELS", "10")
-    volume = _cube((10, 20, 20), (2, 2, 2), (3, 3, 3), value=1)  # 27 voxels, over the cap
-    row = MorphologyProcessor().run_chunk(_leaf(volume, name="mito", kind="label"))
-
-    # NaN, not 0.0 — the skeleton was skipped to bound runtime, not measured as empty.
-    assert np.isnan(row["instance_branches"]).all()
-    assert np.isnan(row["instance_length_um"]).all()
-    # The rest of the instance's morphology is still reported.
-    assert row["instance_volume_um3"] == pytest.approx([27 * np.prod(VOXEL)])

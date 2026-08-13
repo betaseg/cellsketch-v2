@@ -42,7 +42,7 @@ def test_cell_row_carries_no_per_entity_measurements(table):
     # Per-entity values must not leak onto the cell row even when only one entity
     # produced them — otherwise a one-label-entity cell looks different in kind from
     # a two-label-entity one.
-    for col in ("entity_name", "entity_kind", "volume_um3", "sphericity", "instance_volume_um3"):
+    for col in ("entity_name", "entity_kind", "volume_um3", "sphericity"):
         assert cells[col].null_count() == cells.height
 
 
@@ -88,26 +88,64 @@ def test_group_comes_from_the_import_path(table):
     }
 
 
-def test_instance_lists_unnest_to_one_row_per_instance(table):
-    mito = table.filter((pl.col("obs_level") == 1) & (pl.col("entity_name") == "mito"))
+def _instances(table) -> pl.DataFrame:
+    """The instance table, as a widget gets it: one unnest of the cell row's lists."""
+    instance_cols = [c for c in table.columns if c.startswith("instance_") and c != "instance_count"]
+    return (
+        table.filter(pl.col("obs_level") == 0)
+        .select("cell_id", "imported_path_short", *instance_cols)
+        .explode(instance_cols, empty_as_null=True)
+    )
 
-    assert mito["instance_count"].to_list() == [4, 4, 3, 3]
-    for count, volumes in zip(mito["instance_count"], mito["instance_volume_um3"]):
-        assert len(volumes) == count
-        assert all(v > 0 for v in volumes)
+
+def test_instance_lists_unnest_to_one_row_per_instance(table):
+    instances = _instances(table)
+
+    # 4 + 4 + 3 + 3 mitochondria, and every instance_* column stays aligned with them.
+    assert instances.height == 14
+    assert instances["instance_entity"].unique().to_list() == ["mito"]
+    assert instances["instance_volume_um3"].min() > 0
+    per_cell = instances.group_by("cell_id").len().sort("cell_id")
+    assert per_cell["len"].to_list() == [4, 4, 3, 3]
+
+
+def test_instance_count_on_the_cell_row_matches_the_instance_table(table):
+    cells = table.filter(pl.col("obs_level") == 0).sort("cell_id")
+    counted = _instances(table).group_by("cell_id").len().sort("cell_id")
+
+    # instance_count comes from the per-entity rows, the table from the cell row: two
+    # processors, one answer.
+    assert cells["instance_count"].to_list() == counted["len"].to_list()
 
 
 def test_treated_cells_have_larger_mitochondria(table):
     """The comparison the viewer's significance brackets will be drawn on."""
-    mito = table.filter((pl.col("obs_level") == 1) & (pl.col("entity_name") == "mito"))
     by_group = (
-        mito.explode("instance_volume_um3", empty_as_null=True)
+        _instances(table)
         .group_by("imported_path_short")
         .agg(pl.col("instance_volume_um3").mean())
     )
     means = dict(by_group.iter_rows())
 
     assert means["treated"] > means["control"]
+
+
+def test_instances_carry_distances_to_the_other_entities(table):
+    distances = (
+        table.filter(pl.col("obs_level") == 0)
+        .select("cell_id", "distance_entity", "distance_label", "distance_target", "distance_um")
+        .explode("distance_entity", "distance_label", "distance_target", "distance_um",
+                 empty_as_null=True)
+    )
+
+    # Every mitochondrion is measured to the two entities that are not its own.
+    assert sorted(distances["distance_target"].unique().to_list()) == ["nucleus", "pm"]
+    assert distances.height == 14 * 2
+    # 0 is a real reading, not a missing one: the synthetic mitochondria ring overlaps
+    # the nucleus, and an instance inside its target is zero away from it.
+    assert distances["distance_um"].min() == 0.0
+    assert distances["distance_um"].max() > 0
+    assert distances["distance_um"].is_finite().all()
 
 
 def test_contacts_ride_on_the_cell_row_as_an_edge_list(table):
