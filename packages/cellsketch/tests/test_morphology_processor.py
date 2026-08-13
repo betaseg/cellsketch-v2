@@ -8,10 +8,12 @@ from pixel_patrol_cellsketch.plugins.processors.morphology import MorphologyProc
 VOXEL = (0.1, 0.02, 0.02)
 
 
-def _leaf(volume: np.ndarray, *, name: str, kind: str, cell_shape=None) -> object:
+def _leaf(volume: np.ndarray, *, name: str, kind: str, cell_shape=None, center=None) -> object:
     """A record shaped like the leaf block the pipeline hands to a LEAF processor."""
     data = volume[np.newaxis, ...]
     meta = {
+        **({"cell_center_z_um": center[0], "cell_center_y_um": center[1],
+            "cell_center_x_um": center[2]} if center else {}),
         "dim_order": "CZYX",
         "dim_names": ["C", "Z", "Y", "X"],
         "shape": list(data.shape),
@@ -48,6 +50,26 @@ def test_mask_entity_reports_whole_structure_morphology():
     assert row["total_volume_um3"] == pytest.approx(row["volume_um3"])
     assert row["surface_area_um2"] > 0
     assert 0 < row["sphericity"] <= 1.2
+
+
+def test_mask_polarity_is_measured_from_the_cell_centre_in_the_record():
+    # Centroid at voxel (5, 10, 15): level with the centre in Z and Y, displaced in +X.
+    volume = _cube((10, 20, 20), (4, 9, 14), (3, 3, 3))
+    centre = (5 * VOXEL[0], 10 * VOXEL[1], 10 * VOXEL[2])
+    row = MorphologyProcessor().run_chunk(
+        _leaf(volume, name="nucleus", kind="mask", center=centre)
+    )
+
+    assert row["polar_dist_um"] > 0
+    assert row["polar_az_deg"] == pytest.approx(0.0, abs=1.0)   # +X is azimuth 0
+    assert row["polar_el_deg"] == pytest.approx(0.0, abs=1.0)
+
+
+def test_mask_polarity_is_absent_without_a_cell_centre():
+    volume = _cube((10, 20, 20), (2, 5, 5), (4, 6, 6))
+    row = MorphologyProcessor().run_chunk(_leaf(volume, name="nucleus", kind="mask"))
+
+    assert "polar_dist_um" not in row
 
 
 def test_label_entity_reports_counts_and_totals_only():

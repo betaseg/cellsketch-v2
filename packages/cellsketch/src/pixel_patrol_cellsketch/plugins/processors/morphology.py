@@ -22,6 +22,7 @@ from pixel_patrol_base.core.contracts import ChunkKind
 from pixel_patrol_base.core.record import Record
 from pixel_patrol_base.core.specs import RecordSpec
 
+from pixel_patrol_cellsketch.distances import polarity_from_offset
 from pixel_patrol_cellsketch.geometry import (
     aspect_ratio_from_coords,
     estimate_surface_area_um2,
@@ -40,6 +41,9 @@ _COLUMNS: Dict[str, Any] = {
     "surface_area_um2":         np.float64,
     "sphericity":               np.float64,
     "aspect_ratio_major_minor": np.float64,
+    "polar_dist_um":            np.float64,
+    "polar_az_deg":             np.float64,
+    "polar_el_deg":             np.float64,
 }
 
 _DESCRIPTIONS: Dict[str, str] = {
@@ -51,6 +55,9 @@ _DESCRIPTIONS: Dict[str, str] = {
     "surface_area_um2":         "Voxel-face surface area of the structure in µm² (mask entities).",
     "sphericity":               "Sphericity of the structure, 1 = perfect sphere (mask entities).",
     "aspect_ratio_major_minor": "Ratio of largest to smallest PCA axis length (mask entities).",
+    "polar_dist_um":            "Distance in µm from the cell centre to this structure's centroid (mask entities).",
+    "polar_az_deg":             "Azimuth in degrees of this structure's centroid as seen from the cell centre (mask entities).",
+    "polar_el_deg":             "Elevation in degrees of this structure's centroid as seen from the cell centre (mask entities).",
 }
 
 # Only the instance count adds up across entities: it counts labelled objects, and mask
@@ -142,6 +149,12 @@ class MorphologyProcessor:
                     aspect_ratio_from_coords(coords, voxel_size_zyx) if coords.size else float("nan")
                 ),
             })
+            # Where this structure sits relative to the cell: the loader put the membrane
+            # centroid in the record, so even a leaf that sees one entity can measure it.
+            center = [meta.get(f"cell_center_{ax}_um") for ax in "zyx"]
+            if coords.size and all(c is not None for c in center):
+                centroid_um = coords.mean(axis=0) * np.array(voxel_size_zyx)
+                row.update(polarity_from_offset(*(centroid_um - np.array(center, dtype=float))))
         else:
             labels = volume.astype(np.int32, copy=False)
             row.update({

@@ -33,6 +33,7 @@ from pixel_patrol_base.core.loader_schema import (
 from pixel_patrol_base.core.record import Record, record_from
 
 from pixel_patrol_cellsketch.config import CellSketchConfig
+from pixel_patrol_cellsketch.distances import cell_center_um
 from pixel_patrol_cellsketch.discovery import (
     Dataset,
     clip_to_membrane,
@@ -102,6 +103,9 @@ class CellLoader:
         "n_entities": int,
         "cell_shape_zyx": list,
         "voxel_size_source": str,
+        "cell_center_z_um": float,
+        "cell_center_y_um": float,
+        "cell_center_x_um": float,
     }
     OUTPUT_SCHEMA_DESCRIPTIONS: Dict[str, str] = {
         "cell_id": "Name of the cell folder the entity volumes were read from.",
@@ -110,6 +114,9 @@ class CellLoader:
         "n_entities": "Number of entity volumes stacked along C for this cell.",
         "cell_shape_zyx": "Voxel extent (Z, Y, X) of the analysed volume after cropping to the membrane bounding box.",
         "voxel_size_source": "Where the voxel size came from: 'tiff-metadata' or 'config'.",
+        "cell_center_z_um": "Z coordinate in µm of the plasma-membrane centroid, the origin every polarity metric is measured from.",
+        "cell_center_y_um": "Y coordinate in µm of the plasma-membrane centroid.",
+        "cell_center_x_um": "X coordinate in µm of the plasma-membrane centroid.",
     }
     OUTPUT_SCHEMA_PATTERNS: List[tuple[str, Any]] = list(RASTER_IMAGE_LOADER_SCHEMA_PATTERNS)
 
@@ -202,6 +209,11 @@ class CellLoader:
             "pixel_size_Y": float(voxel_size_zyx[1]),
             "pixel_size_X": float(voxel_size_zyx[2]),
         }
+        # The membrane centroid is the origin for every polarity metric. Computed here,
+        # once, so a processor that sees only one entity can still measure against it.
+        center = cell_center_um(volumes[membrane_key], voxel_size_zyx)
+        if center is not None:
+            meta["cell_center_z_um"], meta["cell_center_y_um"], meta["cell_center_x_um"] = center
         logger.info(
             "cellsketch: %s — %d entities, %s voxels, voxel size (z,y,x) µm: %.4g, %.4g, %.4g "
             "(source dtype %s)",

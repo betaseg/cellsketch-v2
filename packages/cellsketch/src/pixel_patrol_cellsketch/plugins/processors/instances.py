@@ -158,10 +158,16 @@ class InstanceProcessor:
         if membrane_name in volumes:
             voxel_um3 = float(np.prod(voxel_size_zyx))
             out["cell_volume_um3"] = float((volumes[membrane_name] > 0).sum() * voxel_um3)
-        center = (
-            cell_center_um(volumes[membrane_name], voxel_size_zyx)
-            if membrane_name in volumes else None
-        )
+
+        # The loader computed the membrane centroid, so polarity here and on the entity
+        # rows is measured from the same origin.
+        from_meta = [meta.get(f"cell_center_{ax}_um") for ax in "zyx"]
+        if all(c is not None for c in from_meta):
+            center = tuple(float(c) for c in from_meta)
+        elif membrane_name in volumes:
+            center = cell_center_um(volumes[membrane_name], voxel_size_zyx)
+        else:
+            center = None
 
         # One distance transform per target, reused by every instance measured against it.
         targets = build_distance_targets(volumes, kinds_by_name)
