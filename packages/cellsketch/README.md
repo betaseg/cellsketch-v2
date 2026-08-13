@@ -111,6 +111,11 @@ Two widgets ship with the package and load automatically in `pixel-patrol view`
 | --- | --- |
 | Instance Morphology | one violin per group for every per-instance metric, with a structure selector |
 | Distances Between Structures | distance from each instance of one structure to each other structure |
+| Reaching Two Structures At Once | one panel per pair of structures; for each instance the *larger* of its two distances, as a cumulative share — a curve that climbs early means most instances sit against both |
+
+The reach curves are drawn from quantiles, so a group of 8000 instances costs 51
+vertices rather than 8000 points, and the reading is the same at any *n*. They mirror
+the panel matrix `stats_viewer.html` grew, computed from the long-format distances.
 
 Both build their own source — a subquery that unnests the cell row's list columns —
 and hand it to the viewer's own distribution engine, so instance-level data goes

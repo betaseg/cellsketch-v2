@@ -51,7 +51,10 @@ async function distinctValues(ctx, expr) {
 function unnestedSource(ctx, columns) {
   const selects = columns.map((c) => `unnest(${ctx.sql.q(c)}) AS ${ctx.sql.q(c)}`);
   const where = ctx.sql.andWhere(ctx.where, CELL_ROW);
-  return `(SELECT ${ctx.sql.groupCol()} AS ${GROUP_ALIAS}, ${selects.join(', ')} FROM pp_data ${where})`;
+  // cell_id rides along: an instance is identified by cell + entity + label, which is
+  // what any join on instances has to match.
+  return `(SELECT "cell_id", ${ctx.sql.groupCol()} AS ${GROUP_ALIAS}, ${selects.join(', ')}
+           FROM pp_data ${where})`;
 }
 
 /** A labelled <select>; calls onChange with the new value. */
@@ -237,4 +240,112 @@ const instanceDistances = {
   },
 };
 
-export default [instanceMorphology, instanceDistances];
+// ── Reach: how close instances get to two structures at once ──────────────────
+
+// Probabilities the reach curve is drawn from. A monotone curve needs no more
+// vertices than this, so a group of 8000 instances costs 51 points, not 8000.
+const CURVE_PROBABILITIES = Array.from({ length: 51 }, (_, i) => i / 50);
+
+/** One row per (instance × pair of targets): the distance at which it reaches both. */
+function reachSource(ctx, entity) {
+  const long = unnestedSource(ctx, [
+    'distance_entity', 'distance_label', 'distance_target', 'distance_um',
+  ]);
+  return `(
+    SELECT a.${GROUP_ALIAS} AS grp, a."distance_target" AS target_a,
+           b."distance_target" AS target_b,
+           GREATEST(a."distance_um", b."distance_um") AS reach
+    FROM ${long} a
+    JOIN ${long} b
+      ON a."cell_id" = b."cell_id"
+     AND a."distance_entity" = b."distance_entity"
+     AND a."distance_label" = b."distance_label"
+     AND a."distance_target" < b."distance_target"
+    WHERE a."distance_entity" = ${esc(entity)}
+  )`;
+}
+
+const instanceReach = {
+  id: 'cellsketch-reach',
+  label: 'Reaching Two Structures At Once',
+  group: 'Dataset Stats',
+
+  requires(schema) {
+    return schema.allCols.includes('distance_um');
+  },
+
+  async render(container, ctx) {
+    const entities = await distinctValues(ctx, 'unnest(distance_entity)');
+    if (!entities.length) {
+      emptyState(container, 'No distances in this report.');
+      return;
+    }
+
+    const controls = document.createElement('div');
+    controls.style.cssText = 'margin-bottom:.5rem';
+    container.appendChild(controls);
+    const plots = document.createElement('div');
+    container.appendChild(plots);
+
+    let entity = entities[0];
+    const draw = async () => {
+      plots.replaceChildren();
+      const probs = `[${CURVE_PROBABILITIES.join(', ')}]`;
+      const curves = await ctx.queryRows(`
+        SELECT target_a, target_b, grp, COUNT(*) AS n,
+               quantile_cont(reach, ${probs}) AS quantiles
+        FROM ${reachSource(ctx, entity)}
+        WHERE reach IS NOT NULL
+        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`);
+      if (!curves.length) {
+        emptyState(plots, `${entity} instances have fewer than two other structures to reach.`);
+        return;
+      }
+
+      note(
+        plots,
+        `For every ${entity} instance, the larger of its two distances — the distance at ` +
+          'which it is close to both structures. The curve is the share of instances at or ' +
+          'below each value, so one that climbs early and steeply means most sit against both.'
+      );
+
+      const asNumbers = (q) => Array.from(q ?? [], Number);
+      // A shared X range makes every panel directly comparable.
+      const xMax = Math.max(...curves.flatMap((r) => asNumbers(r.quantiles)));
+      const pairs = [...new Set(curves.map((r) => `${r.target_a} ${r.target_b}`))];
+      const nextCell = plotGrid(plots, pairs.length <= 1 ? 1 : 2);
+
+      for (const pair of pairs) {
+        const [a, b] = pair.split(' ');
+        const traces = curves
+          .filter((r) => r.target_a === a && r.target_b === b)
+          .map((r) => ({
+            type: 'scatter',
+            mode: 'lines',
+            line: { shape: 'hv', width: 2, color: ctx.color.group(r.grp) },
+            name: `${ctx.groupLabel(r.grp)} (n=${Number(r.n).toLocaleString()})`,
+            x: asNumbers(r.quantiles),
+            y: CURVE_PROBABILITIES.map((p) => p * 100),
+            hovertemplate: 'reaches both within %{x:.3g} µm<br>%{y:.0f}% of instances<extra>%{fullData.name}</extra>',
+          }));
+        ctx.plot.append(nextCell(), traces, {
+          title: { text: `${a} & ${b}` },
+          xaxis: { title: 'reaches both within (µm)', rangemode: 'tozero', range: [0, xMax] },
+          yaxis: { title: `% of ${entity} instances`, ticksuffix: '%', range: [0, 102] },
+          showlegend: true,
+          legend: { orientation: 'h', y: -0.25 },
+        });
+      }
+    };
+
+    controls.appendChild(
+      selector('Structure', entities, entity, (v) => {
+        entity = v;
+        draw();
+      })
+    );
+    await draw();
+  },
+};
+
+export default [instanceMorphology, instanceDistances, instanceReach];

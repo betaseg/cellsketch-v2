@@ -20,7 +20,27 @@ GROUP_ALIAS = '"__cs_group__"'
 
 def _unnested_source(group_col: str, columns: list[str]) -> str:
     selects = ", ".join(f'unnest("{c}") AS "{c}"' for c in columns)
-    return f'(SELECT "{group_col}" AS {GROUP_ALIAS}, {selects} FROM pp_data WHERE "obs_level" = 0)'
+    return (
+        f'(SELECT "cell_id", "{group_col}" AS {GROUP_ALIAS}, {selects} '
+        'FROM pp_data WHERE "obs_level" = 0)'
+    )
+
+
+def _reach_source(entity: str) -> str:
+    """Mirrors reachSource() in plugin_cellsketch.js."""
+    long = _unnested_source(
+        "imported_path_short",
+        ["distance_entity", "distance_label", "distance_target", "distance_um"],
+    )
+    return f"""(
+      SELECT a.{GROUP_ALIAS} AS grp, a."distance_target" AS target_a,
+             b."distance_target" AS target_b,
+             GREATEST(a."distance_um", b."distance_um") AS reach
+      FROM {long} a JOIN {long} b
+        ON a."cell_id" = b."cell_id" AND a."distance_entity" = b."distance_entity"
+       AND a."distance_label" = b."distance_label"
+       AND a."distance_target" < b."distance_target"
+      WHERE a."distance_entity" = '{entity}')"""
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +74,7 @@ def test_the_declared_widget_ids_are_unique_and_namespaced():
     source = (get_viewer_extension_dir() / "plugin_cellsketch.js").read_text()
     ids = [line.split("'")[1] for line in source.splitlines() if line.strip().startswith("id: '")]
 
-    assert ids == ["cellsketch-instance-morphology", "cellsketch-distances"]
+    assert ids == ["cellsketch-instance-morphology", "cellsketch-distances", "cellsketch-reach"]
 
 
 # ── the SQL those widgets issue ───────────────────────────────────────────────
@@ -124,6 +144,35 @@ def test_the_distance_widget_source_yields_one_row_per_instance_and_target(con):
     ).fetchall()
 
     assert [(r[0], r[1]) for r in rows] == [("nucleus", 14), ("pm", 14)]
+
+
+def test_reach_pairs_stay_within_their_own_cell(con):
+    pairs = con.execute(
+        f"""SELECT target_a, target_b, grp, COUNT(*) AS n FROM {_reach_source('mito')}
+            GROUP BY 1, 2, 3 ORDER BY 3"""
+    ).fetchall()
+
+    # One row per instance per unordered pair of the other structures - 14 instances,
+    # one pair (nucleus & pm). A join that matched across cells would multiply this.
+    assert pairs == [("nucleus", "pm", "control", 8), ("nucleus", "pm", "treated", 6)]
+
+
+def test_the_reach_curve_is_drawn_from_quantiles(con):
+    probs = ", ".join(str(i / 50) for i in range(51))
+    rows = con.execute(
+        f"""SELECT grp, COUNT(*) AS n, quantile_cont(reach, [{probs}]) AS quantiles
+            FROM {_reach_source('mito')} WHERE reach IS NOT NULL GROUP BY 1 ORDER BY 1"""
+    ).fetchall()
+
+    for _grp, _n, quantiles in rows:
+        # Fixed vertex count whatever the instance count, and monotone by construction.
+        assert len(quantiles) == 51
+        assert quantiles == sorted(quantiles)
+
+    # Treated mitochondria were built larger and closer in, so they reach both
+    # structures at shorter distances than control - the separation the curve shows.
+    by_group = {grp: quantiles for grp, _n, quantiles in rows}
+    assert max(by_group["treated"]) < max(by_group["control"])
 
 
 def test_the_widgets_find_the_columns_they_require(con):
