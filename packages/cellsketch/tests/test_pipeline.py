@@ -6,25 +6,6 @@ one row per cell at obs_level 0, one row per entity at obs_level 1 keyed by dim_
 
 import polars as pl
 import pytest
-from pixel_patrol_base import api
-
-from synthetic import make_dataset
-
-# One leaf block = one whole entity volume. Z must be pinned to full extent
-# explicitly: PixelPatrol's default leaf shape steps every non-XY dim by 1.
-SLICE_SIZE = {"C": 1, "Z": -1}
-
-
-@pytest.fixture(scope="module")
-def table(tmp_path_factory) -> pl.DataFrame:
-    root = make_dataset(tmp_path_factory.mktemp("cells"))
-    out = root.parent / "report.parquet"
-    project = api.create_project("cellsketch-test", root, loader="cellsketch", output_path=out)
-    api.add_paths(project, ["control", "treated"])
-    api.process_files(project, slice_size=SLICE_SIZE, max_workers=1, mb_per_task=4096)
-    df, _ = api.load(out)
-    return df
-
 
 def test_one_row_per_cell_at_obs_level_0(table):
     cells = table.filter(pl.col("obs_level") == 0)

@@ -5,10 +5,12 @@ processor, and (later) viewer widgets that replace `analyze_cell.py`'s own
 discovery, reporting, and HTML viewers with PixelPatrol's pipeline and report.
 
 **Status: in progress.** The loader, per-entity morphology, per-instance morphology,
-distances, polarity and instance contacts are in place, so a run produces a PixelPatrol
-table carrying everything `analyze_cell.py`'s `report.parquet` does except meshes and
-skeleton geometry. The viewer widgets and the mesh payload are not ported yet;
-`analyze_cell.py` remains the complete tool until they are.
+distances, polarity and instance contacts are in place, plus two viewer widgets, so a
+run produces a PixelPatrol table carrying everything `analyze_cell.py`'s
+`report.parquet` does except meshes and skeleton geometry. Still to port: the mesh and
+skeleton payloads (and with them `mesh_viewer.html`), and a contacts widget with the
+gap-threshold slider and grouping that `stats_viewer.html` has. `analyze_cell.py`
+remains the complete tool until then.
 
 ## Data model
 
@@ -99,6 +101,25 @@ Two flags matter and are not optional:
   (`n_entities × Z × Y × X × 4` bytes). Below that PixelPatrol splits the volume
   spatially and the processor refuses the fragment rather than reporting metrics
   measured on part of a cell.
+
+## Viewer widgets
+
+Two widgets ship with the package and load automatically in `pixel-patrol view`
+(discovered through the `pixel_patrol.viewer_extensions` entry point):
+
+| Widget | Shows |
+| --- | --- |
+| Instance Morphology | one violin per group for every per-instance metric, with a structure selector |
+| Distances Between Structures | distance from each instance of one structure to each other structure |
+
+Both build their own source — a subquery that unnests the cell row's list columns —
+and hand it to the viewer's own distribution engine, so instance-level data goes
+through the same violins, palette, grouping and **Mann-Whitney significance brackets**
+as the built-in widgets. Turn the brackets on with the sidebar's *Show significance*
+(or `pixel-patrol view … --significance`).
+
+That reuse is the reason for this package: the engine takes an arbitrary source table
+expression, so it does not care that the rows came from an unnest.
 
 ## Configuration
 
