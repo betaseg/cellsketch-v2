@@ -227,9 +227,9 @@ class MorphologyProcessor:
         for rp in props:
             vol_um3 = float(rp.area * voxel_um3)
             area_um2 = estimate_surface_area_um2(rp.image, voxel_size_zyx)
-            if skels is None or (cfg.max_skeleton_voxels is not None and rp.area > cfg.max_skeleton_voxels):
-                # No kimimaro installed, or the instance is over the size cap: report
-                # not-measured (NaN) rather than a misleading zero-length skeleton.
+            if cfg.max_skeleton_voxels is not None and rp.area > cfg.max_skeleton_voxels:
+                # Over the size cap: report not-measured (NaN) rather than a
+                # misleading zero-length skeleton.
                 skel = unmeasured
             else:
                 skel = skeleton_graph_metrics(skels.get(int(rp.label)))

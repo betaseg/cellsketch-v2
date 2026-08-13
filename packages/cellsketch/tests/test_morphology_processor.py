@@ -1,5 +1,3 @@
-import importlib.util
-
 import numpy as np
 import pytest
 from pixel_patrol_base.core.record import record_from
@@ -109,14 +107,25 @@ def test_aggregation_sums_counts_and_drops_per_entity_scalars():
     ) is None
 
 
-@pytest.mark.skipif(
-    importlib.util.find_spec("kimimaro") is not None, reason="kimimaro is installed"
-)
-def test_skeleton_metrics_are_nan_when_kimimaro_is_missing():
+def test_skeleton_metrics_are_measured_per_instance():
     volume = _cube((10, 20, 20), (2, 2, 2), (3, 3, 3), value=1)
+    volume += _cube((10, 20, 20), (5, 12, 12), (4, 4, 4), value=2)
     row = MorphologyProcessor().run_chunk(_leaf(volume, name="mito", kind="label"))
 
-    # Not measured, not zero-length: the columns exist so a run with the optional
-    # extra installed writes the same schema.
+    assert len(row["instance_branches"]) == 2
+    assert all(n >= 1 for n in row["instance_branches"])
+    assert all(length > 0 for length in row["instance_length_um"])
+    # Arc/chord is ≥ 1 by construction; a straight branch lands on 1 within float noise.
+    assert all(t >= 1.0 - 1e-9 for t in row["instance_tortuosity"])
+
+
+def test_oversized_instances_report_skeletons_as_not_measured(monkeypatch):
+    monkeypatch.setenv("CELLSKETCH_MAX_SKELETON_VOXELS", "10")
+    volume = _cube((10, 20, 20), (2, 2, 2), (3, 3, 3), value=1)  # 27 voxels, over the cap
+    row = MorphologyProcessor().run_chunk(_leaf(volume, name="mito", kind="label"))
+
+    # NaN, not 0.0 — the skeleton was skipped to bound runtime, not measured as empty.
     assert np.isnan(row["instance_branches"]).all()
     assert np.isnan(row["instance_length_um"]).all()
+    # The rest of the instance's morphology is still reported.
+    assert row["instance_volume_um3"] == pytest.approx([27 * np.prod(VOXEL)])

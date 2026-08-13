@@ -46,14 +46,6 @@ VIRTUAL_ENV=$PWD/.venv uv pip install -e . \
   -e /path/to/pixel-patrol/packages/pixel-patrol-base pytest
 ```
 
-Curve-skeleton metrics (`instance_branches`, `instance_length_um`,
-`instance_tortuosity`) need the optional extra; without it those columns are null and
-everything else still runs:
-
-```bash
-VIRTUAL_ENV=$PWD/.venv uv pip install -e ".[skeleton]"
-```
-
 ## Run
 
 ```bash

@@ -2,8 +2,6 @@
 
 Moved unchanged from ``analyze_cell.py`` — surface area, sphericity, PCA aspect
 ratio, and the kimimaro curve-skeleton metrics (branches / length / tortuosity).
-Skeletons are optional: without kimimaro installed the metrics come back NaN
-instead of failing the run.
 """
 
 from __future__ import annotations
@@ -12,6 +10,7 @@ import logging
 import math
 from typing import Dict, Tuple
 
+import kimimaro
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -79,21 +78,13 @@ def compute_curve_skeletons(
     voxel_size_zyx: Tuple[float, float, float],
     max_voxels: int | None = None,
     num_threads: int = 0,
-) -> dict | None:
+) -> dict:
     """TEASAR curve skeletons for every instance in a label volume (kimimaro).
 
     Returns ``{label_id: cloudvolume.Skeleton}``, vertices in µm in the volume frame
     (axis order ZYX). Instances larger than ``max_voxels`` are skipped to bound
-    runtime. Returns ``None`` — as opposed to an empty dict — when kimimaro is not
-    installed, so callers can report "not measured" instead of a skeleton of zero
-    length.
+    runtime.
     """
-    try:
-        import kimimaro
-    except ImportError:
-        logger.info("cellsketch: kimimaro unavailable — skeleton metrics disabled")
-        return None
-
     lab = np.ascontiguousarray(labels.astype(np.uint32))
     object_ids = None
     if max_voxels is not None:

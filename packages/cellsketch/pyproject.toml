@@ -16,12 +16,6 @@ dependencies = [
     "tifffile>=2024.5.0",
     "imagecodecs",
     "edt>=2.4.0",
-]
-
-[project.optional-dependencies]
-# Curve-skeleton metrics (branches / length_um / tortuosity). Without these the
-# morphology processor still runs and reports skeleton metrics as null.
-skeleton = [
     "kimimaro>=4.0.0",
     "crackle-codec",
     "posix-ipc",
