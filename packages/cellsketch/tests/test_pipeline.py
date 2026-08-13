@@ -70,6 +70,9 @@ def test_the_discovered_unit_is_the_cell_folder(table):
     assert table.height == 4 * 4
     assert table["name"].unique().sort().to_list() == ["cell_a", "cell_b", "cell_c", "cell_d"]
     assert table["parent"].unique().sort().to_list() == ["control", "treated"]
+    # And its size describes the volumes it was built from, not the 4 KB inode of the
+    # directory holding them.
+    assert table["size_bytes"].min() > 100_000
 
 
 def test_group_comes_from_the_import_path(table):
