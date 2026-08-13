@@ -4,10 +4,10 @@ CellSketch as a [PixelPatrol](https://pixelpatrol.app/) extension: a loader, a
 processor, and (later) viewer widgets that replace `analyze_cell.py`'s own
 discovery, reporting, and HTML viewers with PixelPatrol's pipeline and report.
 
-**Status: phase 1.** The loader and the morphology processor are in place, so a run
-produces a PixelPatrol table with one row per cell and one row per entity. Distances,
-contacts, meshes and the viewer widgets are not ported yet; `analyze_cell.py` remains
-the complete tool until they are.
+**Status: in progress.** The loader, per-entity morphology, and instance contacts are
+in place, so a run produces a PixelPatrol table with one row per cell and one row per
+entity. Per-instance distances, meshes and the viewer widgets are not ported yet;
+`analyze_cell.py` remains the complete tool until they are.
 
 ## Data model
 
@@ -22,6 +22,7 @@ then gets one row per dimension slice, which maps onto CellSketch like this:
 | one entity (organelle) | one row at `obs_level=1`, `dim_c` → `channel_names` |
 | whole cell | one row at `obs_level=0` |
 | one instance (`row_type=instance`) | an element of the `instance_*` list columns |
+| one contact (`row_type=contact`) | an element of the `contact_*` list columns, on the cell row |
 | experimental group | a `-p` import path (`imported_path_short`) |
 
 Instances have no row of their own because PixelPatrol has no granularity below a
@@ -32,6 +33,21 @@ SELECT cell_id, entity_name, unnest(instance_volume_um3) AS volume_um3
 FROM pp_data
 WHERE obs_level = 1 AND entity_kind = 'label'
 ```
+
+Contacts are pairs, so they belong to no single entity and ride on the cell row as a
+parallel edge list. Unnest them the same way (several `unnest()` calls in one `SELECT`
+stay row-aligned) and threshold the gap interactively:
+
+```sql
+SELECT cell_id, unnest(contact_entity_a) AS entity_a, unnest(contact_label_a) AS label_a,
+                unnest(contact_entity_b) AS entity_b, unnest(contact_label_b) AS label_b,
+                unnest(contact_gap_um)   AS gap_um
+FROM pp_data WHERE obs_level = 0
+```
+
+`gap_um` is measured in whole voxel steps, so instances sharing a face read *one voxel
+step*, not zero, and with anisotropic voxels the smallest reportable gap depends on
+direction. `analyze_cell.py` computes exactly the same numbers.
 
 ## Install (development)
 
@@ -81,6 +97,10 @@ options, so the analysis knobs are environment variables (defaults match the
 | `CELLSKETCH_AUTO_LABEL_MASKS` | `0` | `--auto-label-masks` |
 | `CELLSKETCH_MAX_SKELETON_VOXELS` | `500000` | `--max-skeleton-voxels` |
 | `CELLSKETCH_NUM_THREADS` | `1` (cells already run in parallel) | `--num-threads` |
+| `CELLSKETCH_CONTACT_MAX_UM` | `0.5` | `--contact-max-um` |
+
+`--with-contacts` has no equivalent: contacts are a processor, so they are on by default
+and skipped with `--processors-exclude cellsketch-contacts`.
 
 ## Tests
 

@@ -110,6 +110,28 @@ def test_treated_cells_have_larger_mitochondria(table):
     assert means["treated"] > means["control"]
 
 
+def test_contacts_ride_on_the_cell_row_as_an_edge_list(table):
+    cells = table.filter(pl.col("obs_level") == 0)
+
+    # The synthetic mitochondria sit on a ring around the nucleus, so every cell has
+    # neighbouring pairs; the columns are parallel, one element per pair.
+    assert cells["contact_count"].min() > 0
+    for row in cells.iter_rows(named=True):
+        n = row["contact_count"]
+        assert len(row["contact_entity_a"]) == n
+        assert len(row["contact_gap_um"]) == n
+        assert all(gap <= 0.5 for gap in row["contact_gap_um"])
+        # A pair always names two entities, and never the enclosing membrane.
+        assert "pm" not in set(row["contact_entity_a"]) | set(row["contact_entity_b"])
+
+
+def test_contacts_are_absent_from_entity_rows(table):
+    entities = table.filter(pl.col("obs_level") == 1)
+
+    # A pair belongs to no single entity, so it stays on the cell row.
+    assert entities["contact_count"].null_count() == entities.height
+
+
 def test_voxel_size_lands_in_the_standard_pixel_size_columns(table):
     cells = table.filter(pl.col("obs_level") == 0)
 
