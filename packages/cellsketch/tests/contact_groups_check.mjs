@@ -7,9 +7,16 @@
 // entity_b, label_b}], facets: {cell_id: facet} }. Prints one JSON summary per facet.
 import { readFileSync } from 'node:fs';
 
-const [pluginPath, fixturePath] = process.argv.slice(2);
+const [pluginPath, fixturePath, mode] = process.argv.slice(2);
 const plugin = await import(pluginPath);
-const { instances, edges, facets } = JSON.parse(readFileSync(fixturePath, 'utf8'));
+let { instances, edges, facets } = JSON.parse(readFileSync(fixturePath, 'utf8'));
+
+// DuckDB returns int64 columns as BigInt, so a run against a real report sees BigInt label
+// ids where a JSON fixture has plain numbers. --bigint reproduces that.
+if (mode === '--bigint') {
+  instances = instances.map((i) => ({ ...i, label: BigInt(i.label) }));
+  edges = edges.map((e) => ({ ...e, label_a: BigInt(e.label_a), label_b: BigInt(e.label_b) }));
+}
 
 const groups = plugin.contactGroups(instances, edges);
 const byFacet = plugin.summariseByFacet(groups, new Map(Object.entries(facets)));

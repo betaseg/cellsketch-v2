@@ -457,7 +457,8 @@ const pairLabel = (a, b) => [a, b].sort().join(' + ');
  * instance that could have touched, not only those that did. Identity is cell + entity +
  * label, since a label id alone repeats across cells and structures - and the cell each
  * group belongs to is tracked in its own map rather than parsed back out of a joined key,
- * because cell folder names may contain anything.
+ * because cell folder names may contain anything. Parts are stringified first: label ids
+ * arrive from DuckDB as BigInt, which JSON refuses to serialize.
  */
 export function contactGroups(instances, edges) {
   const parent = new Map();
@@ -470,7 +471,9 @@ export function contactGroups(instances, edges) {
     return x;
   };
   const ensure = (cell, entity, label) => {
-    const k = JSON.stringify([cell, entity, label]);
+    // String() every part: DuckDB hands int64 columns over as BigInt, which
+    // JSON.stringify refuses outright ("Do not know how to serialize a BigInt").
+    const k = JSON.stringify([String(cell), String(entity), String(label)]);
     if (!parent.has(k)) {
       parent.set(k, k);
       cellOf.set(k, cell);

@@ -19,13 +19,17 @@ PLUGIN = get_viewer_extension_dir() / "plugin_cellsketch.js"
 CHECKER = Path(__file__).parent / "contact_groups_check.mjs"
 
 
-def cluster(instances, edges, facets) -> dict:
-    """Run the widget's contactGroups/summariseByFacet over a fixture."""
+def cluster(instances, edges, facets, bigint: bool = False) -> dict:
+    """Run the widget's contactGroups/summariseByFacet over a fixture.
+
+    bigint=True passes label ids as BigInt, which is what DuckDB actually hands the widget
+    for an int64 column.
+    """
     node = shutil.which("node")
     assert node, "node is required: the viewer widgets are JavaScript"
     fixture = json.dumps({"instances": instances, "edges": edges, "facets": facets})
     out = subprocess.run(
-        [node, str(CHECKER), str(PLUGIN), "/dev/stdin"],
+        [node, str(CHECKER), str(PLUGIN), "/dev/stdin"] + (["--bigint"] if bigint else []),
         input=fixture, capture_output=True, text=True, check=False,
     )
     assert out.returncode == 0, out.stderr
@@ -89,6 +93,19 @@ def test_the_same_label_id_in_two_cells_is_two_instances():
     assert result["total"] == 2
     assert result["facets"]["control"]["instances"] == 1
     assert result["facets"]["treated"]["instances"] == 1
+
+
+def test_label_ids_arrive_as_bigints_from_duckdb():
+    instances = [_instance("cell_a", "mito", 1), _instance("cell_a", "mito", 2),
+                 _instance("cell_a", "mito", 3)]
+    edges = [_edge("cell_a", "mito", 1, "mito", 2)]
+
+    result = cluster(instances, edges, {"cell_a": "control"}, bigint=True)
+
+    # int64 columns come back as BigInt, which JSON.stringify refuses outright - the
+    # widget threw "Do not know how to serialize a BigInt" until the key was stringified.
+    assert result["total"] == 3
+    assert result["facets"]["control"]["sizes"] == [2]
 
 
 def test_cell_names_with_awkward_characters_survive():
