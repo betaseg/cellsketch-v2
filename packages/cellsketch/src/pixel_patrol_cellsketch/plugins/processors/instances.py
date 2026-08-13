@@ -33,13 +33,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from pixel_patrol_base.core.contracts import ChunkKind
 from pixel_patrol_base.core.record import Record
 from pixel_patrol_base.core.specs import RecordSpec
-from scipy import ndimage
 from scipy.spatial.distance import cdist
 from skimage.measure import regionprops
 
@@ -315,9 +315,14 @@ class InstanceProcessor:
     ) -> Dict[str, List[Any]]:
         """One row per (instance, target), reducing each transform over every entity.
 
-        Targets are the outer loop so only one distance transform exists at a time, and
-        every instance of every entity is reduced against it with one labelled ndimage
-        pass - no per-instance coordinate arrays.
+        Targets are the outer loop so only one distance transform exists at a time.
+
+        Each entity's foreground is indexed once (voxel positions sorted by label id),
+        after which measuring it against a transform is a gather plus a reduceat over the
+        foreground alone. scipy's ndimage.minimum does the obvious thing instead - one
+        labelled pass over the whole volume - and is pathologically slow at it: 54 s per
+        call on a 197-megavoxel cell with 10k instances, against 0.01 s here, because its
+        cost follows the volume and the label count rather than the foreground.
         """
         cfg = self._config
         # The histogram columns are only created when they are being filled: a column of
@@ -326,56 +331,94 @@ class InstanceProcessor:
             "distance_entity", "distance_label", "distance_target", "distance_um",
         ]
         dist: Dict[str, List[Any]] = {col: [] for col in columns}
+        indexes = {
+            name: _foreground_index(views[name])
+            for name in label_names if ids_by_entity.get(name)
+        }
         for target, target_view in views.items():
-            measured = [
-                name for name in label_names if name != target and ids_by_entity.get(name)
-            ]
+            measured = [name for name in indexes if name != target]
             if not measured:
                 continue
             transform = distance_transform_um(
                 distance_target(target_view, target, kinds_by_name[target]),
-                voxel_size_zyx, cfg.num_threads,
+                voxel_size_zyx, cfg.edt_threads,
             )
+            flat = transform.reshape(-1)
             for name in measured:
-                labels, ids = views[name], ids_by_entity[name]
-                mins = ndimage.minimum(transform, labels=labels, index=ids)
-                stats = self._distance_stats(transform, labels, ids) if cfg.distance_histograms else None
-                for position, label_id in enumerate(ids):
+                index = indexes[name]
+                values = flat[index.positions]
+                mins = np.minimum.reduceat(values, index.starts)
+                stats = _distance_stats(values, index) if cfg.distance_histograms else None
+                for position, label_id in enumerate(index.ids):
                     dist["distance_entity"].append(name)
                     dist["distance_label"].append(int(label_id))
                     dist["distance_target"].append(target)
-                    dist["distance_um"].append(float(np.atleast_1d(mins)[position]))
+                    dist["distance_um"].append(float(mins[position]))
                     if stats is not None:
                         dist["distance_mean_um"].append(stats["mean"][position])
                         dist["distance_hist_min_um"].append(stats["lo"])
                         dist["distance_hist_max_um"].append(stats["hi"])
                         dist["distance_hist_counts"].append(stats["counts"][position])
-            del transform
+            del transform, flat
         return dist
 
-    @staticmethod
-    def _distance_stats(transform: np.ndarray, labels: np.ndarray, ids: List[int]) -> Dict[str, Any]:
-        """Mean and a binned distribution per instance, over one entity/target pair.
 
-        The histogram range is shared by every instance of the pair, unlike
-        ``analyze_cell.py``'s per-instance range: shared bins are what makes two
-        instances' distributions comparable, and one labelled pass computes them all.
-        """
-        means = np.atleast_1d(ndimage.mean(transform, labels=labels, index=ids))
-        lo = float(np.atleast_1d(ndimage.minimum(transform, labels=labels, index=ids)).min())
-        hi = float(np.atleast_1d(ndimage.maximum(transform, labels=labels, index=ids)).max())
-        if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
-            hi = lo + 1.0
-        counts = ndimage.histogram(
-            transform, lo, hi, DISTANCE_HISTOGRAM_BINS, labels=labels, index=ids
-        )
-        per_instance = [counts] if len(ids) == 1 and np.ndim(counts) == 1 else list(counts)
-        return {
-            "mean": [float(m) for m in means],
-            "lo": lo,
-            "hi": hi,
-            "counts": [json.dumps([int(c) for c in row]) for row in per_instance],
-        }
+@dataclass(frozen=True)
+class _ForegroundIndex:
+    """An entity's labelled voxels, grouped by instance.
+
+    positions: flat voxel indices, sorted by label id
+    starts:    where each instance's run begins in positions
+    ids:       the label ids, in the same order as starts
+    """
+    positions: np.ndarray
+    starts: np.ndarray
+    ids: np.ndarray
+
+
+def _foreground_index(labels: np.ndarray) -> _ForegroundIndex:
+    """Index an entity's foreground once, so each later measurement is a gather."""
+    positions = np.flatnonzero(labels)
+    # int32 halves this array where the volume allows, and it is the second largest
+    # allocation after the distance transform itself.
+    if labels.size <= np.iinfo(np.int32).max:
+        positions = positions.astype(np.int32, copy=False)
+    ids_at = labels.reshape(-1)[positions]
+    order = np.argsort(ids_at, kind="stable")
+    positions = positions[order]
+    ids, starts = np.unique(ids_at[order], return_index=True)
+    return _ForegroundIndex(positions=positions, starts=starts, ids=ids)
+
+
+def _distance_stats(values: np.ndarray, index: _ForegroundIndex) -> Dict[str, Any]:
+    """Mean and a binned distribution per instance, from the gathered values.
+
+    The histogram range is shared by every instance of the entity/target pair, unlike
+    ``analyze_cell.py``'s per-instance range: shared bins are what makes two instances'
+    distributions comparable, and one pass computes them all.
+    """
+    counts_per_instance = np.diff(np.append(index.starts, len(values)))
+    sums = np.add.reduceat(values.astype(np.float64), index.starts)
+    means = sums / counts_per_instance
+    lo, hi = float(values.min()), float(values.max())
+    if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
+        hi = lo + 1.0
+    # One bincount over (instance, bin) pairs rather than a histogram per instance.
+    bins = np.clip(
+        ((values - lo) / (hi - lo) * DISTANCE_HISTOGRAM_BINS).astype(np.int64),
+        0, DISTANCE_HISTOGRAM_BINS - 1,
+    )
+    instance_of = np.repeat(np.arange(len(index.ids)), counts_per_instance)
+    flat_counts = np.bincount(
+        instance_of * DISTANCE_HISTOGRAM_BINS + bins,
+        minlength=len(index.ids) * DISTANCE_HISTOGRAM_BINS,
+    ).reshape(len(index.ids), DISTANCE_HISTOGRAM_BINS)
+    return {
+        "mean": [float(m) for m in means],
+        "lo": lo,
+        "hi": hi,
+        "counts": [json.dumps([int(c) for c in row]) for row in flat_counts],
+    }
 
 
 def _polar_spread_deg(

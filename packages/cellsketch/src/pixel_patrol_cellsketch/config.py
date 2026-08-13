@@ -13,6 +13,7 @@ once per worker process. Every value has the same default as the corresponding
     CELLSKETCH_NUM_THREADS        kimimaro worker count; 1 by default because
                                   PixelPatrol already runs cells in parallel
                                   (0 = all cores)
+    CELLSKETCH_EDT_THREADS        distance-transform threads (0 = all cores)
     CELLSKETCH_CONTACT_MAX_UM     largest instance-pair gap recorded, in µm
     CELLSKETCH_POLARITY_SPREAD    1 -> per-instance angular spread on the polarity sphere
     CELLSKETCH_DISTANCE_HISTOGRAMS  1 -> per-instance distance distributions, not just minima
@@ -76,6 +77,9 @@ class CellSketchConfig:
     # cannot fork children of their own, so asking kimimaro for a process pool costs a
     # failed attempt per cell before it falls back. Cells already run in parallel.
     num_threads: int = 1
+    # Separate from num_threads: edt is a C++ loop with no subprocesses, so it can use
+    # all cores even inside a Dask worker, where kimimaro's process pool cannot.
+    edt_threads: int = 0
     contact_max_um: float = 0.5
     # Both walk every voxel of every instance, so they are opt-in, as the equivalent
     # analyze_cell.py flags were.
@@ -96,6 +100,7 @@ class CellSketchConfig:
             auto_label_masks=_env_flag("CELLSKETCH_AUTO_LABEL_MASKS"),
             max_skeleton_voxels=_env_int("CELLSKETCH_MAX_SKELETON_VOXELS", 500_000),
             num_threads=_env_int("CELLSKETCH_NUM_THREADS", 1),
+            edt_threads=_env_int("CELLSKETCH_EDT_THREADS", 0),
             contact_max_um=_env_float("CELLSKETCH_CONTACT_MAX_UM", 0.5),
             polarity_spread=_env_flag("CELLSKETCH_POLARITY_SPREAD"),
             distance_histograms=_env_flag("CELLSKETCH_DISTANCE_HISTOGRAMS"),
