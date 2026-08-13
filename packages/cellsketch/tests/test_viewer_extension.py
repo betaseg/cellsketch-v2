@@ -74,7 +74,12 @@ def test_the_declared_widget_ids_are_unique_and_namespaced():
     source = (get_viewer_extension_dir() / "plugin_cellsketch.js").read_text()
     ids = [line.split("'")[1] for line in source.splitlines() if line.strip().startswith("id: '")]
 
-    assert ids == ["cellsketch-instance-morphology", "cellsketch-distances", "cellsketch-reach"]
+    assert ids == [
+        "cellsketch-instance-morphology",
+        "cellsketch-distances",
+        "cellsketch-reach",
+        "cellsketch-contacts",
+    ]
 
 
 # ── the SQL those widgets issue ───────────────────────────────────────────────

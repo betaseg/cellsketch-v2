@@ -1,13 +1,12 @@
 # pixel-patrol-cellsketch
 
 CellSketch as a [PixelPatrol](https://pixelpatrol.app/) extension: a loader, four
-processors and three viewer widgets that replace `analyze_cell.py`'s own discovery,
+processors and four viewer widgets that replace `analyze_cell.py`'s own discovery,
 reporting and HTML viewers with PixelPatrol's pipeline and report.
 
 **Status:** every measurement `analyze_cell.py` makes is ported, including the mesh and
-skeleton geometry for `mesh_viewer.html` and the Blender export. Still to come: a
-contacts widget with the grouping `stats_viewer.html` has, and `stats_viewer.html`'s
-remaining sections as widgets.
+skeleton geometry for `mesh_viewer.html` and the Blender export. Still to come: `stats_viewer.html`'s
+remaining sections (the overview cards and the structure table) as widgets.
 
 ## Data model
 
@@ -172,7 +171,7 @@ is why it is opt-in rather than part of every run.
 
 ## Viewer widgets
 
-Three widgets ship with the package and load automatically in `pixel-patrol view`
+Four widgets ship with the package and load automatically in `pixel-patrol view`
 (discovered through the `pixel_patrol.viewer_extensions` entry point):
 
 | Widget | Shows |
@@ -180,10 +179,23 @@ Three widgets ship with the package and load automatically in `pixel-patrol view
 | Instance Morphology | one violin per group for every per-instance metric, with a structure selector |
 | Distances Between Structures | distance from each instance of one structure to each other structure |
 | Reaching Two Structures At Once | one panel per pair of structures; for each instance the *larger* of its two distances, as a cumulative share — a curve that climbs early means most instances sit against both |
+| Contacts & Groups | contact groups (clusters of instances chained by contacts) at a live gap threshold: group-size box plots and the share of instances touching anything, per group, with a summary table |
 
 The reach curves are drawn from quantiles, so a group of 8000 instances costs 51
 vertices rather than 8000 points, and the reading is the same at any *n*. They mirror
 the panel matrix `stats_viewer.html` grew, computed from the long-format distances.
+
+Contacts & Groups clusters instances with a union-find over the edge list at whatever gap
+the slider is set to, seeding every instance as a singleton so "share of instances
+touching" has the right denominator. An instance touches something exactly when it lands
+in a group of two or more, so the two charts always agree. On real data - 103,314 contacts
+within 0.1 µm across eight cells - that resolves to 141 clusters, the largest holding
+8,158 instances, with 97.6% of instances touching something: dense enough that the slider
+is the point, not the default.
+
+The clustering runs in the browser, so it is covered by running it through node from the
+Python suite (`tests/contact_groups_check.mjs`) - identity is cell + entity + label, and a
+test pins that a label id repeated in two cells stays two instances.
 
 Each builds its own source — a subquery that unnests the cell row's list columns —
 and hand it to the viewer's own distribution engine, so instance-level data goes

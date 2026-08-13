@@ -433,4 +433,281 @@ const instanceReach = {
   },
 };
 
-export default [instanceMorphology, instanceDistances, instanceReach];
+
+// ── Contacts & groups ─────────────────────────────────────────────────────────
+
+// Enough slider steps to feel continuous without re-querying on every pixel.
+const GAP_STEPS = 40;
+const MAX_EDGES = 400000;
+
+/** Every recorded contact, one row per instance pair. */
+function contactEdgeSource(ctx) {
+  return unnestedSource(ctx, [
+    'contact_entity_a', 'contact_label_a', 'contact_entity_b', 'contact_label_b',
+    'contact_gap_um',
+  ]);
+}
+
+const pairLabel = (a, b) => [a, b].sort().join(' + ');
+
+/**
+ * Connected components of instances linked by contacts: a "contact group".
+ *
+ * Instances are seeded as singletons from the instance table, so the denominator is every
+ * instance that could have touched, not only those that did. Identity is cell + entity +
+ * label, since a label id alone repeats across cells and structures - and the cell each
+ * group belongs to is tracked in its own map rather than parsed back out of a joined key,
+ * because cell folder names may contain anything.
+ */
+export function contactGroups(instances, edges) {
+  const parent = new Map();
+  const cellOf = new Map();
+  const find = (x) => {
+    while (parent.get(x) !== x) {
+      parent.set(x, parent.get(parent.get(x)));
+      x = parent.get(x);
+    }
+    return x;
+  };
+  const ensure = (cell, entity, label) => {
+    const k = JSON.stringify([cell, entity, label]);
+    if (!parent.has(k)) {
+      parent.set(k, k);
+      cellOf.set(k, cell);
+    }
+    return k;
+  };
+
+  for (const i of instances) ensure(i.cell_id, i.entity, i.label);
+  for (const e of edges) {
+    const a = ensure(e.cell_id, e.entity_a, e.label_a);
+    const b = ensure(e.cell_id, e.entity_b, e.label_b);
+    parent.set(find(a), find(b));
+  }
+
+  const sizes = new Map();
+  const rootCell = new Map();
+  for (const k of parent.keys()) {
+    const root = find(k);
+    sizes.set(root, (sizes.get(root) ?? 0) + 1);
+    if (!rootCell.has(root)) rootCell.set(root, cellOf.get(k));
+  }
+  return { sizes, rootCell, total: parent.size };
+}
+
+/** Group sizes and touch fraction per facet, from the facet each cell belongs to. */
+export function summariseByFacet(groups, facetOfCell) {
+  const byFacet = new Map();
+  for (const [root, size] of groups.sizes) {
+    const facet = facetOfCell.get(groups.rootCell.get(root)) ?? '(none)';
+    const entry = byFacet.get(facet) ?? { sizes: [], instances: 0, touching: 0 };
+    entry.instances += size;
+    if (size > 1) {
+      entry.sizes.push(size);
+      entry.touching += size;
+    }
+    byFacet.set(facet, entry);
+  }
+  return byFacet;
+}
+
+const contactsAndGroups = {
+  id: 'cellsketch-contacts',
+  label: 'Contacts & Groups',
+  group: 'Dataset Stats',
+
+  requires(schema) {
+    return schema.allCols.includes('contact_gap_um');
+  },
+
+  async overviewPlot(container, ctx) {
+    return miniDistribution(ctx, container, {
+      numCol: 'contact_gap_um',
+      source: contactEdgeSource(ctx),
+      where: '',
+      yLabel: 'Gap (µm)',
+    });
+  },
+
+  async overviewMessage(ctx) {
+    const [row] = await ctx.queryRows(
+      `SELECT COUNT(*) AS n, MAX(${ctx.sql.q('contact_gap_um')}) AS widest
+       FROM ${contactEdgeSource(ctx)}`
+    );
+    if (!row || !Number(row.n)) return null;
+    return `<strong>${Number(row.n).toLocaleString()}</strong> instance pairs lie within `
+      + `<strong>${Number(row.widest).toFixed(3)} µm</strong> of each other.`;
+  },
+
+  async render(container, ctx) {
+    const edgeSource = contactEdgeSource(ctx);
+    const [limits] = await ctx.queryRows(
+      `SELECT COUNT(*) AS n, MAX(${ctx.sql.q('contact_gap_um')}) AS widest FROM ${edgeSource}`
+    );
+    if (!limits || !Number(limits.n)) {
+      emptyState(container, 'No contacts in this report.');
+      return;
+    }
+    const widest = Number(limits.widest) || 0;
+
+    // Which facet each cell belongs to: the active grouping, read off the cell rows.
+    const facetRows = await ctx.queryRows(
+      `SELECT ${ctx.sql.q('cell_id')} AS cell_id, ${ctx.sql.groupCol()} AS facet
+       FROM pp_data ${ctx.sql.andWhere(ctx.where, CELL_ROW)}`
+    );
+    const facetOfCell = new Map(facetRows.map((r) => [String(r.cell_id), r.facet]));
+
+    // Every instance, so a structure that touches nothing still counts in the denominator.
+    const instances = (await ctx.queryRows(
+      `SELECT ${ctx.sql.q('cell_id')} AS cell_id, ${ctx.sql.q('instance_entity')} AS entity,
+              ${ctx.sql.q('instance_label')} AS label
+       FROM ${unnestedSource(ctx, ['instance_entity', 'instance_label'])}`
+    )).map((r) => ({ cell_id: String(r.cell_id), entity: r.entity, label: r.label }));
+
+    const pairs = await ctx.queryRows(
+      `SELECT DISTINCT ${ctx.sql.q('contact_entity_a')} AS a, ${ctx.sql.q('contact_entity_b')} AS b
+       FROM ${edgeSource} ORDER BY 1, 2`
+    );
+    const pairOptions = [
+      'all contacts', 'same-type contacts',
+      ...new Set(pairs.map((p) => pairLabel(p.a, p.b))),
+    ];
+
+    const controls = document.createElement('div');
+    controls.style.cssText =
+      'display:flex;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:.5rem';
+    container.appendChild(controls);
+    const plots = document.createElement('div');
+    container.appendChild(plots);
+
+    let pairChoice = pairOptions[0];
+    let gapUm = widest;
+
+    const draw = async () => {
+      plots.replaceChildren();
+      const conditions = [`${ctx.sql.q('contact_gap_um')} <= ${gapUm}`];
+      if (pairChoice === 'same-type contacts') {
+        conditions.push(`${ctx.sql.q('contact_entity_a')} = ${ctx.sql.q('contact_entity_b')}`);
+      } else if (pairChoice !== 'all contacts') {
+        const [a, b] = pairChoice.split(' + ');
+        const ea = ctx.sql.q('contact_entity_a');
+        const eb = ctx.sql.q('contact_entity_b');
+        conditions.push(
+          `((${ea} = ${esc(a)} AND ${eb} = ${esc(b)}) OR (${ea} = ${esc(b)} AND ${eb} = ${esc(a)}))`
+        );
+      }
+      const edges = await ctx.queryRows(
+        `SELECT ${ctx.sql.q('cell_id')} AS cell_id,
+                ${ctx.sql.q('contact_entity_a')} AS entity_a,
+                ${ctx.sql.q('contact_label_a')} AS label_a,
+                ${ctx.sql.q('contact_entity_b')} AS entity_b,
+                ${ctx.sql.q('contact_label_b')} AS label_b
+         FROM ${edgeSource} WHERE ${conditions.join(' AND ')} LIMIT ${MAX_EDGES}`
+      );
+      if (edges.length >= MAX_EDGES) {
+        ctx.plot.prependWarning(
+          plots,
+          `Only the first ${MAX_EDGES.toLocaleString()} contacts were grouped - lower the gap.`
+        );
+      }
+
+      const groups = contactGroups(
+        instances,
+        edges.map((e) => ({ ...e, cell_id: String(e.cell_id) }))
+      );
+      const byFacet = summariseByFacet(groups, facetOfCell);
+      const present = ctx.groups.filter((g) => byFacet.has(g));
+      const ordered = present.length ? present : [...byFacet.keys()];
+
+      note(
+        plots,
+        `A contact group is a cluster of instances chained together by contacts of `
+        + `${gapUm.toFixed(3)} µm or less. An instance touches something exactly when it `
+        + `lands in a group of two or more, so the two charts always agree.`
+      );
+
+      const nextCell = plotGrid(plots, 2);
+      // Left: how many instances chain together.
+      ctx.plot.append(
+        nextCell(),
+        ordered.map((facet) => ({
+          type: 'box',
+          name: ctx.groupLabel(facet),
+          y: byFacet.get(facet).sizes,
+          boxpoints: 'outliers',
+          marker: { color: ctx.color.group(facet) },
+        })),
+        {
+          title: { text: 'Contact group size' },
+          yaxis: { title: 'instances per group', rangemode: 'tozero' },
+          xaxis: { type: 'category' },
+          showlegend: false,
+        }
+      );
+      // Right: the share of instances that touch anything at all.
+      ctx.plot.append(
+        nextCell(),
+        [{
+          type: 'bar',
+          x: ordered.map((f) => ctx.groupLabel(f)),
+          y: ordered.map((f) => {
+            const e = byFacet.get(f);
+            return e.instances ? (e.touching / e.instances) * 100 : 0;
+          }),
+          marker: { color: ordered.map((f) => ctx.color.group(f)) },
+          hovertemplate: '%{x}: %{y:.1f}% of instances touch<extra></extra>',
+        }],
+        {
+          title: { text: 'Instances touching' },
+          yaxis: { title: '% of instances', ticksuffix: '%', rangemode: 'tozero' },
+          xaxis: { type: 'category' },
+          showlegend: false,
+        }
+      );
+
+      ctx.plot.statTable(plots, {
+        headers: ['', 'instances', 'groups', 'largest', 'mean size', 'touching'],
+        rows: ordered.map((facet) => {
+          const e = byFacet.get(facet);
+          const mean = e.sizes.length ? e.sizes.reduce((a, b) => a + b, 0) / e.sizes.length : 0;
+          return [
+            ctx.groupLabel(facet),
+            e.instances.toLocaleString(),
+            e.sizes.length.toLocaleString(),
+            e.sizes.length ? Math.max(...e.sizes) : 0,
+            mean.toFixed(2),
+            e.instances ? `${((e.touching / e.instances) * 100).toFixed(1)}%` : '-',
+          ];
+        }),
+      });
+    };
+
+    controls.appendChild(selector('Contacts', pairOptions, pairChoice, (value) => {
+      pairChoice = value;
+      draw();
+    }));
+
+    const sliderWrap = document.createElement('label');
+    sliderWrap.style.cssText =
+      'display:inline-flex;align-items:center;gap:.4rem;font-size:.8rem';
+    const readout = document.createElement('span');
+    readout.textContent = `gap <= ${widest.toFixed(3)} µm`;
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = String(GAP_STEPS);
+    slider.value = String(GAP_STEPS);
+    slider.addEventListener('input', () => {
+      gapUm = (Number(slider.value) / GAP_STEPS) * widest;
+      readout.textContent = `gap <= ${gapUm.toFixed(3)} µm`;
+    });
+    // Redraw on release rather than on every pixel: each step is a query plus a union-find.
+    slider.addEventListener('change', draw);
+    sliderWrap.append('Gap threshold', slider, readout);
+    controls.appendChild(sliderWrap);
+
+    await draw();
+  },
+};
+
+export default [instanceMorphology, instanceDistances, instanceReach, contactsAndGroups];
