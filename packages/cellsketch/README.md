@@ -1,16 +1,13 @@
 # pixel-patrol-cellsketch
 
-CellSketch as a [PixelPatrol](https://pixelpatrol.app/) extension: a loader, a
-processor, and (later) viewer widgets that replace `analyze_cell.py`'s own
-discovery, reporting, and HTML viewers with PixelPatrol's pipeline and report.
+CellSketch as a [PixelPatrol](https://pixelpatrol.app/) extension: a loader, four
+processors and three viewer widgets that replace `analyze_cell.py`'s own discovery,
+reporting and HTML viewers with PixelPatrol's pipeline and report.
 
-**Status: in progress.** The loader, per-entity morphology, per-instance morphology,
-distances, polarity and instance contacts are in place, plus two viewer widgets, so a
-run produces a PixelPatrol table carrying everything `analyze_cell.py`'s
-`report.parquet` does except meshes and skeleton geometry. Still to port: the mesh and
-skeleton payloads (and with them `mesh_viewer.html` and the Blender export), and a
-contacts widget with the grouping that `stats_viewer.html` has. `analyze_cell.py`
-remains the complete tool until then.
+**Status:** every measurement `analyze_cell.py` makes is ported, including the mesh and
+skeleton geometry for `mesh_viewer.html` and the Blender export. Still to come: a
+contacts widget with the grouping `stats_viewer.html` has, and `stats_viewer.html`'s
+remaining sections as widgets.
 
 ## Data model
 
@@ -123,9 +120,36 @@ pixel-patrol process experiment/ -o report.parquet --loader cellsketch \
 Skip the expensive parts with `--no-instances` / `--no-contacts` (equivalently,
 `--processors-exclude cellsketch-instances`).
 
+## Meshes for the 3D viewer and Blender
+
+Geometry never enters the parquet — base64 meshes would multiply the size of the report
+every stats query loads — so it goes to one `report_meshes.csv` per cell, exactly where
+`analyze_cell.py --with-mesh` put it. Either during processing:
+
+```bash
+cellsketch process experiment/ -o report.parquet --with-mesh \
+  --mesh-smooth-sigma 1 --mesh-step-size 1 --mesh-level 0.05
+# → report.parquet  +  report_meshes/<cell>/report_meshes.csv
+```
+
+or afterwards, when you have a report already and want to re-mesh with other settings:
+
+```bash
+cellsketch mesh experiment/ -o geometry/ --mesh-step-size 1 --no-skeletons
+```
+
+Each CSV holds one row per label instance (with `mesh_b64` and, unless `--no-skeletons`,
+`skeleton_b64`), one per whole-structure mask, and the contact edge list the 3D viewer
+groups by — drop it on `mesh_viewer.html`, or pass it to `csv_to_blender.py`. The payload
+formats are unchanged, and the geometry is identical to what `analyze_cell.py` produced
+for the same cell: same vertex and face counts, same bounds.
+
+Meshing is the most expensive thing here (it skeletonises again for the overlay), which
+is why it is opt-in rather than part of every run.
+
 ## Viewer widgets
 
-Two widgets ship with the package and load automatically in `pixel-patrol view`
+Three widgets ship with the package and load automatically in `pixel-patrol view`
 (discovered through the `pixel_patrol.viewer_extensions` entry point):
 
 | Widget | Shows |
@@ -138,7 +162,7 @@ The reach curves are drawn from quantiles, so a group of 8000 instances costs 51
 vertices rather than 8000 points, and the reading is the same at any *n*. They mirror
 the panel matrix `stats_viewer.html` grew, computed from the long-format distances.
 
-Both build their own source — a subquery that unnests the cell row's list columns —
+Each builds its own source — a subquery that unnests the cell row's list columns —
 and hand it to the viewer's own distribution engine, so instance-level data goes
 through the same violins, palette, grouping and **Mann-Whitney significance brackets**
 as the built-in widgets. Turn the brackets on with the sidebar's *Show significance*

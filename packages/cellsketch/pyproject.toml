@@ -16,6 +16,7 @@ dependencies = [
     "tifffile>=2024.5.0",
     "imagecodecs",
     "edt>=2.4.0",
+    "fast-simplification>=0.1.6",
     "kimimaro>=4.0.0",
     "crackle-codec",
     "posix-ipc",

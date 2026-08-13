@@ -16,6 +16,9 @@ once per worker process. Every value has the same default as the corresponding
     CELLSKETCH_CONTACT_MAX_UM     largest instance-pair gap recorded, in µm
     CELLSKETCH_POLARITY_SPREAD    1 -> per-instance angular spread on the polarity sphere
     CELLSKETCH_DISTANCE_HISTOGRAMS  1 -> per-instance distance distributions, not just minima
+    CELLSKETCH_MESH_DIR           where to write report_meshes.csv per cell; unset = no meshing
+    CELLSKETCH_MESH_SMOOTH_SIGMA / _STEP_SIZE / _TARGET_REDUCTION / _LEVEL
+                                  mesh generation knobs, as analyze_cell.py's --mesh-* flags
 """
 
 from __future__ import annotations
@@ -78,6 +81,12 @@ class CellSketchConfig:
     # analyze_cell.py flags were.
     polarity_spread: bool = False
     distance_histograms: bool = False
+    # Geometry is written beside the report, never into it; unset means no meshing at all.
+    mesh_dir: Optional[str] = None
+    mesh_smooth_sigma: float = 0.7
+    mesh_step_size: int = 2
+    mesh_target_reduction: float = 0.8
+    mesh_level: Optional[float] = None
 
     @classmethod
     def from_env(cls) -> "CellSketchConfig":
@@ -90,4 +99,12 @@ class CellSketchConfig:
             contact_max_um=_env_float("CELLSKETCH_CONTACT_MAX_UM", 0.5),
             polarity_spread=_env_flag("CELLSKETCH_POLARITY_SPREAD"),
             distance_histograms=_env_flag("CELLSKETCH_DISTANCE_HISTOGRAMS"),
+            mesh_dir=os.environ.get("CELLSKETCH_MESH_DIR") or None,
+            mesh_smooth_sigma=_env_float("CELLSKETCH_MESH_SMOOTH_SIGMA", 0.7),
+            mesh_step_size=_env_int("CELLSKETCH_MESH_STEP_SIZE", 2),
+            mesh_target_reduction=_env_float("CELLSKETCH_MESH_TARGET_REDUCTION", 0.8),
+            mesh_level=(
+                _env_float("CELLSKETCH_MESH_LEVEL", 0.0)
+                if os.environ.get("CELLSKETCH_MESH_LEVEL") else None
+            ),
         )
