@@ -69,9 +69,16 @@ def _image_meta(record: Record) -> Dict[str, Any]:
 
 
 def _entity_record(record: Record, c_index: int) -> Record:
-    """One channel of an object, in the shape a per-entity processor expects."""
+    """One channel of an object, in the shape a per-entity processor expects.
+
+    A slice, which is a view, and not np.take, which copies: a channel of a real object is
+    hundreds of megabytes, and this runs once per entity. The morphology processor only
+    reads it. instances.channel_view says the same thing for the object-level processors.
+    """
     c_axis = record.dim_order.index("C")
-    data = np.take(record.data, [c_index], axis=c_axis)
+    key = [slice(None)] * record.data.ndim
+    key[c_axis] = slice(c_index, c_index + 1)   # a length-1 axis, as np.take([i]) gave
+    data = record.data[tuple(key)]
     meta = {k: v for k, v in record.meta.items() if k != "shape"}
     return record_from(data, {**meta, "dim_c": c_index}, kind=record.kind)
 
