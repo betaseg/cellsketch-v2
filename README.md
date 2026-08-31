@@ -82,6 +82,9 @@ Useful flags, see `pixel-patrol-anatomy process --help` for the rest:
 - `--no-instances` / `--no-contacts`: skip the expensive per-instance work
 - `--contact-max-um T`: largest surface-to-surface gap recorded as a contact
 - `--mesh-smooth-sigma` / `--mesh-step-size` / `--mesh-target-reduction` / `--mesh-level`
+- `--mesh-workers N`: processes meshing one object's instances. The default divides the
+  machine between the two levels of parallelism, so objects and instances do not each
+  claim every core
 
 ## Checking your input first (`dry-run`)
 

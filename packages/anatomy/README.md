@@ -189,6 +189,9 @@ distances, histograms, contacts and polarity spread all on:
 load          6s     instances    39s     contacts    16s     meshes   133s
 ```
 
+Those meshing and instance figures predate the parallel meshing and the allocation work
+below, and have not been re-measured on that object since.
+
 Three things got it there, and the first is worth knowing about if you write your own
 processor:
 
@@ -200,9 +203,14 @@ processor:
 - **`--skeleton-entities mito`**: skeletonising dominates everything else (103 s of a
   2-minute object), and most of it is usually wasted: a granule's skeleton is one branch the
   length of its diameter. Naming just the filaments took that object from 55 s to 36 s.
-- **Skeletons and contacts are computed once per object**, not once per reader, so
-  `--with-mesh` no longer repeats the expensive parts for its geometry.
-- **Objects run in parallel**, as many at once as their measured peak allows.
+- **Nothing is measured twice per object.** Skeletons, contacts, ITK's shape statistics and
+  `regionprops` are computed once and shared, so `--with-mesh` does not repeat for its
+  geometry what the instance table already measured.
+- **Objects run in parallel**, as many at once as their measured peak allows, and **an
+  object's instances are meshed in parallel** within that. Two levels, because the object
+  pool is sized by memory rather than by cores: on a batch of large objects it is three
+  workers on a machine with far more cores than that, and meshing is the longest part of a
+  run. Measured on 22 cores with 8 mesh workers: 1.7x at 400 instances, 2.7x at 900.
 
 Two things keep peak memory down, both worth knowing if you profile a run: entity volumes
 are stacked in the narrowest integer type their label ids need (usually `uint16`, halving
@@ -409,6 +417,7 @@ same name:
 | `PP_ANATOMY_MESH_STEP_SIZE` | `2` | `--mesh-step-size` |
 | `PP_ANATOMY_MESH_TARGET_REDUCTION` | `0.8` | `--mesh-target-reduction` |
 | `PP_ANATOMY_MESH_LEVEL` | `0` | `--mesh-level` |
+| `PP_ANATOMY_MESH_WORKERS` | the cores the object pool is not using | `--mesh-workers` |
 
 `pixel-patrol-anatomy process` sets these from its own flags, so you only need the
 variables when driving `pixel-patrol` directly. `--with-contacts` has no equivalent:
