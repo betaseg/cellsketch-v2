@@ -25,12 +25,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import fast_simplification
 import numpy as np
 from scipy.ndimage import distance_transform_edt, gaussian_filter
-from skimage.measure import marching_cubes, regionprops
+from skimage.measure import marching_cubes
 
 from pixel_patrol_anatomy.geometry import (
     METRICS_2D,
     METRICS_3D,
-    label_metrics,
     region_metrics,
 )
 from pixel_patrol_anatomy.distances import object_center_um, polarity_from_offset
@@ -38,6 +37,8 @@ from pixel_patrol_anatomy.geometry import skeleton_graph_metrics
 from pixel_patrol_anatomy.skeletons import (
     EntityFilter,
     contacts_for,
+    label_metrics_for,
+    regions_for,
     skeletons_for,
     wants_skeletons,
 )
@@ -475,11 +476,14 @@ def _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
             })
             continue
 
-        labels = np.ascontiguousarray(volume)
-        props = regionprops(labels)
+        # The view itself, not a contiguous copy of it: label_metrics makes whatever
+        # ITK needs, and passing the same array the instance processor passed is what
+        # lets the per-object cache recognise the two calls as the same work.
+        labels = volume
+        props = regions_for(object_id, name, labels)
         if not props:
             continue
-        measured = label_metrics(labels, sample_size)
+        measured = label_metrics_for(object_id, name, labels, sample_size)
         shape_keys = METRICS_2D if ndim == 2 else METRICS_3D
         skeletons = (
             skeletons_for(object_id, name, labels, sample_size,

@@ -121,6 +121,36 @@ def skeletons_for(
     )
 
 
+def label_metrics_for(object_id: str, entity: str, labels: np.ndarray,
+                      sample_size: Sequence[float]) -> Dict[int, Dict[str, Any]]:
+    """ITK's shape statistics for every instance of an entity, once per object.
+
+    A --with-mesh run has two readers: the instance table, and the geometry rows that carry
+    the same numbers beside each mesh. It is a full pass over the entity either time.
+    """
+    from pixel_patrol_anatomy.geometry import label_metrics
+
+    return CACHE.get_or_compute(
+        object_id, ("label_metrics", normalize_name(entity)), labels,
+        lambda: label_metrics(labels, sample_size),
+    )
+
+
+def regions_for(object_id: str, entity: str, labels: np.ndarray):
+    """``regionprops`` for an entity, once per object.
+
+    The same two readers and the same full pass (find_objects) each time. Sharing the
+    objects shares the properties they compute lazily too, so an area read for the instance
+    table is not measured again for the geometry.
+    """
+    from skimage.measure import regionprops
+
+    return CACHE.get_or_compute(
+        object_id, ("regions", normalize_name(entity)), labels,
+        lambda: regionprops(labels),
+    )
+
+
 def contacts_for(object_id: str, volumes, kinds, voxel_size_zyx, max_gap_um: float,
                  object_mask_name: str | None = None):
     """This object's contact edge list, computed once whether the table or the mesh CSV asks.

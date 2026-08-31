@@ -40,7 +40,6 @@ from pixel_patrol_base.core.contracts import ChunkKind
 from pixel_patrol_base.core.record import Record
 from pixel_patrol_base.core.specs import RecordSpec
 from scipy.spatial import cKDTree
-from skimage.measure import regionprops
 
 from pixel_patrol_anatomy.config import AnatomyConfig
 from pixel_patrol_anatomy.distances import (
@@ -54,11 +53,12 @@ from pixel_patrol_anatomy.distances import (
 from pixel_patrol_anatomy.geometry import (
     METRICS_2D,
     METRICS_3D,
-    label_metrics,
     skeleton_graph_metrics,
 )
 from pixel_patrol_anatomy.spatial import object_center, voxel_size
-from pixel_patrol_anatomy.skeletons import CACHE, skeletons_for, wants_skeletons
+from pixel_patrol_anatomy.skeletons import (
+    CACHE, label_metrics_for, regions_for, skeletons_for, wants_skeletons,
+)
 from pixel_patrol_anatomy.plugins.loaders.object_loader import OBJECT_KIND
 
 logger = logging.getLogger(__name__)
@@ -311,12 +311,12 @@ class InstanceProcessor:
     ) -> List[int]:
         """Append one element per instance to every instance_* list; return the label ids."""
         cfg = self._config
-        props = regionprops(np.ascontiguousarray(labels))
+        props = regions_for(object_id, entity, labels)
         if not props:
             return []
         ndim = labels.ndim
         # Every instance measured in one pass, then looked up per instance.
-        measured = label_metrics(labels, sample_size)
+        measured = label_metrics_for(object_id, entity, labels, sample_size)
         shape_keys = METRICS_2D if ndim == 2 else METRICS_3D
 
         # One pass over the whole entity yields a skeleton per instance, shared with the
