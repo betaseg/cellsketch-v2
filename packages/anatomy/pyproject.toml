@@ -1,0 +1,61 @@
+[project]
+name = "pixel-patrol-anatomy"
+version = "0.1.0"
+description = "Anatomy — the spatial anatomy of segmented objects, as a PixelPatrol flavour"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Helmholtz Imaging Engineering & Support Unit MDC" },
+]
+
+dependencies = [
+    "pixel-patrol-base>=0.8.0",
+    "numpy>=2.0.0",
+    "polars>=1.0.0",
+    "scipy>=1.13.0",
+    "scikit-image>=0.23.0",
+    # The measuring itself: ITK's LabelShapeStatisticsImageFilter, spacing aware and correct
+    # about boundaries, where counting voxel faces reads ~1.5x high in 3D.
+    "SimpleITK>=2.3",
+    "tifffile>=2024.5.0",
+    "imagecodecs",
+    "edt>=2.4.0",
+    "fast-simplification>=0.1.6",
+    "kimimaro>=4.0.0",
+    "crackle-codec",
+    "posix-ipc",
+    "psutil",
+]
+
+[project.scripts]
+pixel-patrol-anatomy = "pixel_patrol_anatomy.cli:cli"
+
+# Not for running: `process` has its own pipeline. These let PixelPatrol's schema catalogue
+# read this package's column descriptions, which is what makes the report self-describing.
+[project.entry-points."pixel_patrol.loader_plugins"]
+anatomy_loaders = "pixel_patrol_anatomy.plugin_registry:register_loader_plugins"
+
+[project.entry-points."pixel_patrol.processor_plugins"]
+anatomy_processors = "pixel_patrol_anatomy.plugin_registry:register_processor_plugins"
+
+[project.entry-points."pixel_patrol.viewer_extensions"]
+anatomy_viewer = "pixel_patrol_anatomy.viewer_extensions:get_viewer_extension_dir"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pixel_patrol_anatomy"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

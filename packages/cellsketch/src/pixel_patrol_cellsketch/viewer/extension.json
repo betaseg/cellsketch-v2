@@ -1,4 +1,0 @@
-{
-  "name": "CellSketch",
-  "plugins": ["./plugin_cellsketch.js"]
-}
