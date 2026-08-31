@@ -11,10 +11,10 @@ Both also share the same two hazards, which is why this is one class and not two
 - **spawn, not fork.** The process holds native threads (ITK, BLAS, polars) and a forked
   child can deadlock on their locks. The batch pool specifies spawn for the same reason, and
   Python 3.12 warns when it is not.
-- **a pool is not always worth opening.** Spawn costs about a second to stand up workers
-  that each import numpy and skimage. Below a few hundred pieces of work that is more than
-  doing it serially, so the pool appears on the first batch that justifies it and is reused
-  after that, including for a trailing batch too small to have opened one.
+- **a pool is not always worth opening.** Spawn costs about a second to stand up workers,
+  and every task pays pickling on the way out and back. Whether that is repaid depends on
+  the total work, which the number of instances does not predict, so WorkPool measures one
+  batch before deciding rather than guessing from a count.
 """
 
 from __future__ import annotations
@@ -22,11 +22,16 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor
 from itertools import islice
 from typing import Any, Callable, Iterator, List, Optional, Sequence, TypeVar
 
 logger = logging.getLogger(__name__)
+
+# Tasks timed to decide whether a pool is worth it. Small, because this runs here
+# rather than in the pool: it is the price of finding out.
+_SAMPLE = 24
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -58,28 +63,80 @@ def worker_share(requested: int = 0) -> int:
 
 
 class WorkPool:
-    """Independent per-instance work, farmed out once there is enough of it to be worth it.
+    """Independent per-instance work, farmed out only once it is measurably worth it.
+
+    Whether a pool pays depends on the total work, which no count of instances predicts: on
+    one synthetic object 400 large instances gained 1.7x, while 600 small ones on a
+    cell-shaped object lost 1.45x, because each was cheap enough that pickling and IPC cost
+    more than the meshing. So this does not guess. It runs the first batch here, times it,
+    and extrapolates over `total` to decide whether the rest is worth a pool:
+
+        projected = elapsed / len(batch) * total
+
+    Below `min_seconds` of projected work it never opens one, and the most a wrong guess
+    costs is the one batch it measured.
 
     `what` names the work in the warning a broken pool logs. Falling back rather than
     raising is deliberate: doing this serially is slow, not wrong, and losing an object's
-    whole geometry (or its contact edges) to a pool that died is much the worse outcome.
+    whole geometry to a pool that died is much the worse outcome.
     """
 
-    def __init__(self, workers: int, minimum: int, what: str = "work") -> None:
+    def __init__(self, workers: int, total: int = 0, what: str = "work",
+                 min_seconds: float = 4.0) -> None:
         self._workers = workers
-        self._minimum = minimum
+        self._total = total
         self._what = what
+        self._min_seconds = min_seconds
         self._pool: Optional[ProcessPoolExecutor] = None
+        self._decided = workers <= 1     # one worker: nothing to decide
 
-    def map(self, fn: Callable[[T], R], tasks: Sequence[T]) -> List[R]:
-        if self._workers > 1 and (self._pool is not None or len(tasks) >= self._minimum):
-            try:
-                return list(self._open().map(fn, tasks))
-            except Exception as exc:  # noqa: BLE001 - a broken pool must not cost the result
-                logger.warning("anatomy: parallel %s failed (%s); one at a time",
-                               self._what, type(exc).__name__)
-                self._workers = 1
-        return [fn(task) for task in tasks]
+    def map(self, fn: Callable[[T], R], tasks: Sequence[T],
+            total: Optional[int] = None) -> List[R]:
+        """`total` is how many tasks of this kind are coming, for the projection."""
+        if not tasks:
+            return []
+        if self._pool is None and not self._decided:
+            return self._measure(fn, tasks, total)
+        if self._pool is None:
+            return [fn(task) for task in tasks]
+        try:
+            # Chunked, so a worker is handed a run of tasks rather than one round trip per
+            # task; at one per trip the IPC on thousands of small tasks is the whole cost.
+            chunk = max(1, len(tasks) // (self._workers * 4))
+            return list(self._open().map(fn, tasks, chunksize=chunk))
+        except Exception as exc:  # noqa: BLE001 - a broken pool must not cost the result
+            logger.warning("anatomy: parallel %s failed (%s); one at a time",
+                           self._what, type(exc).__name__)
+            self._workers, self._pool = 1, None
+            return [fn(task) for task in tasks]
+
+    def _measure(self, fn: Callable[[T], R], tasks: Sequence[T],
+                 total: Optional[int]) -> List[R]:
+        """Time a short sample here, then decide whether the rest is worth a pool.
+
+        A sample and not the whole batch: what it measures is work done serially that could
+        have been shared, so measuring 256 instances to decide about 400 spends most of the
+        gain finding out it was there.
+        """
+        sample = tasks[:_SAMPLE]
+        started = time.perf_counter()
+        results = list(map(fn, sample))
+        elapsed = time.perf_counter() - started
+        expected = max(total or self._total, len(tasks))
+        projected = elapsed / len(sample) * expected
+        self._decided = True
+        if projected < self._min_seconds:
+            self._workers = 1
+            logger.debug("anatomy: %s projected at %.1f s over %d; not worth a pool",
+                         self._what, projected, expected)
+        else:
+            logger.info("anatomy: %s projected at %.0f s over %d; using %d processes",
+                        self._what, projected, expected, self._workers)
+            self._open()
+        rest = tasks[len(sample):]
+        if rest:
+            results.extend(self.map(fn, rest, total))
+        return results
 
     def _open(self) -> ProcessPoolExecutor:
         if self._pool is None:

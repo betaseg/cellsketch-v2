@@ -317,10 +317,6 @@ def _bbox_extent(binary: np.ndarray) -> float:
 # handed, so feeding it everything would hold every cropped mask in memory at the same time.
 _GEOMETRY_BATCH = 256
 
-# Instances in a batch below which a pool is not worth opening. Measured, 8 workers on 22
-# cores: 50 instances 0.39x, 150 0.84x, 400 1.72x, 900 2.61x, so the crossover sits near 200.
-_MESH_PARALLEL_MIN = 200
-
 
 def _instance_geometry(task: Tuple[Any, ...]) -> Tuple[bytes, bytes]:
     """One instance's (mesh, outline).
@@ -362,8 +358,7 @@ def mesh_rows_for_object(
     centre = (object_center_um(volumes[object_mask_name] > 0, sample_size)
               if object_mask_name and object_mask_name in volumes else None)
 
-    pool = WorkPool(worker_share(options.mesh_workers), _MESH_PARALLEL_MIN,
-                    what="meshing")
+    pool = WorkPool(worker_share(options.mesh_workers), what="meshing")
     try:
         return _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
                      object_mask_name, rows, ndim, planar, centre, pool)
@@ -450,7 +445,8 @@ def _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
                                     sigma_max=options.smooth_sigma * 2),
                     options.target_reduction, options.level,
                 ))
-            for row, (mesh_payload, outline_payload) in zip(pending, pool.map(_instance_geometry, tasks)):
+            geometry = pool.map(_instance_geometry, tasks, total=len(props))
+            for row, (mesh_payload, outline_payload) in zip(pending, geometry):
                 row["mesh"] = mesh_payload
                 row["outline"] = outline_payload
                 rows.append(row)
