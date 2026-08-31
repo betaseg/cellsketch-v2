@@ -53,6 +53,13 @@ build-backend = "hatchling.build"
 [tool.uv]
 package = true
 
+# The pixel-patrol-base dependency is a git URL, which hatchling refuses to put in a
+# wheel's metadata unless asked: a direct reference cannot be resolved from an index, so
+# a package carrying one is not publishable to PyPI. This one is not going there while it
+# depends on an unreleased base, and the reference goes away with the pin.
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/pixel_patrol_anatomy"]
 
