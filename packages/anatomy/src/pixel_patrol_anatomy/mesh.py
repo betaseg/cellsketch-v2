@@ -13,12 +13,8 @@ from __future__ import annotations
 
 import logging
 import math
-import multiprocessing
-import os
 import struct
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -32,6 +28,7 @@ from pixel_patrol_anatomy.geometry import (
     METRICS_3D,
 )
 from pixel_patrol_anatomy.distances import object_center_um, polarity_from_offset
+from pixel_patrol_anatomy.parallel import WorkPool, batched, worker_share
 from pixel_patrol_anatomy.geometry import skeleton_graph_metrics
 from pixel_patrol_anatomy.skeletons import (
     EntityFilter,
@@ -320,39 +317,9 @@ def _bbox_extent(binary: np.ndarray) -> float:
 # handed, so feeding it everything would hold every cropped mask in memory at the same time.
 _GEOMETRY_BATCH = 256
 
-# Instances in a batch below which a pool is not worth *opening*. Spawn (which is what this
-# has to use) costs about a second to stand up eight workers importing numpy and skimage,
-# and that is more than a small object spends meshing. Measured, 8 workers, 22 cores:
-#   50 instances 0.39x   150 0.84x   400 1.72x   900 2.61x
-# so the crossover sits near 200. Once a pool is open, using it again is free, so this gates
-# opening one and not the trailing batch of an entity that already justified it.
-_PARALLEL_MIN = 200
-
-
-def _batched(items: Sequence[Any], size: int):
-    """`items` in chunks of `size`. itertools.batched is 3.12+, and this supports 3.11."""
-    it = iter(items)
-    while chunk := list(islice(it, size)):
-        yield chunk
-
-
-def geometry_workers(requested: int = 0) -> int:
-    """How many processes to mesh instances with.
-
-    Objects already run in parallel, and that pool is sized by memory rather than by cores,
-    so on a batch of big objects most of the machine sits idle while one instance at a time
-    is meshed. This is the share of the cores left over, which the batch works out and
-    passes down in PP_ANATOMY_MESH_WORKERS; meshing on its own gets the machine.
-    """
-    if requested:
-        return max(1, int(requested))
-    raw = os.environ.get("PP_ANATOMY_MESH_WORKERS")
-    if raw:
-        try:
-            return max(1, int(raw))
-        except ValueError:
-            logger.warning("anatomy: PP_ANATOMY_MESH_WORKERS=%r is not a number; ignoring", raw)
-    return max(1, os.cpu_count() or 1)
+# Instances in a batch below which a pool is not worth opening. Measured, 8 workers on 22
+# cores: 50 instances 0.39x, 150 0.84x, 400 1.72x, 900 2.61x, so the crossover sits near 200.
+_MESH_PARALLEL_MIN = 200
 
 
 def _instance_geometry(task: Tuple[Any, ...]) -> Tuple[bytes, bytes]:
@@ -368,47 +335,6 @@ def _instance_geometry(task: Tuple[Any, ...]) -> Tuple[bytes, bytes]:
     return generate_mesh(image, origin, sample_size, step_size=step_size,
                          smooth_sigma=sigma, target_reduction=target_reduction,
                          level=level), b""
-
-
-class _GeometryPool:
-    """Instance geometry, farmed out to processes once there is enough of it to be worth it.
-
-    Started on the first batch big enough to pay for it, rather than up front: spawning
-    costs a fraction of a second per worker, and an object with a handful of instances is
-    finished serially before a pool would have opened.
-    """
-
-    def __init__(self, workers: int) -> None:
-        self._workers = workers
-        self._pool: Optional[ProcessPoolExecutor] = None
-
-    def map(self, tasks: Sequence[Tuple[Any, ...]]) -> List[Tuple[bytes, bytes]]:
-        if self._workers > 1 and (self._pool is not None
-                                  or len(tasks) >= _PARALLEL_MIN):
-            try:
-                return list(self._open().map(_instance_geometry, tasks))
-            except Exception as exc:  # noqa: BLE001 - a broken pool must not cost the geometry
-                # Meshing one at a time is slow, not wrong, and losing an object's whole
-                # geometry to a pool that died is much the worse outcome.
-                logger.warning("anatomy: parallel meshing failed (%s); one at a time",
-                               type(exc).__name__)
-                self._workers = 1
-        return [_instance_geometry(task) for task in tasks]
-
-    def _open(self) -> ProcessPoolExecutor:
-        if self._pool is None:
-            # spawn, not fork, for the reason the batch pool uses it: this process holds
-            # native threads (ITK, BLAS, polars) and a forked child can deadlock on their
-            # locks. Python 3.12 warns about exactly this.
-            self._pool = ProcessPoolExecutor(
-                max_workers=self._workers,
-                mp_context=multiprocessing.get_context("spawn"),
-            )
-        return self._pool
-
-    def shutdown(self) -> None:
-        if self._pool is not None:
-            self._pool.shutdown()
 
 
 def mesh_rows_for_object(
@@ -436,7 +362,8 @@ def mesh_rows_for_object(
     centre = (object_center_um(volumes[object_mask_name] > 0, sample_size)
               if object_mask_name and object_mask_name in volumes else None)
 
-    pool = _GeometryPool(geometry_workers(options.mesh_workers))
+    pool = WorkPool(worker_share(options.mesh_workers), _MESH_PARALLEL_MIN,
+                    what="meshing")
     try:
         return _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
                      object_mask_name, rows, ndim, planar, centre, pool)
@@ -493,7 +420,7 @@ def _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
         )
         # In batches, so the pool always has work but the cropped masks in flight never
         # add up to another copy of the object.
-        for batch in _batched(props, _GEOMETRY_BATCH):
+        for batch in batched(props, _GEOMETRY_BATCH):
             pending: List[Dict[str, Any]] = []
             tasks: List[Tuple[Any, ...]] = []
             for rp in batch:
@@ -523,7 +450,7 @@ def _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
                                     sigma_max=options.smooth_sigma * 2),
                     options.target_reduction, options.level,
                 ))
-            for row, (mesh_payload, outline_payload) in zip(pending, pool.map(tasks)):
+            for row, (mesh_payload, outline_payload) in zip(pending, pool.map(_instance_geometry, tasks)):
                 row["mesh"] = mesh_payload
                 row["outline"] = outline_payload
                 rows.append(row)
