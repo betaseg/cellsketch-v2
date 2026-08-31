@@ -112,13 +112,25 @@ than reinterpreted.
 
 ## Install (development)
 
-Folder discovery for suffix-less directories needs `pixel-patrol-base` newer than
-0.8.0, so install both from a local checkout:
+Folder discovery for suffix-less directories needs `pixel-patrol-base` newer than the
+0.8.0 on PyPI, so it comes from git, pinned to the commit `.github/workflows/tests.yml`
+installs rather than to a branch that moves under you:
 
 ```bash
 uv venv --python 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install -e . \
-  -e /path/to/pixel-patrol/packages/pixel-patrol-base pytest
+VIRTUAL_ENV=$PWD/.venv uv pip install -e . pytest \
+  "pixel-patrol-base @ git+https://github.com/ida-mdc/pixel-patrol.git@59a40e06aec04d6a6a296e0495b3e140a0d00c89#subdirectory=packages/pixel-patrol-base"
+```
+
+That is enough for the suite, which never opens the viewer. `pixel-patrol view` does, and
+the viewer is a build product that is not committed, so seeing the widgets means a clone
+and one npm build instead:
+
+```bash
+git clone https://github.com/ida-mdc/pixel-patrol.git
+git -C pixel-patrol checkout 59a40e06aec04d6a6a296e0495b3e140a0d00c89
+(cd pixel-patrol/viewer && npm ci && npm run build)
+VIRTUAL_ENV=$PWD/.venv uv pip install -e pixel-patrol/packages/pixel-patrol-base
 ```
 
 ## Run

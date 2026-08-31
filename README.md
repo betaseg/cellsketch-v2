@@ -31,11 +31,34 @@ and every configuration knob; this page is the short path through a run.
 
 ## Install and run
 
+Folder discovery for suffix-less directories needs a `pixel-patrol-base` newer than the
+0.8.0 on PyPI, so it comes from git, at the commit the workflows pin:
+
 ```bash
+git clone https://github.com/ida-mdc/pixel-patrol.git
+git -C pixel-patrol checkout 59a40e06aec04d6a6a296e0495b3e140a0d00c89   # head of fix/folder_based_records
+
 uv venv --python 3.12 .venv
 VIRTUAL_ENV=$PWD/.venv uv pip install -e packages/anatomy \
-  -e /path/to/pixel-patrol/packages/pixel-patrol-base
+  -e pixel-patrol/packages/pixel-patrol-base
 ```
+
+`view` additionally needs the viewer itself, which is a build product and is not
+committed, so build it once in the same checkout (`pixel-patrol view` otherwise stops
+with *Viewer not built*):
+
+```bash
+(cd pixel-patrol/viewer && npm ci && npm run build)
+```
+
+If you only ever `process`, skip the clone and npm entirely:
+
+```bash
+VIRTUAL_ENV=$PWD/.venv uv pip install -e packages/anatomy \
+  "pixel-patrol-base @ git+https://github.com/ida-mdc/pixel-patrol.git@59a40e06aec04d6a6a296e0495b3e140a0d00c89#subdirectory=packages/pixel-patrol-base"
+```
+
+Move all three to `main`, or a PyPI release, once the folder-based records work lands.
 
 ```bash
 pixel-patrol-anatomy dry-run experiment/
