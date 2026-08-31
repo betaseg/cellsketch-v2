@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import logging
 import math
+import multiprocessing
+import os
 import struct
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -91,6 +95,8 @@ class MeshOptions:
     # Contacts ride along so "Colour by → Contact group" works; None leaves them out. Cheap
     # next to meshing (seconds against minutes).
     contact_max_um: Optional[float] = 0.5
+    # Processes to mesh instances with. 0 = work it out: the batch's share of the cores.
+    mesh_workers: int = 0
 
 
 def sigma_for_shape(sphericity_value: float, fill_ratio: float,
@@ -309,6 +315,101 @@ def _bbox_extent(binary: np.ndarray) -> float:
     return float(extent)
 
 
+# Instances whose geometry is in flight at once. A pool consumes the whole iterable it is
+# handed, so feeding it everything would hold every cropped mask in memory at the same time.
+_GEOMETRY_BATCH = 256
+
+# Instances in a batch below which a pool is not worth *opening*. Spawn (which is what this
+# has to use) costs about a second to stand up eight workers importing numpy and skimage,
+# and that is more than a small object spends meshing. Measured, 8 workers, 22 cores:
+#   50 instances 0.39x   150 0.84x   400 1.72x   900 2.61x
+# so the crossover sits near 200. Once a pool is open, using it again is free, so this gates
+# opening one and not the trailing batch of an entity that already justified it.
+_PARALLEL_MIN = 200
+
+
+def _batched(items: Sequence[Any], size: int):
+    """`items` in chunks of `size`. itertools.batched is 3.12+, and this supports 3.11."""
+    it = iter(items)
+    while chunk := list(islice(it, size)):
+        yield chunk
+
+
+def geometry_workers(requested: int = 0) -> int:
+    """How many processes to mesh instances with.
+
+    Objects already run in parallel, and that pool is sized by memory rather than by cores,
+    so on a batch of big objects most of the machine sits idle while one instance at a time
+    is meshed. This is the share of the cores left over, which the batch works out and
+    passes down in PP_ANATOMY_MESH_WORKERS; meshing on its own gets the machine.
+    """
+    if requested:
+        return max(1, int(requested))
+    raw = os.environ.get("PP_ANATOMY_MESH_WORKERS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning("anatomy: PP_ANATOMY_MESH_WORKERS=%r is not a number; ignoring", raw)
+    return max(1, os.cpu_count() or 1)
+
+
+def _instance_geometry(task: Tuple[Any, ...]) -> Tuple[bytes, bytes]:
+    """One instance's (mesh, outline).
+
+    Module level and tuple-argued so a process pool can carry it. What crosses to the worker
+    is one instance's cropped mask, which is why farming these out is worth it: the work is
+    an EDT, a blur, marching cubes and a decimation, and the payload is a few kilobytes.
+    """
+    image, origin, sample_size, planar, step_size, sigma, target_reduction, level = task
+    if planar:
+        return b"", generate_outline(image, origin, sample_size)
+    return generate_mesh(image, origin, sample_size, step_size=step_size,
+                         smooth_sigma=sigma, target_reduction=target_reduction,
+                         level=level), b""
+
+
+class _GeometryPool:
+    """Instance geometry, farmed out to processes once there is enough of it to be worth it.
+
+    Started on the first batch big enough to pay for it, rather than up front: spawning
+    costs a fraction of a second per worker, and an object with a handful of instances is
+    finished serially before a pool would have opened.
+    """
+
+    def __init__(self, workers: int) -> None:
+        self._workers = workers
+        self._pool: Optional[ProcessPoolExecutor] = None
+
+    def map(self, tasks: Sequence[Tuple[Any, ...]]) -> List[Tuple[bytes, bytes]]:
+        if self._workers > 1 and (self._pool is not None
+                                  or len(tasks) >= _PARALLEL_MIN):
+            try:
+                return list(self._open().map(_instance_geometry, tasks))
+            except Exception as exc:  # noqa: BLE001 - a broken pool must not cost the geometry
+                # Meshing one at a time is slow, not wrong, and losing an object's whole
+                # geometry to a pool that died is much the worse outcome.
+                logger.warning("anatomy: parallel meshing failed (%s); one at a time",
+                               type(exc).__name__)
+                self._workers = 1
+        return [_instance_geometry(task) for task in tasks]
+
+    def _open(self) -> ProcessPoolExecutor:
+        if self._pool is None:
+            # spawn, not fork, for the reason the batch pool uses it: this process holds
+            # native threads (ITK, BLAS, polars) and a forked child can deadlock on their
+            # locks. Python 3.12 warns about exactly this.
+            self._pool = ProcessPoolExecutor(
+                max_workers=self._workers,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+        return self._pool
+
+    def shutdown(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown()
+
+
 def mesh_rows_for_object(
     volumes: Mapping[str, np.ndarray],
     kinds: Mapping[str, str],
@@ -334,6 +435,17 @@ def mesh_rows_for_object(
     centre = (object_center_um(volumes[object_mask_name] > 0, sample_size)
               if object_mask_name and object_mask_name in volumes else None)
 
+    pool = _GeometryPool(geometry_workers(options.mesh_workers))
+    try:
+        return _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
+                     object_mask_name, rows, ndim, planar, centre, pool)
+    finally:
+        pool.shutdown()
+
+
+def _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
+          object_mask_name, rows, ndim, planar, centre, pool):
+    """The body of mesh_rows_for_object, with a pool open for the instance geometry."""
     for name, volume in volumes.items():
         kind = kinds[name]
         if kind != "label":
@@ -375,35 +487,42 @@ def mesh_rows_for_object(
             if options.with_skeletons and wants_skeletons(name, options.skeleton_entities)
             else {}
         )
-        for rp in props:
-            stats = measured.get(int(rp.label), {})
-            shape_metrics = {key: stats.get(key, float("nan")) for key in shape_keys}
-            origin = tuple(int(v) for v in rp.bbox[:ndim])
-            bbox_extent = float(np.prod([hi - lo for lo, hi
-                                         in zip(rp.bbox[:ndim], rp.bbox[ndim:])]))
-            fill_ratio = rp.area / bbox_extent if bbox_extent > 0 else float("nan")
-            roundness = shape_metrics.get("sphericity",
-                                          shape_metrics.get("circularity", float("nan")))
-            carried = (metrics or {}).get((name, int(rp.label))) or {}
-            rows.append({
-                **_polarity(stats.get("centroid_um"), centre),
-                **_skeleton_metrics(skeletons.get(int(rp.label))),
-                **{k: v for k, v in carried.items() if k in CARRIED_METRICS},
-                **shape_metrics,
-                "object_id": object_id, "group_id": group_id, "entity_name": name,
-                "entity_kind": kind, "row_type": "instance", "label_id": int(rp.label),
-                "spatial_dims": ndim,
-                "mesh": b"" if planar else generate_mesh(
-                    rp.image.astype(bool), origin, sample_size,
-                    step_size=options.step_size,
-                    smooth_sigma=sigma_for_shape(roundness, fill_ratio, sigma_min=0.3,
-                                                 sigma_max=options.smooth_sigma * 2),
-                    target_reduction=options.target_reduction, level=options.level,
-                ),
-                "outline": generate_outline(rp.image.astype(bool), origin, sample_size)
-                if planar else b"",
-                "skeleton": skeleton_payload(skeletons.get(int(rp.label))),
-            })
+        # In batches, so the pool always has work but the cropped masks in flight never
+        # add up to another copy of the object.
+        for batch in _batched(props, _GEOMETRY_BATCH):
+            pending: List[Dict[str, Any]] = []
+            tasks: List[Tuple[Any, ...]] = []
+            for rp in batch:
+                stats = measured.get(int(rp.label), {})
+                shape_metrics = {key: stats.get(key, float("nan")) for key in shape_keys}
+                origin = tuple(int(v) for v in rp.bbox[:ndim])
+                bbox_extent = float(np.prod([hi - lo for lo, hi
+                                             in zip(rp.bbox[:ndim], rp.bbox[ndim:])]))
+                fill_ratio = rp.area / bbox_extent if bbox_extent > 0 else float("nan")
+                roundness = shape_metrics.get("sphericity",
+                                              shape_metrics.get("circularity", float("nan")))
+                carried = (metrics or {}).get((name, int(rp.label))) or {}
+                pending.append({
+                    **_polarity(stats.get("centroid_um"), centre),
+                    **_skeleton_metrics(skeletons.get(int(rp.label))),
+                    **{k: v for k, v in carried.items() if k in CARRIED_METRICS},
+                    **shape_metrics,
+                    "object_id": object_id, "group_id": group_id, "entity_name": name,
+                    "entity_kind": kind, "row_type": "instance", "label_id": int(rp.label),
+                    "spatial_dims": ndim,
+                    "skeleton": skeleton_payload(skeletons.get(int(rp.label))),
+                })
+                tasks.append((
+                    rp.image.astype(bool), origin, tuple(sample_size), planar,
+                    options.step_size,
+                    sigma_for_shape(roundness, fill_ratio, sigma_min=0.3,
+                                    sigma_max=options.smooth_sigma * 2),
+                    options.target_reduction, options.level,
+                ))
+            for row, (mesh_payload, outline_payload) in zip(pending, pool.map(tasks)):
+                row["mesh"] = mesh_payload
+                row["outline"] = outline_payload
+                rows.append(row)
 
     if options.contact_max_um is not None:
         rows.extend(_contact_rows(volumes, kinds, sample_size, object_id, group_id,

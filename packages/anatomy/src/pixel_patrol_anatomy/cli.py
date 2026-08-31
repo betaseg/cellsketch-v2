@@ -106,10 +106,12 @@ def _apply_mesh_env(
     target_reduction: float | None,
     level: float | None,
     mesh_format: str | None = None,
+    mesh_workers: int | None = None,
 ) -> None:
     settings = {
         "PP_ANATOMY_MESH_DIR": mesh_dir,
         "PP_ANATOMY_MESH_FORMAT": mesh_format,
+        "PP_ANATOMY_MESH_WORKERS": mesh_workers,
         "PP_ANATOMY_MESH_SMOOTH_SIGMA": smooth_sigma,
         "PP_ANATOMY_MESH_STEP_SIZE": step_size,
         "PP_ANATOMY_MESH_TARGET_REDUCTION": target_reduction,
@@ -131,6 +133,9 @@ def _mesh_flags(fn):
                      help="Decimation fraction (default: 0.8, keeping ~20%% of faces)."),
         click.option("--mesh-level", type=float, default=None, metavar="L",
                      help="Iso-surface level on the signed distance field (default: 0)."),
+        click.option("--mesh-workers", type=int, default=None, metavar="N",
+                     help="Processes meshing instances of one object (default: the cores "
+                          "the object pool is not using)."),
     ]):
         fn = option(fn)
     return fn
@@ -261,6 +266,7 @@ def process(
     max_workers: int | None, with_mesh: bool,
     mesh_dir: Path | None, mesh_smooth_sigma: float | None, mesh_step_size: int | None,
     mesh_target_reduction: float | None, mesh_level: float | None,
+    mesh_workers: int | None,
 ) -> None:
     """Analyse every object folder under OBJECT_DIR and write one report."""
     objects = find_object_dirs(object_dir)
@@ -276,7 +282,8 @@ def process(
                         skeleton_entities, skip_skeletons)
 
     meshes_to = (mesh_dir or output.with_name(output.stem + "_meshes")) if with_mesh else None
-    _apply_mesh_env(meshes_to, mesh_smooth_sigma, mesh_step_size, mesh_target_reduction, mesh_level)
+    _apply_mesh_env(meshes_to, mesh_smooth_sigma, mesh_step_size, mesh_target_reduction,
+                    mesh_level, mesh_workers=mesh_workers)
 
     excluded = {"anatomy-contacts"} if no_contacts else set()
     if not with_mesh:
@@ -401,6 +408,7 @@ def mesh(
     no_contacts: bool,
     mesh_smooth_sigma: float | None, mesh_step_size: int | None,
     mesh_target_reduction: float | None, mesh_level: float | None,
+    mesh_workers: int | None,
 ) -> None:
     """Write per-object geometry for the 3D widgets and the Blender export.
 
@@ -419,7 +427,8 @@ def mesh(
         raise click.ClickException(f"No object folders found under {object_dir}.")
     _apply_analysis_env(object_mask, voxel_size_um, auto_clip, False, contact_max_um,
                         None, None, skeleton_entities=skeleton_entities)
-    _apply_mesh_env(None, mesh_smooth_sigma, mesh_step_size, mesh_target_reduction, mesh_level)
+    _apply_mesh_env(None, mesh_smooth_sigma, mesh_step_size, mesh_target_reduction,
+                    mesh_level, mesh_workers=mesh_workers)
     options = mesh_options(with_skeletons=not no_skeletons,
                            **({"contact_max_um": None} if no_contacts else {}))
 

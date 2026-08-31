@@ -102,6 +102,7 @@ class MeshProcessor:
                 max_skeleton_voxels=cfg.max_skeleton_voxels,
                 num_threads=cfg.num_threads,
                 contact_max_um=cfg.contact_max_um,
+                mesh_workers=cfg.mesh_workers,
             ),
             metrics=metrics,
         )

@@ -202,7 +202,13 @@ def analyse(
     started = time.perf_counter()
     groups = [group_of(f, root, paths) for f in folders]
     n_workers = worker_count(workers, len(folders), peak_gb)
-    logger.info("anatomy: %d object(s), %d worker(s)", len(folders), n_workers)
+    # Meshing farms instances out to processes of its own, and this pool is sized by memory
+    # rather than by cores, so on big objects most of the machine would otherwise sit idle.
+    # Each object gets the share left over; an explicit --mesh-workers already set it.
+    os.environ.setdefault("PP_ANATOMY_MESH_WORKERS",
+                          str(max(1, (os.cpu_count() or 1) // n_workers)))
+    logger.info("anatomy: %d object(s), %d worker(s), %s mesh process(es) each",
+                len(folders), n_workers, os.environ["PP_ANATOMY_MESH_WORKERS"])
 
     if n_workers == 1:
         results = [analyse_object(f, g, excluded) for f, g in zip(folders, groups)]

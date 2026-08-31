@@ -157,6 +157,9 @@ class AnatomyConfig:
     mesh_step_size: int = 2
     mesh_target_reduction: float = 0.8
     mesh_level: Optional[float] = None
+    # Processes to mesh instances with. 0 = the share of the cores the batch is not already
+    # using for objects, which `analyse` works out and passes down.
+    mesh_workers: int = 0
 
     @classmethod
     def from_env(cls) -> "AnatomyConfig":
@@ -184,4 +187,5 @@ class AnatomyConfig:
                 _env_float("PP_ANATOMY_MESH_LEVEL", 0.0)
                 if os.environ.get("PP_ANATOMY_MESH_LEVEL") else None
             ),
+            mesh_workers=_env_int("PP_ANATOMY_MESH_WORKERS", 0),
         )
