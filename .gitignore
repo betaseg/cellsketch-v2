@@ -1,0 +1,14 @@
+# Editors
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# What a run writes: the report, and the geometry that goes beside it
+report.parquet
+*_meshes/
