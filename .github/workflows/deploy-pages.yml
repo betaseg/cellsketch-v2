@@ -37,11 +37,14 @@ jobs:
 
       # pixel-patrol-base has to come from git: PyPI stops at 0.8.0, and the loader
       # here claims a whole object folder as one record, which needs the folder-based
-      # records branch. Point this at main (or a PyPI release) once that has landed.
+      # records work. Pinned to a commit, not the branch: a branch would change what
+      # this builds without anyone touching this repo, and would vanish when it merges.
+      # This is the commit tests.yml installs, so CI and the deploy agree on the base.
+      # Point both at main (or a PyPI release) once that has landed.
       - uses: actions/checkout@v4
         with:
           repository: ida-mdc/pixel-patrol
-          ref: fix/folder_based_records
+          ref: 59a40e06aec04d6a6a296e0495b3e140a0d00c89   # head of fix/folder_based_records
           path: pixel-patrol
 
       # The viewer bundle is a build product and is not committed, so installing

@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # The viewer widgets are JavaScript, and parts of the suite run them through node: the
+      # geometry decoder, the merge arithmetic, the contact clustering, the object overview and
+      # every query and chart the widgets build. Without node those tests fail rather than skip.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # pixel-patrol-base has to come from git: PyPI stops at 0.8.0, and the loader here claims
+      # a whole object folder as one record, which needs the folder-based records work. Pinned
+      # to a commit, not the branch, so a run is reproducible and so the deploy workflow builds
+      # the same base this was tested against. Point both at main (or a PyPI release) once that
+      # has landed.
+      - name: Install
+        run: |
+          uv venv --python 3.12 .venv
+          VIRTUAL_ENV=$PWD/.venv uv pip install \
+            "pixel-patrol-base @ git+https://github.com/ida-mdc/pixel-patrol.git@59a40e06aec04d6a6a296e0495b3e140a0d00c89#subdirectory=packages/pixel-patrol-base" \
+            -e packages/anatomy \
+            pytest
+
+      - name: Test
+        working-directory: packages/anatomy
+        run: ../../.venv/bin/python -m pytest -q
