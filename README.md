@@ -31,34 +31,25 @@ and every configuration knob; this page is the short path through a run.
 
 ## Install and run
 
-Folder discovery for suffix-less directories needs a `pixel-patrol-base` newer than the
-0.8.0 on PyPI, so it comes from git, at the commit the workflows pin:
+```bash
+uv venv --python 3.12 .venv
+VIRTUAL_ENV=$PWD/.venv uv pip install -e packages/anatomy
+```
+
+That is everything for `dry-run`, `process` and `mesh`. Folder discovery for suffix-less
+directories is in no `pixel-patrol-base` release, so the package pins an unreleased one by
+commit in its own dependencies; nothing to name here, and nothing to keep in step.
+
+`view` needs one thing more: the viewer itself is a build product and is not committed, so
+an install from git carries none and the command stops with *Viewer not built*. Build it
+once, from the commit the package already pins:
 
 ```bash
 git clone https://github.com/ida-mdc/pixel-patrol.git
-git -C pixel-patrol checkout 59a40e06aec04d6a6a296e0495b3e140a0d00c89   # head of fix/folder_based_records
-
-uv venv --python 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install -e packages/anatomy \
-  -e pixel-patrol/packages/pixel-patrol-base
-```
-
-`view` additionally needs the viewer itself, which is a build product and is not
-committed, so build it once in the same checkout (`pixel-patrol view` otherwise stops
-with *Viewer not built*):
-
-```bash
+git -C pixel-patrol checkout "$(grep -oE '[0-9a-f]{40}' packages/anatomy/pyproject.toml)"
 (cd pixel-patrol/viewer && npm ci && npm run build)
+VIRTUAL_ENV=$PWD/.venv uv pip install -e pixel-patrol/packages/pixel-patrol-base
 ```
-
-If you only ever `process`, skip the clone and npm entirely:
-
-```bash
-VIRTUAL_ENV=$PWD/.venv uv pip install -e packages/anatomy \
-  "pixel-patrol-base @ git+https://github.com/ida-mdc/pixel-patrol.git@59a40e06aec04d6a6a296e0495b3e140a0d00c89#subdirectory=packages/pixel-patrol-base"
-```
-
-Move all three to `main`, or a PyPI release, once the folder-based records work lands.
 
 ```bash
 pixel-patrol-anatomy dry-run experiment/

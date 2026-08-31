@@ -112,23 +112,25 @@ than reinterpreted.
 
 ## Install (development)
 
-Folder discovery for suffix-less directories needs `pixel-patrol-base` newer than the
-0.8.0 on PyPI, so it comes from git, pinned to the commit `.github/workflows/tests.yml`
-installs rather than to a branch that moves under you:
-
 ```bash
 uv venv --python 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install -e . pytest \
-  "pixel-patrol-base @ git+https://github.com/ida-mdc/pixel-patrol.git@59a40e06aec04d6a6a296e0495b3e140a0d00c89#subdirectory=packages/pixel-patrol-base"
+VIRTUAL_ENV=$PWD/.venv uv pip install -e . pytest
 ```
 
-That is enough for the suite, which never opens the viewer. `pixel-patrol view` does, and
-the viewer is a build product that is not committed, so seeing the widgets means a clone
-and one npm build instead:
+`pixel-patrol-base` comes from git, pinned to a commit in this package's own
+`dependencies`: folder discovery for suffix-less directories, which the loader needs to
+claim an object folder as one record, is in no release. That pin is the only copy of the
+commit in the repo - `.github/workflows/deploy-pages.yml` reads it back out of the
+pyproject rather than repeating it, so the deploy cannot drift from what the tests ran
+against. Swap it for a version once that work has landed.
+
+The install above runs the whole suite, which never opens the viewer. Seeing the widgets
+does, and the viewer is a build product that is not committed, so it takes a clone at the
+same commit and one npm build:
 
 ```bash
 git clone https://github.com/ida-mdc/pixel-patrol.git
-git -C pixel-patrol checkout 59a40e06aec04d6a6a296e0495b3e140a0d00c89
+git -C pixel-patrol checkout "$(grep -oE '[0-9a-f]{40}' pyproject.toml)"
 (cd pixel-patrol/viewer && npm ci && npm run build)
 VIRTUAL_ENV=$PWD/.venv uv pip install -e pixel-patrol/packages/pixel-patrol-base
 ```

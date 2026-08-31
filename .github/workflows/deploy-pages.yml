@@ -35,16 +35,25 @@ jobs:
         with:
           fetch-depth: 0   # history back to STANDALONE_VIEWER_REF
 
-      # pixel-patrol-base has to come from git: PyPI stops at 0.8.0, and the loader
-      # here claims a whole object folder as one record, which needs the folder-based
-      # records work. Pinned to a commit, not the branch: a branch would change what
-      # this builds without anyone touching this repo, and would vanish when it merges.
-      # This is the commit tests.yml installs, so CI and the deploy agree on the base.
-      # Point both at main (or a PyPI release) once that has landed.
+      # The viewer has to be built from source, so pixel-patrol is checked out at the
+      # very commit packages/anatomy/pyproject.toml pins its dependency to. Read from
+      # there rather than repeated here, so the pin has one home and the deploy cannot
+      # drift from what the tests ran against.
+      - id: pin
+        name: Read the pinned pixel-patrol commit
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re, tomllib
+          deps = tomllib.load(open("packages/anatomy/pyproject.toml", "rb"))["project"]["dependencies"]
+          url = next(d for d in deps if d.startswith("pixel-patrol-base"))
+          print("sha=" + re.search(r"@([0-9a-f]{40})#", url).group(1))
+          PY
+          cat "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           repository: ida-mdc/pixel-patrol
-          ref: 59a40e06aec04d6a6a296e0495b3e140a0d00c89   # head of fix/folder_based_records
+          ref: ${{ steps.pin.outputs.sha }}
           path: pixel-patrol
 
       # The viewer bundle is a build product and is not committed, so installing
@@ -68,12 +77,15 @@ jobs:
       # Installing the anatomy package is what puts its widgets in the viewer:
       # the pixel_patrol.viewer_extensions entry point is how build-viewer-html
       # discovers the extension directory and inlines its plugins.
+      #
+      # Base is installed second, on purpose. The first install pulls it from the
+      # pinned git URL, which carries no viewer; the checkout above is the same
+      # commit but with viewer_dist/ built into it, so it has to land last to win.
       - name: Install
         run: |
           uv venv --python 3.12 .venv
-          VIRTUAL_ENV=$PWD/.venv uv pip install \
-            -e pixel-patrol/packages/pixel-patrol-base \
-            -e packages/anatomy
+          VIRTUAL_ENV=$PWD/.venv uv pip install -e packages/anatomy
+          VIRTUAL_ENV=$PWD/.venv uv pip install -e pixel-patrol/packages/pixel-patrol-base
 
       # One self-contained page: the app bundle and every installed extension are
       # inlined, DuckDB WASM comes from a CDN. Open it with ?data=<url of a report>.
