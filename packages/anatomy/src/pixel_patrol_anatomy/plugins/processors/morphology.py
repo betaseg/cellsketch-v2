@@ -15,7 +15,7 @@ object-level (MEMORY) processors instead.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 from pixel_patrol_base.core.contracts import ChunkKind
@@ -115,6 +115,23 @@ def _make_sum(col: str) -> Callable[[List[Dict], Dict[str, Any]], Any]:
     return agg
 
 
+def _foreground_centroid(binary: np.ndarray) -> Optional[np.ndarray]:
+    """Mean position of the foreground, in samples, in array order. None if there is none.
+
+    One weighted reduction per axis, not ``np.argwhere``: a whole-object mask holds tens of
+    millions of samples, and listing their coordinates to take one mean costs gigabytes.
+    Measured on a 53-Mvoxel mask, the coordinate array alone peaked at 2.5 GB.
+    """
+    total = int(binary.sum())
+    if not total:
+        return None
+    return np.array([
+        float((binary.sum(axis=tuple(j for j in range(binary.ndim) if j != axis))
+               * np.arange(binary.shape[axis])).sum()) / total
+        for axis in range(binary.ndim)
+    ])
+
+
 class MorphologyProcessor:
     """Whole-structure morphology for a mask entity; counts and totals for a label entity."""
 
@@ -182,7 +199,7 @@ class MorphologyProcessor:
         if entity_kind == "mask":
             binary = volume > 0
             metrics = region_metrics(binary, sample_size)
-            coords = np.argwhere(binary)
+            centroid = _foreground_centroid(binary)
             # instance_count stays null: a mask is one structure, not one instance, which
             # keeps the object-row sum a count of label instances.
             row.update(metrics)
@@ -190,8 +207,8 @@ class MorphologyProcessor:
             # The loader recorded the object mask's centroid, so a leaf that sees one
             # entity can still measure where it sits.
             center = object_center(meta, record.dim_order)
-            if coords.size and center is not None:
-                centroid_um = coords.mean(axis=0) * np.array(sample_size)
+            if centroid is not None and center is not None:
+                centroid_um = centroid * np.array(sample_size)
                 row.update(polarity_from_offset(centroid_um - np.array(center, dtype=float)))
         else:
             labels = volume.astype(np.int32, copy=False)
