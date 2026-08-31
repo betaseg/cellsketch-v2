@@ -33,8 +33,12 @@ and every configuration knob; this page is the short path through a run.
 
 ```bash
 uv venv --python 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install -e packages/anatomy
+source .venv/bin/activate
+uv pip install -e packages/anatomy
 ```
+
+Every command below assumes that activated environment; without it, reach into the venv
+directly instead (`.venv/bin/pixel-patrol-anatomy …`).
 
 That is everything for `dry-run`, `process` and `mesh`. Folder discovery for suffix-less
 directories is in no `pixel-patrol-base` release, so the package pins an unreleased one by
@@ -48,7 +52,7 @@ once, from the commit the package already pins:
 git clone https://github.com/ida-mdc/pixel-patrol.git
 git -C pixel-patrol checkout "$(grep -oE '[0-9a-f]{40}' packages/anatomy/pyproject.toml)"
 (cd pixel-patrol/viewer && npm ci && npm run build)
-VIRTUAL_ENV=$PWD/.venv uv pip install -e pixel-patrol/packages/pixel-patrol-base
+uv pip install -e pixel-patrol/packages/pixel-patrol-base
 ```
 
 ```bash

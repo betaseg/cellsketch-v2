@@ -114,8 +114,12 @@ than reinterpreted.
 
 ```bash
 uv venv --python 3.12 .venv
-VIRTUAL_ENV=$PWD/.venv uv pip install -e . pytest
+source .venv/bin/activate
+uv pip install -e . pytest
 ```
+
+Everything below runs in that activated environment; `.venv/bin/<command>` works too, for
+a one-off without activating.
 
 `pixel-patrol-base` comes from git, pinned to a commit in this package's own
 `dependencies`: folder discovery for suffix-less directories, which the loader needs to
@@ -132,7 +136,7 @@ same commit and one npm build:
 git clone https://github.com/ida-mdc/pixel-patrol.git
 git -C pixel-patrol checkout "$(grep -oE '[0-9a-f]{40}' pyproject.toml)"
 (cd pixel-patrol/viewer && npm ci && npm run build)
-VIRTUAL_ENV=$PWD/.venv uv pip install -e pixel-patrol/packages/pixel-patrol-base
+uv pip install -e pixel-patrol/packages/pixel-patrol-base
 ```
 
 ## Run
@@ -413,7 +417,7 @@ contacts are a processor, so they are on by default and skipped with `--no-conta
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest
+pytest
 ```
 
 `tests/synthetic.py` builds a small grouped batch of synthetic objects (membrane,
@@ -421,5 +425,5 @@ nucleus, mitochondria) with voxel size in the TIFF metadata; it is also runnable
 script to produce a dataset to try the CLI on:
 
 ```bash
-.venv/bin/python tests/synthetic.py /tmp/objects
+python tests/synthetic.py /tmp/objects
 ```
