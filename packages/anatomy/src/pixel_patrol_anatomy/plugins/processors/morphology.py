@@ -23,7 +23,8 @@ from pixel_patrol_base.core.record import Record
 from pixel_patrol_base.core.specs import RecordSpec
 
 from pixel_patrol_anatomy.distances import polarity_from_offset
-from pixel_patrol_anatomy.geometry import region_metrics, size_key, total_size_key
+from pixel_patrol_anatomy.geometry import size_key, total_size_key
+from pixel_patrol_anatomy.skeletons import region_metrics_for
 from pixel_patrol_anatomy.plugins.loaders.object_loader import OBJECT_KIND
 from pixel_patrol_anatomy.spatial import (
     object_center,
@@ -198,7 +199,8 @@ class MorphologyProcessor:
             row["file_size_bytes"] = int(sizes[c_index])
         if entity_kind == "mask":
             binary = volume > 0
-            metrics = region_metrics(binary, sample_size)
+            metrics = region_metrics_for(
+                str(meta.get("object_id") or "object"), entity_name, volume, sample_size)
             centroid = _foreground_centroid(binary)
             # instance_count stays null: a mask is one structure, not one instance, which
             # keeps the object-row sum a count of label instances.

@@ -136,6 +136,25 @@ def label_metrics_for(object_id: str, entity: str, labels: np.ndarray,
     )
 
 
+def region_metrics_for(object_id: str, entity: str, volume: np.ndarray,
+                       sample_size: Sequence[float]) -> Dict[str, float]:
+    """Shape statistics for a whole-structure mask, once per object and entity.
+
+    The same two readers the label entities have, and for a mask this is the single most
+    expensive measurement in the object: the object mask is the largest structure there is.
+
+    Keyed on the volume, not on the boolean derived from it. ``volume > 0`` is a fresh array
+    every call, which would not merely miss - the cache would take it for a different object
+    and evict everything already stored for this one.
+    """
+    from pixel_patrol_anatomy.geometry import region_metrics
+
+    return CACHE.get_or_compute(
+        object_id, ("region_metrics", normalize_name(entity)), volume,
+        lambda: region_metrics(volume > 0, sample_size),
+    )
+
+
 def regions_for(object_id: str, entity: str, labels: np.ndarray):
     """``regionprops`` for an entity, once per object.
 

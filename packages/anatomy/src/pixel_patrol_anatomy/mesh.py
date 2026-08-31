@@ -30,7 +30,6 @@ from skimage.measure import marching_cubes
 from pixel_patrol_anatomy.geometry import (
     METRICS_2D,
     METRICS_3D,
-    region_metrics,
 )
 from pixel_patrol_anatomy.distances import object_center_um, polarity_from_offset
 from pixel_patrol_anatomy.geometry import skeleton_graph_metrics
@@ -38,6 +37,7 @@ from pixel_patrol_anatomy.skeletons import (
     EntityFilter,
     contacts_for,
     label_metrics_for,
+    region_metrics_for,
     regions_for,
     skeletons_for,
     wants_skeletons,
@@ -455,7 +455,7 @@ def _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
                 continue
             # Not `metrics`: that parameter holds the per-instance values to carry, and
             # rebinding it here left every label row without them.
-            shape = region_metrics(binary, sample_size)
+            shape = region_metrics_for(object_id, name, volume, sample_size)
             extent = _bbox_extent(binary)
             roundness = shape.get("sphericity", shape.get("circularity", float("nan")))
             rows.append({
