@@ -1,0 +1,73 @@
+[project]
+name = "pixel-patrol-anatomy"
+version = "0.1.0"
+description = "Anatomy — the spatial anatomy of segmented objects, as a PixelPatrol flavour"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Helmholtz Imaging Engineering & Support Unit MDC" },
+]
+
+dependencies = [
+    # Folder discovery for suffix-less directories, which the loader here needs to claim
+    # an object folder as one record, is in no release: PyPI stops at 0.8.0. Pinned to a
+    # commit rather than a branch, so an install is reproducible and cannot change under
+    # a reader. This is the only place the commit appears; the workflows and the READMEs
+    # read it from here. Swap for a version once that work has landed.
+    "pixel-patrol-base @ git+https://github.com/ida-mdc/pixel-patrol.git@59a40e06aec04d6a6a296e0495b3e140a0d00c89#subdirectory=packages/pixel-patrol-base",
+    "numpy>=2.0.0",
+    "polars>=1.0.0",
+    "scipy>=1.13.0",
+    "scikit-image>=0.23.0",
+    # The measuring itself: ITK's LabelShapeStatisticsImageFilter, spacing aware and correct
+    # about boundaries, where counting voxel faces reads ~1.5x high in 3D.
+    "SimpleITK>=2.3",
+    "tifffile>=2024.5.0",
+    "imagecodecs",
+    "edt>=2.4.0",
+    "fast-simplification>=0.1.6",
+    "kimimaro>=4.0.0",
+    "crackle-codec",
+    "posix-ipc",
+    "psutil",
+]
+
+[project.scripts]
+pixel-patrol-anatomy = "pixel_patrol_anatomy.cli:cli"
+
+# Not for running: `process` has its own pipeline. These let PixelPatrol's schema catalogue
+# read this package's column descriptions, which is what makes the report self-describing.
+[project.entry-points."pixel_patrol.loader_plugins"]
+anatomy_loaders = "pixel_patrol_anatomy.plugin_registry:register_loader_plugins"
+
+[project.entry-points."pixel_patrol.processor_plugins"]
+anatomy_processors = "pixel_patrol_anatomy.plugin_registry:register_processor_plugins"
+
+[project.entry-points."pixel_patrol.viewer_extensions"]
+anatomy_viewer = "pixel_patrol_anatomy.viewer_extensions:get_viewer_extension_dir"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+# The pixel-patrol-base dependency is a git URL, which hatchling refuses to put in a
+# wheel's metadata unless asked: a direct reference cannot be resolved from an index, so
+# a package carrying one is not publishable to PyPI. This one is not going there while it
+# depends on an unreleased base, and the reference goes away with the pin.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pixel_patrol_anatomy"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

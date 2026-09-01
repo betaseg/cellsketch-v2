@@ -1,12 +1,15 @@
 name: Deploy viewers to GitHub Pages
 
+# Two viewers share the site. The standalone one keeps the URLs it was published
+# under (/, /stats_viewer.html, /mesh_viewer.html) so existing links keep working;
+# the PixelPatrol-based one, which replaced it, is published beside it.
+
 on:
   push:
     branches: [main]
     paths:
-      - index.html
-      - stats_viewer.html
-      - mesh_viewer.html
+      - 'packages/anatomy/**'
+      - '.github/workflows/deploy-pages.yml'
   workflow_dispatch:
 
 permissions:
@@ -18,22 +21,98 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+env:
+  # The last commit that changed the standalone viewer, before the package
+  # replaced it. Those three files are frozen, so the site takes them straight
+  # out of history rather than keeping a copy in the tree.
+  STANDALONE_VIEWER_REF: 42c08030eca7b771844345c517d1e2cc904f4660
+
 jobs:
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Prepare site
+        with:
+          fetch-depth: 0   # history back to STANDALONE_VIEWER_REF
+
+      # The viewer has to be built from source, so pixel-patrol is checked out at the
+      # very commit packages/anatomy/pyproject.toml pins its dependency to. Read from
+      # there rather than repeated here, so the pin has one home and the deploy cannot
+      # drift from what the tests ran against.
+      - id: pin
+        name: Read the pinned pixel-patrol commit
         run: |
-          mkdir _site
-          cp index.html _site/index.html
-          cp stats_viewer.html _site/stats_viewer.html
-          cp mesh_viewer.html _site/mesh_viewer.html
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re, tomllib
+          deps = tomllib.load(open("packages/anatomy/pyproject.toml", "rb"))["project"]["dependencies"]
+          url = next(d for d in deps if d.startswith("pixel-patrol-base"))
+          print("sha=" + re.search(r"@([0-9a-f]{40})#", url).group(1))
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ida-mdc/pixel-patrol
+          ref: ${{ steps.pin.outputs.sha }}
+          path: pixel-patrol
+
+      # The viewer bundle is a build product and is not committed, so installing
+      # pixel-patrol-base straight from git would carry no viewer at all. Vite syncs
+      # its output into the package's viewer_dist/, which is what the install below
+      # then picks up and what build-viewer-html reads.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: pixel-patrol/viewer/package-lock.json
+
+      - name: Build the viewer bundle
+        working-directory: pixel-patrol/viewer
+        run: |
+          npm ci
+          npm run build
+
+      - uses: astral-sh/setup-uv@v5
+
+      # Installing the anatomy package is what puts its widgets in the viewer:
+      # the pixel_patrol.viewer_extensions entry point is how build-viewer-html
+      # discovers the extension directory and inlines its plugins.
+      #
+      # Base is installed second, on purpose. The first install pulls it from the
+      # pinned git URL, which carries no viewer; the checkout above is the same
+      # commit but with viewer_dist/ built into it, so it has to land last to win.
+      - name: Install
+        run: |
+          uv venv --python 3.12 .venv
+          VIRTUAL_ENV=$PWD/.venv uv pip install -e packages/anatomy
+          VIRTUAL_ENV=$PWD/.venv uv pip install -e pixel-patrol/packages/pixel-patrol-base
+
+      # One self-contained page: the app bundle and every installed extension are
+      # inlined, DuckDB WASM comes from a CDN. Open it with ?data=<url of a report>.
+      - name: Build the Anatomy viewer
+        run: |
+          mkdir -p _site
+          .venv/bin/pixel-patrol build-viewer-html -o _site/pixelpatrol-anatomy.html
+
+      - name: Add the standalone viewer at its original URLs
+        run: |
+          git show "$STANDALONE_VIEWER_REF:index.html"        > _site/index.html
+          git show "$STANDALONE_VIEWER_REF:stats_viewer.html" > _site/stats_viewer.html
+          git show "$STANDALONE_VIEWER_REF:mesh_viewer.html"  > _site/mesh_viewer.html
+
+      - name: Show what will be published
+        run: ls -lh _site
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v4

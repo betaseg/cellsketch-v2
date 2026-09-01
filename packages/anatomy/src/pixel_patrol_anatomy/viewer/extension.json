@@ -1,0 +1,8 @@
+{
+  "name": "Anatomy",
+  "plugins": [
+    "./plugin_anatomy_objects.js",
+    "./plugin_anatomy.js",
+    "./plugin_anatomy_3d.js"
+  ]
+}

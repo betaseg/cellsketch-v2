@@ -1,21 +1,22 @@
 """
-csv_to_blender.py — Import an AlphaCells report.csv into a Blender scene.
+geometry_to_blender.py — Import a Anatomy geometry.parquet into a Blender scene.
 
-Script editor: set CSV_PATH below, then run with Alt+P.
+Script editor: set GEOMETRY_PATH below, then run with Alt+P.
 
 CLI (headless):
-    blender --background --python csv_to_blender.py -- /path/to/report.csv [out.blend]
+    blender --background --python geometry_to_blender.py -- <cell>/geometry.parquet [out.blend]
 
-Mesh encoding (from analyze_cell.py):
-  gzip( [uint32 nV][uint32 nF]
-        [float32×3 min_xyz][float32×3 scale_xyz]
-        [uint16 × nV×3  quantised XYZ vertices (µm)]
-        [uint32 × nF×3  face indices] )
+Reading parquet needs pandas and pyarrow inside Blender's own Python:
+    <blender>/python/bin/python3 -m pip install pandas pyarrow
+
+Mesh encoding (from anatomy, stored as a BLOB — parquet does the compressing):
+  [uint32 nV][uint32 nF]
+  [float32×3 min_xyz][float32×3 scale_xyz]
+  [uint16 × nV×3  quantised XYZ vertices (µm)]
+  [uint32 × nF×3  face indices]
 Vertices are in µm, XYZ order (Three.js convention).
 """
 
-import base64
-import gzip
 import struct
 import sys
 
@@ -26,7 +27,7 @@ import numpy as np
 # CONFIG — edit these when running from the script editor
 # ---------------------------------------------------------------------------
 
-CSV_PATH      = "/path/to/report.csv"
+GEOMETRY_PATH = "/path/to/geometry.parquet"
 OUT_BLEND     = ""   # leave empty to skip saving
 OUT_RENDER    = ""   # leave empty to skip rendering
 CELLS         = []   # e.g. ["high_c1", "high_c2"] — empty = all
@@ -58,14 +59,11 @@ _PALETTE = [
 # Mesh decoding
 # ---------------------------------------------------------------------------
 
-def decode_mesh_b64(mesh_b64: str):
+def decode_mesh(payload):
     """Return (verts float32 (N,3), faces uint32 (M,3)) or (None, None)."""
-    if not mesh_b64 or not isinstance(mesh_b64, str) or not mesh_b64.strip():
+    if payload is None or len(payload) < 32:
         return None, None
-    try:
-        raw = gzip.decompress(base64.b64decode(mesh_b64))
-    except Exception:
-        return None, None
+    raw = bytes(payload)
 
     nV, nF = struct.unpack_from("<II", raw, 0)
     if nV == 0 or nF == 0:
@@ -126,7 +124,7 @@ def add_mesh_object(name: str, all_verts: np.ndarray, all_faces: np.ndarray, col
 
 
 def merge_meshes(rows_iter):
-    """Decode and concatenate meshes from an iterable of CSV rows.
+    """Decode and concatenate meshes from an iterable of geometry rows.
 
     Returns (verts, faces) as combined numpy arrays, or (None, None) if
     nothing decoded successfully.
@@ -135,7 +133,7 @@ def merge_meshes(rows_iter):
     all_faces = []
     vert_offset = 0
     for _, row in rows_iter:
-        verts, faces = decode_mesh_b64(str(row["mesh_b64"]))
+        verts, faces = decode_mesh(row["mesh"])
         if verts is None:
             continue
         all_verts.append(verts)
@@ -206,42 +204,46 @@ def frame_camera():
 # ---------------------------------------------------------------------------
 
 def resolve_config():
-    """Return (csv_path, out_blend, out_render) from CLI args or CONFIG vars."""
+    """Return (geometry_path, out_blend, out_render) from CLI args or CONFIG vars."""
     args = sys.argv
     if "--" in args:
         args = args[args.index("--") + 1:]
-        csv_path  = args[0] if len(args) > 0 else CSV_PATH
+        geometry_path = args[0] if len(args) > 0 else GEOMETRY_PATH
         out_blend = args[1] if len(args) > 1 else OUT_BLEND
         out_render = args[2] if len(args) > 2 else OUT_RENDER
     else:
-        csv_path   = CSV_PATH
+        geometry_path = GEOMETRY_PATH
         out_blend  = OUT_BLEND
         out_render = OUT_RENDER
-    return csv_path, out_blend or None, out_render or None
+    return geometry_path, out_blend or None, out_render or None
 
 
 def main():
     import pandas as pd
 
-    csv_path, out_blend, out_render = resolve_config()
+    geometry_path, out_blend, out_render = resolve_config()
 
-    print(f"[csv_to_blender] Reading {csv_path}")
-    df = pd.read_csv(csv_path, low_memory=False)
+    print(f"[geometry_to_blender] Reading {geometry_path}")
+    # Only the columns this needs: the metrics beside them are for the viewer, and the
+    # skeleton overlay has no Blender equivalent.
+    df = pd.read_parquet(
+        geometry_path, columns=["object_id", "entity_name", "row_type", "mesh"]
+    )
 
     if CELLS:
-        df = df[df["cell_id"].astype(str).isin(set(CELLS))]
+        df = df[df["object_id"].astype(str).isin(set(CELLS))]
     if ENTITIES:
         df = df[df["entity_name"].isin(set(ENTITIES))]
     if EXCL_ENTITIES:
         df = df[~df["entity_name"].isin(set(EXCL_ENTITIES))]
 
-    if "mesh_b64" not in df.columns:
-        raise RuntimeError("CSV has no 'mesh_b64' column — re-run analyze_cell.py with --with-mesh")
-
-    df = df[df["mesh_b64"].notna() & (df["mesh_b64"].astype(str).str.strip() != "")]
-    print(f"[csv_to_blender] {len(df)} rows with meshes after filtering")
+    df = df[df["mesh"].notna()]
+    print(f"[geometry_to_blender] {len(df)} rows with meshes after filtering")
     if df.empty:
-        print("[csv_to_blender] Nothing to import.")
+        # A 2D object has outlines rather than meshes: there is no surface to import, and
+        # a flat polygon in Blender would be a worse view of it than the viewer's own.
+        print("[geometry_to_blender] Nothing to import. (2D objects carry outlines, not "
+              "meshes — look at those in the viewer's gallery instead.)")
         return
 
     setup_scene()
@@ -261,15 +263,15 @@ def main():
     root_col = get_or_create_collection("AlphaCells")
     imported = skipped = 0
 
-    for cell_id, cell_df in df.groupby("cell_id"):
-        cell_col = get_or_create_collection(str(cell_id), parent=root_col)
+    for object_id, cell_df in df.groupby("object_id"):
+        cell_col = get_or_create_collection(str(object_id), parent=root_col)
 
         for entity_name, ent_df in cell_df.groupby("entity_name"):
             if IMPORT_MASKS:
                 mask_rows = ent_df[ent_df["row_type"] == "file"]
                 verts, faces = merge_meshes(mask_rows.iterrows())
                 if verts is not None:
-                    add_mesh_object(f"{cell_id}_{entity_name}_mask", verts, faces,
+                    add_mesh_object(f"{object_id}_{entity_name}_mask", verts, faces,
                                     cell_col, get_mat(entity_name, is_mask=True))
                     imported += 1
                 elif not mask_rows.empty:
@@ -279,23 +281,27 @@ def main():
                 inst_rows = ent_df[ent_df["row_type"] == "instance"]
                 verts, faces = merge_meshes(inst_rows.iterrows())
                 if verts is not None:
-                    add_mesh_object(f"{cell_id}_{entity_name}_labels", verts, faces,
+                    add_mesh_object(f"{object_id}_{entity_name}_labels", verts, faces,
                                     cell_col, get_mat(entity_name, is_mask=False))
                     imported += 1
                 elif not inst_rows.empty:
                     skipped += 1
 
-    print(f"[csv_to_blender] Imported {imported} objects, skipped {skipped} empty")
+    print(f"[geometry_to_blender] Imported {imported} objects, skipped {skipped} empty")
 
     frame_camera()
 
     if out_blend:
         bpy.ops.wm.save_as_mainfile(filepath=out_blend)
-        print(f"[csv_to_blender] Saved → {out_blend}")
+        print(f"[geometry_to_blender] Saved → {out_blend}")
     if out_render:
         bpy.context.scene.render.filepath = out_render
         bpy.ops.render.render(write_still=True)
-        print(f"[csv_to_blender] Rendered → {out_render}")
+        print(f"[geometry_to_blender] Rendered → {out_render}")
 
 
-main()
+# Blender runs a script as __main__, both headless (--python) and from the Script
+# Editor, so the guard changes nothing there - it only lets the decoder above be
+# imported and tested outside Blender.
+if __name__ == "__main__":
+    main()
