@@ -34,7 +34,11 @@ FLAVOR = "object anatomy"
 
 # Peak resident memory per worker, as a multiple of (stack + one distance transform).
 # Calibrated on a 133-megavoxel five-entity object: predicted 4.7 GB, measured 4.4 GB.
-_PEAK_OVERHEAD = 2.5
+# Measured, not guessed: on a 565-megavoxel seven-entity object the worker the OOM killer
+# took was resident at 32.2 GB, where 2.5 had projected 23.7 GB. 3.5 covers that with a
+# little margin. Being wrong is no longer fatal - a killed worker is retried at lower
+# concurrency rather than losing the batch - but it still costs the time already spent.
+_PEAK_OVERHEAD = 3.5
 
 
 def find_object_dirs(root: Path) -> list[Path]:

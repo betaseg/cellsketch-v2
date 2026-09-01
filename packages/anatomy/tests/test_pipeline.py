@@ -4,8 +4,12 @@ This is the phase-1 validation — it asserts the row layout the whole design re
 one row per object at obs_level 0, one row per entity at obs_level 1 keyed by dim_c.
 """
 
+from pathlib import Path
+
 import polars as pl
 import pytest
+
+from pixel_patrol_anatomy import pipeline
 
 from conftest import MITO_COLOUR
 
@@ -173,3 +177,51 @@ def test_voxel_size_lands_in_the_standard_pixel_size_columns(table):
     assert objects["pixel_size_Z"].to_list() == pytest.approx([0.1] * 4)
     assert objects["pixel_size_X"].to_list() == pytest.approx([0.02] * 4)
     assert objects["voxel_size_source"].unique().to_list() == ["tiff-metadata"]
+
+
+# ── surviving a worker that is killed rather than raising ────────────────────
+#
+# The OOM killer sends SIGKILL, so the worker reports nothing and the pool breaks. What must
+# not happen is what did happen on a real 7-object run: every finished object thrown away
+# because one of them died after two hours.
+
+def _fake_dispatch(killed_by_worker_count):
+    """A dispatch that kills the object named 'bad' unless few enough workers are running."""
+    def dispatch(work, excluded, n_workers):
+        finished, unrun = [], []
+        for folder, group in work:
+            if folder.name == "bad" and n_workers >= killed_by_worker_count:
+                unrun.append((folder, group))
+            else:
+                finished.append(pipeline.ObjectResult(folder.name, object_row={"n": folder.name}))
+        return finished, unrun
+    return dispatch
+
+
+def _work(*names):
+    return [(Path(f"/nowhere/{n}"), "") for n in names]
+
+
+def test_a_killed_worker_does_not_lose_the_objects_that_finished():
+    results = pipeline._measure_all(_work("a", "bad", "b"), (), 4,
+                                    dispatch=_fake_dispatch(killed_by_worker_count=2))
+    measured = {r.object_id for r in results if r.error is None}
+    assert {"a", "b"} <= measured, "objects that finished were thrown away"
+
+
+def test_the_killed_object_is_retried_at_lower_concurrency():
+    # 'bad' survives once the pool is down to a single worker, which is the usual cause:
+    # too many large objects resident at once.
+    results = pipeline._measure_all(_work("a", "bad", "b"), (), 4,
+                                    dispatch=_fake_dispatch(killed_by_worker_count=2))
+    assert {r.object_id for r in results} == {"a", "bad", "b"}
+    assert all(r.error is None for r in results)
+
+
+def test_an_object_that_always_kills_its_worker_is_reported_not_retried_forever():
+    results = pipeline._measure_all(_work("a", "bad", "b"), (), 4,
+                                    dispatch=_fake_dispatch(killed_by_worker_count=1))
+    by_id = {r.object_id: r for r in results}
+    assert set(by_id) == {"a", "bad", "b"}
+    assert by_id["bad"].error and "out of memory" in by_id["bad"].error
+    assert by_id["a"].error is None and by_id["b"].error is None

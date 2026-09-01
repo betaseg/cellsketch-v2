@@ -18,6 +18,7 @@ import os
 import time
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -196,6 +197,82 @@ def worker_count(requested: Optional[int], n_objects: int, peak_gb: float) -> in
     return max(1, min(fit, n_objects, os.cpu_count() or 1))
 
 
+def _dispatch(work: Sequence[Tuple[Path, str]], excluded: Sequence[str],
+              n_workers: int) -> Tuple[List[ObjectResult], List[Tuple[Path, str]]]:
+    """Measure objects in a pool. Returns what finished, and what the pool never got to.
+
+    A worker killed from outside cannot report anything and takes the pool with it. That is
+    not hypothetical here: a batch of multi-gigabyte objects meets the OOM killer, which
+    sends SIGKILL, so `analyse_object`'s own error handling never runs. `pool.map` raises at
+    that point and loses *every* result, including objects that finished hours before.
+
+    So futures are collected one at a time and whatever the broken pool never ran is handed
+    back for the caller to retry. Submission order, not completion order, so a retry at
+    lower concurrency meets the objects in the same sequence.
+    """
+    # spawn, not fork: the parent holds native threads (polars, DuckDB, BLAS) and a forked
+    # child can deadlock on their locks. Workers inherit the environment, which is how they
+    # get the analysis options.
+    context = multiprocessing.get_context("spawn")
+    finished: List[ObjectResult] = []
+    unrun: List[Tuple[Path, str]] = []
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=context) as pool:
+        futures = {pool.submit(analyse_object, folder, group, tuple(excluded)): (folder, group)
+                   for folder, group in work}
+        for future, (folder, _group) in futures.items():
+            try:
+                finished.append(future.result())
+            except BrokenProcessPool:
+                unrun.append((folder, _group))
+            except Exception as exc:  # noqa: BLE001 - one bad object must not stop the batch
+                logger.error("anatomy: %s failed: %s: %s", folder.name, type(exc).__name__, exc)
+                finished.append(ObjectResult(folder.name, error=f"{type(exc).__name__}: {exc}"))
+    return finished, unrun
+
+
+def _measure_all(work: List[Tuple[Path, str]], excluded: Sequence[str],
+                 n_workers: int, dispatch=None) -> List[ObjectResult]:
+    """Measure every object, surviving a worker that is killed rather than raising.
+
+    On a broken pool the concurrency is halved and the objects that never ran are retried,
+    which is usually the right answer: the pool broke because several large objects were
+    resident at once, and fewer of them fit. An object that still kills a lone worker is
+    recorded as a failure so the rest of the batch can finish without it.
+    """
+    dispatch = dispatch or _dispatch
+    results: List[ObjectResult] = []
+    if len(work) == 1 and n_workers == 1:
+        folder, group = work[0]
+        return [analyse_object(folder, group, excluded)]
+
+    while work:
+        finished, unrun = dispatch(work, excluded, n_workers)
+        results.extend(finished)
+        if not unrun:
+            break
+        if n_workers > 1:
+            n_workers = max(1, n_workers // 2)
+            logger.warning(
+                "anatomy: a worker was killed (out of memory?); %d object(s) did not run, "
+                "retrying them with %d worker(s)", len(unrun), n_workers)
+            work = unrun
+        elif finished:
+            # A pool of one still made progress, so keep going with what is left.
+            logger.warning("anatomy: a worker was killed; retrying the remaining %d object(s)",
+                           len(unrun))
+            work = unrun
+        else:
+            # Nothing finished this round on a single worker, so the first object is the one
+            # that kills it. Name it and carry on without it.
+            folder, _group = unrun[0]
+            logger.error("anatomy: %s killed its worker (out of memory?); skipping it",
+                         folder.name)
+            results.append(ObjectResult(
+                folder.name, error="worker killed, most likely out of memory"))
+            work = unrun[1:]
+    return results
+
+
 def analyse(
     folders: Sequence[Path],
     root: Path,
@@ -217,16 +294,7 @@ def analyse(
     logger.info("anatomy: %d object(s), %d worker(s), %s mesh process(es) each",
                 len(folders), n_workers, os.environ["PP_ANATOMY_MESH_WORKERS"])
 
-    if n_workers == 1:
-        results = [analyse_object(f, g, excluded) for f, g in zip(folders, groups)]
-    else:
-        # spawn, not fork: the parent holds native threads (polars, DuckDB, BLAS) and a
-        # forked child can deadlock on their locks. Workers inherit the environment, which
-        # is how they get the analysis options.
-        context = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=n_workers, mp_context=context) as pool:
-            results = list(pool.map(analyse_object, folders, groups,
-                                    [tuple(excluded)] * len(folders)))
+    results = _measure_all(list(zip(folders, groups)), excluded, n_workers)
 
     rows: List[Dict[str, Any]] = []
     failures: Dict[str, str] = {}
