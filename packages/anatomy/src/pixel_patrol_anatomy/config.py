@@ -160,6 +160,9 @@ class AnatomyConfig:
     # Processes to mesh instances with. 0 = the share of the cores the batch is not already
     # using for objects, which `analyse` works out and passes down.
     mesh_workers: int = 0
+    # Keep an object's geometry.parquet if it already has one, rather than meshing it again.
+    # Meshing dominates a run, so a batch that died partway is worth minutes rather than hours.
+    reuse_geometry: bool = False
 
     @classmethod
     def from_env(cls) -> "AnatomyConfig":
@@ -188,4 +191,5 @@ class AnatomyConfig:
                 if os.environ.get("PP_ANATOMY_MESH_LEVEL") else None
             ),
             mesh_workers=_env_int("PP_ANATOMY_MESH_WORKERS", 0),
+            reuse_geometry=_env_flag("PP_ANATOMY_REUSE_GEOMETRY"),
         )

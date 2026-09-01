@@ -85,6 +85,9 @@ Useful flags, see `pixel-patrol-anatomy process --help` for the rest:
 - `--mesh-workers N`: processes meshing one object's instances. The default divides the
   machine between the two levels of parallelism, so objects and instances do not each
   claim every core
+- `--reuse-geometry`: keep the `geometry.parquet` an object already has rather than meshing
+  it again. Meshing is most of a long run, so this is how a batch that died partway is
+  finished in minutes. A file that is missing, empty or truncated is written again
 
 ## Checking your input first (`dry-run`)
 

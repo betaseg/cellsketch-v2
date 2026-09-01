@@ -111,11 +111,13 @@ def _apply_mesh_env(
     level: float | None,
     mesh_format: str | None = None,
     mesh_workers: int | None = None,
+    reuse_geometry: bool = False,
 ) -> None:
     settings = {
         "PP_ANATOMY_MESH_DIR": mesh_dir,
         "PP_ANATOMY_MESH_FORMAT": mesh_format,
         "PP_ANATOMY_MESH_WORKERS": mesh_workers,
+        "PP_ANATOMY_REUSE_GEOMETRY": 1 if reuse_geometry else None,
         "PP_ANATOMY_MESH_SMOOTH_SIGMA": smooth_sigma,
         "PP_ANATOMY_MESH_STEP_SIZE": step_size,
         "PP_ANATOMY_MESH_TARGET_REDUCTION": target_reduction,
@@ -140,6 +142,10 @@ def _mesh_flags(fn):
         click.option("--mesh-workers", type=int, default=None, metavar="N",
                      help="Processes meshing instances of one object (default: the cores "
                           "the object pool is not using)."),
+        click.option("--reuse-geometry", is_flag=True,
+                     help="Keep any geometry.parquet an object already has instead of "
+                          "meshing it again. Meshing dominates a run, so this is how a "
+                          "batch that died partway is finished in minutes."),
     ]):
         fn = option(fn)
     return fn
@@ -270,7 +276,7 @@ def process(
     max_workers: int | None, with_mesh: bool,
     mesh_dir: Path | None, mesh_smooth_sigma: float | None, mesh_step_size: int | None,
     mesh_target_reduction: float | None, mesh_level: float | None,
-    mesh_workers: int | None,
+    mesh_workers: int | None, reuse_geometry: bool,
 ) -> None:
     """Analyse every object folder under OBJECT_DIR and write one report."""
     objects = find_object_dirs(object_dir)
@@ -287,7 +293,8 @@ def process(
 
     meshes_to = (mesh_dir or output.with_name(output.stem + "_meshes")) if with_mesh else None
     _apply_mesh_env(meshes_to, mesh_smooth_sigma, mesh_step_size, mesh_target_reduction,
-                    mesh_level, mesh_workers=mesh_workers)
+                    mesh_level, mesh_workers=mesh_workers,
+                    reuse_geometry=reuse_geometry)
 
     excluded = {"anatomy-contacts"} if no_contacts else set()
     if not with_mesh:
@@ -412,7 +419,7 @@ def mesh(
     no_contacts: bool,
     mesh_smooth_sigma: float | None, mesh_step_size: int | None,
     mesh_target_reduction: float | None, mesh_level: float | None,
-    mesh_workers: int | None,
+    mesh_workers: int | None, reuse_geometry: bool,
 ) -> None:
     """Write per-object geometry for the 3D widgets and the Blender export.
 
@@ -432,7 +439,8 @@ def mesh(
     _apply_analysis_env(object_mask, voxel_size_um, auto_clip, False, contact_max_um,
                         None, None, skeleton_entities=skeleton_entities)
     _apply_mesh_env(None, mesh_smooth_sigma, mesh_step_size, mesh_target_reduction,
-                    mesh_level, mesh_workers=mesh_workers)
+                    mesh_level, mesh_workers=mesh_workers,
+                    reuse_geometry=reuse_geometry)
     options = mesh_options(with_skeletons=not no_skeletons,
                            **({"contact_max_um": None} if no_contacts else {}))
 

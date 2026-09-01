@@ -81,3 +81,40 @@ def test_a_row_with_no_geometry_imports_nothing(blender_script):
     assert blender_script.decode_mesh(None) == (None, None)
     assert blender_script.decode_mesh(b"") == (None, None)
     assert blender_script.decode_mesh(b"\x00" * 8) == (None, None)
+
+
+# ── --reuse-geometry ─────────────────────────────────────────────────────────
+#
+# Meshing dominates a run, so a batch that died partway is worth finishing in minutes. The
+# hazard is reusing a file the killed run left half-written, which would lose an object's
+# geometry with no error raised anywhere.
+
+from pixel_patrol_anatomy.plugins.processors.mesh import _usable_geometry
+
+
+def test_missing_geometry_is_written_again(tmp_path):
+    assert _usable_geometry(tmp_path / "nothing-here.parquet") is None
+
+
+def test_complete_geometry_is_reused(tmp_path):
+    import polars as pl
+    path = tmp_path / "geometry.parquet"
+    pl.DataFrame({"object_id": ["a", "b"], "mesh": [b"x", b"y"]}).write_parquet(path)
+    assert _usable_geometry(path) == 2
+
+
+def test_geometry_with_no_rows_is_written_again(tmp_path):
+    import polars as pl
+    path = tmp_path / "geometry.parquet"
+    pl.DataFrame({"object_id": [], "mesh": []}).write_parquet(path)
+    assert _usable_geometry(path) is None
+
+
+def test_a_truncated_file_is_written_again_rather_than_reused(tmp_path):
+    # What a killed run actually leaves behind.
+    import polars as pl
+    path = tmp_path / "geometry.parquet"
+    pl.DataFrame({"object_id": ["a"], "mesh": [b"x"]}).write_parquet(path)
+    whole = path.read_bytes()
+    path.write_bytes(whole[: len(whole) // 2])
+    assert _usable_geometry(path) is None

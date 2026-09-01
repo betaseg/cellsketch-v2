@@ -256,7 +256,11 @@ The object row carries `mesh_geometry_file`, the path this was written to; it is
 thing the mesh processor adds to the table, and it is how a widget finds the geometry.
 
 Meshing is the most expensive thing here (it skeletonises again for the gallery), which
-is why it is opt-in rather than part of every run.
+is why it is opt-in rather than part of every run. It is also why `--reuse-geometry` exists:
+it keeps the `geometry.parquet` an object already has instead of writing it again, so a batch
+interrupted partway is finished in minutes rather than hours. A file that is missing, empty or
+truncated is written again rather than trusted - a run killed mid-write is exactly the case
+the flag is for.
 
 ## Viewer widgets
 
@@ -418,6 +422,7 @@ same name:
 | `PP_ANATOMY_MESH_TARGET_REDUCTION` | `0.8` | `--mesh-target-reduction` |
 | `PP_ANATOMY_MESH_LEVEL` | `0` | `--mesh-level` |
 | `PP_ANATOMY_MESH_WORKERS` | the cores the object pool is not using | `--mesh-workers` |
+| `PP_ANATOMY_REUSE_GEOMETRY` | `0` | `--reuse-geometry` |
 
 `pixel-patrol-anatomy process` sets these from its own flags, so you only need the
 variables when driving `pixel-patrol` directly. `--with-contacts` has no equivalent:

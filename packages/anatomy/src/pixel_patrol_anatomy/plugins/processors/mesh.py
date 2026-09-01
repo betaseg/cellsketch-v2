@@ -28,13 +28,41 @@ from pixel_patrol_base.core.specs import RecordSpec
 import numpy as np
 
 from pixel_patrol_anatomy.config import AnatomyConfig
-from pixel_patrol_anatomy.mesh import MeshOptions, mesh_rows_for_object, write_geometry
+from pixel_patrol_anatomy.mesh import (
+    GEOMETRY_FILENAME,
+    MeshOptions,
+    mesh_rows_for_object,
+    write_geometry,
+)
 from pixel_patrol_anatomy.plugins.loaders.object_loader import OBJECT_KIND
 from pixel_patrol_anatomy.spatial import voxel_size
 from pixel_patrol_anatomy.plugins.processors.instances import channel_view
 from pixel_patrol_anatomy.skeletons import CACHE
 
 logger = logging.getLogger(__name__)
+
+
+def _usable_geometry(path: Path) -> Optional[int]:
+    """How many rows an existing geometry file has, or None if it should be written again.
+
+    Checked rather than assumed. A run killed mid-write - which is exactly the situation
+    --reuse-geometry exists for - can leave a file that opens and holds nothing, and reusing
+    that would lose an object's geometry with no error raised anywhere.
+    """
+    if not path.is_file():
+        return None
+    try:
+        import pyarrow.parquet as pq
+
+        rows = int(pq.read_metadata(path).num_rows)
+    except Exception as exc:  # noqa: BLE001 - unreadable is a reason to rewrite, not to stop
+        logger.warning("anatomy: %s is not readable geometry (%s); writing it again",
+                       path, type(exc).__name__)
+        return None
+    if rows == 0:
+        logger.warning("anatomy: %s holds no rows; writing it again", path)
+        return None
+    return rows
 
 
 class MeshProcessor:
@@ -84,6 +112,13 @@ class MeshProcessor:
             )
 
         object_id = str(meta.get("object_id") or "object")
+        destination = Path(cfg.mesh_dir) / object_id / GEOMETRY_FILENAME
+        if cfg.reuse_geometry:
+            rows_already = _usable_geometry(destination)
+            if rows_already is not None:
+                logger.info("anatomy: %s: reusing %d geometry rows already at %s",
+                            object_id, rows_already, destination)
+                return {"mesh_geometry_file": str(destination.resolve())}
         # What anatomy-instances already measured, so the geometry carries the same metrics
         # without measuring them twice. Empty when that processor is off.
         metrics = CACHE.get_or_compute(object_id, ("instance_metrics",), arr, dict)
