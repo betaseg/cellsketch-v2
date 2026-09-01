@@ -94,6 +94,16 @@ jobs:
           mkdir -p _site
           .venv/bin/pixel-patrol build-viewer-html -o _site/pixelpatrol-anatomy.html
 
+      # The viewer bundle itself, so `pixel-patrol-anatomy fetch-viewer` can hand someone a
+      # working local viewer without a pixel-patrol checkout and an npm build. Serving the
+      # report locally is also the only way the 3D widgets see the geometry, which sits
+      # beside the report rather than inside it.
+      - name: Publish the viewer bundle for fetch-viewer
+        run: |
+          tar -czf _site/viewer-dist.tar.gz \
+            -C pixel-patrol/packages/pixel-patrol-base/src/pixel_patrol_base viewer_dist
+          ls -lh _site/viewer-dist.tar.gz
+
       - name: Add the standalone viewer at its original URLs
         run: |
           git show "$STANDALONE_VIEWER_REF:index.html"        > _site/index.html

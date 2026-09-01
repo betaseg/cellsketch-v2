@@ -43,9 +43,22 @@ pixel-patrol-anatomy process experiment/ -o report.parquet --object-mask pm \
     -p control -p treated --with-mesh
 ```
 
-Then open **<https://betaseg.github.io/cellsketch-v2/pixelpatrol-anatomy.html>** and choose
-`report.parquet`. That page is the PixelPatrol viewer with this package's seven widgets built
-into it; it reads the file in the browser, so nothing is uploaded and no server runs.
+Then look at it. For everything except the 3D widgets, open
+**<https://betaseg.github.io/cellsketch-v2/pixelpatrol-anatomy.html>** and choose
+`report.parquet`: that page is the PixelPatrol viewer with this package's seven widgets built
+in, and it reads the file in the browser, so nothing is uploaded and no server runs.
+
+**The 3D widgets need a local viewer.** Geometry never enters the report - it is a separate
+`geometry.parquet` per object, beside it - so a page in a browser cannot reach it, and those
+two widgets stay empty. Fetch a prebuilt viewer once and serve the report yourself:
+
+```bash
+pixel-patrol-anatomy fetch-viewer            # ~11 MB, cached under ~/.cache
+pixel-patrol-anatomy view report.parquet
+```
+
+That is still no node and no pixel-patrol checkout. The local server reads the geometry off
+disk, which is the whole reason the 3D widgets work there and not in a hosted page.
 
 `pixel-patrol-base` comes from git, pinned to a commit in this package's own dependencies,
 so the one command brings it along. Folder discovery for suffix-less directories is in no
@@ -67,8 +80,9 @@ directly instead (`.venv/bin/pixel-patrol-anatomy …`).
 ### Running the viewer locally
 
 `pixel-patrol view` serves the viewer itself, and the viewer is a JavaScript bundle that
-pixel-patrol builds rather than ships, so a plain install has none and the command says so.
-Building it is a one-off per pinned commit, not a step you repeat:
+pixel-patrol builds rather than ships, so a plain install has none. `fetch-viewer` above is
+the way to get one without node; build it from source only if you are changing the viewer
+itself. Either way it is a one-off, not a step you repeat:
 
 ```bash
 git clone https://github.com/ida-mdc/pixel-patrol.git

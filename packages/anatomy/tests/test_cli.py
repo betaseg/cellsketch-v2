@@ -233,3 +233,67 @@ def test_process_refuses_a_directory_with_no_objects(tmp_path):
     assert result.exit_code != 0
     assert "No object folders found" in result.output
     assert "dry-run" in result.output        # points at the command that explains why
+
+
+# ── fetch-viewer ─────────────────────────────────────────────────────────────
+#
+# The viewer is a JavaScript bundle pixel-patrol builds rather than ships, so a plain
+# install has none and `view` cannot serve. Fetching a prebuilt one is what keeps the
+# install to a single command - and serving locally is the only way the 3D widgets reach
+# the geometry, which sits beside the report rather than inside it.
+
+def _bundle(tmp_path, name="viewer_dist", with_index=True):
+    import tarfile
+    root = tmp_path / "src" / name
+    root.mkdir(parents=True)
+    if with_index:
+        (root / "index.html").write_text("<html>viewer</html>")
+    archive = tmp_path / "viewer-dist.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(root, arcname=name)
+    return archive
+
+
+def test_fetch_viewer_unpacks_a_bundle(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from pixel_patrol_anatomy import cli as cli_mod
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    result = CliRunner().invoke(cli_mod.cli,
+                                ["fetch-viewer", "--url", _bundle(tmp_path).as_uri()])
+    assert result.exit_code == 0, result.output
+    assert (cli_mod.viewer_cache_dir() / "index.html").is_file()
+
+
+def test_fetch_viewer_does_not_refetch_what_is_cached(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from pixel_patrol_anatomy import cli as cli_mod
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    url = _bundle(tmp_path).as_uri()
+    CliRunner().invoke(cli_mod.cli, ["fetch-viewer", "--url", url])
+    again = CliRunner().invoke(cli_mod.cli, ["fetch-viewer", "--url", url])
+    assert again.exit_code == 0
+    assert "Already have a viewer" in again.output
+
+
+def test_a_bundle_without_a_viewer_in_it_is_refused(tmp_path, monkeypatch):
+    # Rather than leaving a half viewer behind that `view` would then try to serve.
+    from click.testing import CliRunner
+    from pixel_patrol_anatomy import cli as cli_mod
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    archive = _bundle(tmp_path, name="something_else", with_index=False)
+    result = CliRunner().invoke(cli_mod.cli, ["fetch-viewer", "--url", archive.as_uri()])
+    assert result.exit_code != 0
+    assert not cli_mod.viewer_cache_dir().exists()
+
+
+def test_view_without_any_viewer_explains_both_ways_out(tmp_path, monkeypatch):
+    from pixel_patrol_anatomy import cli as cli_mod
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    message = cli_mod._no_viewer_message(tmp_path / "report.parquet")
+    assert "fetch-viewer" in message
+    assert cli_mod.HOSTED_VIEWER in message
+    assert "3D" in message

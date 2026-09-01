@@ -30,6 +30,15 @@ logger = logging.getLogger(__name__)
 
 # Written into the parquet footer metadata (pp_flavor); the viewer shows it as a chip in the
 # report-info strip at the foot of the page.
+VIEWER_BUNDLE_URL = "https://betaseg.github.io/cellsketch-v2/viewer-dist.tar.gz"
+
+
+def viewer_cache_dir() -> Path:
+    """Where a fetched viewer lives. One per user, not one per environment."""
+    root = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+    return Path(root) / "pixel-patrol-anatomy" / "viewer_dist"
+
+
 HOSTED_VIEWER = "https://betaseg.github.io/cellsketch-v2/pixelpatrol-anatomy.html"
 FLAVOR = "object anatomy"
 
@@ -480,32 +489,110 @@ def mesh(
 @cli.command()
 @click.argument("report", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--significance", is_flag=True, help="Show significance brackets from the start.")
+@click.option("--viewer-dist", type=click.Path(exists=True, file_okay=False, path_type=Path),
+              default=None, metavar="DIR",
+              help="Serve this prebuilt viewer instead of a downloaded or built one.")
 @click.option("--port", type=int, default=8052, show_default=True)
-def view(report: Path, significance: bool, port: int) -> None:
+def view(report: Path, significance: bool, port: int, viewer_dist: Path | None) -> None:
     """Open a report in the PixelPatrol viewer.
 
-    A convenience alias: the widgets load from this package's entry point whichever viewer
-    command opens the report, and `pixel-patrol view` takes more options (grouping,
-    filtering, palette).
-    """
-    from pixel_patrol_base import api
+    The widgets load from this package's entry point whichever viewer command opens the
+    report; `pixel-patrol view` takes more options (grouping, filtering, palette).
 
+    Serving locally is what makes the 3D widgets work: the geometry sits beside the report
+    as its own parquet, and only a local server reads it off disk.
+    """
+    from pixel_patrol_base.viewer_server import serve_viewer
+
+    dist = viewer_dist or _viewer_dist()
+    if dist is None:
+        raise SystemExit(_no_viewer_message(report))
+    serve_viewer(report, port=port, dist_dir=dist, is_show_significance=significance)
+
+
+def _viewer_dist() -> Path | None:
+    """The viewer bundle to serve, or None if this installation has none.
+
+    A downloaded one wins over a built one: it is the copy this package fetched and knows
+    the version of, and it is the one a machine with no node has at all.
+    """
+    cached = viewer_cache_dir()
+    if (cached / "index.html").is_file():
+        return cached
     try:
-        api.view(report, port=port, is_show_significance=significance)
-    except FileNotFoundError as exc:
-        if "viewer" not in str(exc).lower():
-            raise
-        # The viewer is a JavaScript bundle that pixel-patrol builds and does not ship, so a
-        # plain install has no local viewer and its advice ("cd viewer && npm run build")
-        # names a directory this user does not have. Point at the one that needs nothing.
+        from pixel_patrol_base.viewer_server import find_viewer_dist
+
+        return find_viewer_dist()
+    except FileNotFoundError:
+        return None
+
+
+def _no_viewer_message(report: Path) -> str:
+    return (
+        "No viewer in this installation.\n\n"
+        "The viewer is a JavaScript bundle that pixel-patrol builds rather than ships, so a\n"
+        "plain install has none. Get one without installing node:\n\n"
+        "    pixel-patrol-anatomy fetch-viewer\n\n"
+        "and run this command again. It is a one-off, cached under\n"
+        f"    {viewer_cache_dir()}\n\n"
+        "Or, without a local viewer at all, open\n"
+        f"    {HOSTED_VIEWER}\n"
+        f"and choose {report}. That reads the file in the browser and uploads nothing, but\n"
+        "the 3D widgets stay empty: the geometry is a separate file beside the report, and\n"
+        "only a local server can reach it."
+    )
+
+
+@cli.command(name="fetch-viewer")
+@click.option("--url", default=None, metavar="URL",
+              help=f"Where to fetch the bundle from (default: {VIEWER_BUNDLE_URL}).")
+@click.option("--force", is_flag=True, help="Fetch again even if one is already cached.")
+def fetch_viewer(url: str | None, force: bool) -> None:
+    """Download the prebuilt viewer, so `view` works without building it.
+
+    The alternative is a pixel-patrol checkout and an npm build. This is the same bundle,
+    built once by this project's release workflow.
+    """
+    import io
+    import shutil
+    import tarfile
+    import urllib.request
+
+    target = viewer_cache_dir()
+    if (target / "index.html").is_file() and not force:
+        click.echo(f"Already have a viewer at {target} (use --force to fetch it again)")
+        return
+
+    source = url or VIEWER_BUNDLE_URL
+    click.echo(f"Fetching {source}")
+    try:
+        with urllib.request.urlopen(source) as response:
+            payload = response.read()
+    except Exception as exc:
         raise SystemExit(
-            f"No local viewer in this installation.\n\n"
-            f"Open {HOSTED_VIEWER}\n"
-            f"and choose {report} - it runs in the browser, reads the file locally, and\n"
-            f"has this package's widgets built in. Nothing is uploaded.\n\n"
-            f"To run one locally instead, build the viewer once from a pixel-patrol\n"
-            f"checkout; see the README under Install."
+            f"Could not fetch the viewer from {source}\n  {type(exc).__name__}: {exc}\n\n"
+            "If this project's pages site is not published yet, point --url at a bundle, or\n"
+            "build one from a pixel-patrol checkout; see the README under Install."
         ) from exc
+
+    # Unpack beside the target and swap, so a failed download never leaves a half viewer
+    # that `view` would then try to serve.
+    staging = target.with_name(target.name + ".incoming")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        archive.extractall(staging, filter="data")
+    unpacked = staging / "viewer_dist" if (staging / "viewer_dist").is_dir() else staging
+    if not (unpacked / "index.html").is_file():
+        shutil.rmtree(staging)
+        raise SystemExit(f"{source} does not hold a viewer (no index.html)")
+    if target.exists():
+        shutil.rmtree(target)
+    unpacked.replace(target)
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    click.echo(f"Viewer ready at {target}")
 
 
 if __name__ == "__main__":  # pragma: no cover
