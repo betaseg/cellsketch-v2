@@ -333,3 +333,42 @@ def test_a_small_instance_is_not_smoothed_away():
     assert payload, "a 3-sample blob still has a surface"
     n_verts, n_faces = payload_counts(payload)
     assert n_verts > 3 and n_faces > 3
+
+
+# ── large instances are meshed in the parent, not farmed out ─────────────────
+#
+# An instance's meshing cost follows its padded bounding box, and one organelle threading
+# through an object has a box spanning most of it. Eight of those, one per pool worker, is
+# how a 22-process pool nearly took a machine down. They are meshed inline instead, which
+# means the results come back from two places and have to be put back in order.
+
+def test_oversized_and_pooled_instances_come_back_in_order(monkeypatch):
+    import numpy as np
+    from pixel_patrol_anatomy import mesh as mesh_mod
+
+    # Low enough that the sprawling instance is routed inline and the cubes are not.
+    monkeypatch.setattr(mesh_mod, "_INLINE_INSTANCE_SAMPLES", 50_000)
+
+    labels = np.zeros((40, 120, 120), dtype=np.uint16)
+    for i in range(12):
+        z, y, x = 2 + (i % 4) * 9, 2 + (i // 4) * 38, 4
+        labels[z:z + 7, y:y + 30, x:x + 30] = i + 1
+    labels[1:39, 1:119, 60:64] = 99          # bbox spans the volume -> inline
+
+    args = ({"m": labels}, {"m": "label"}, (0.024, 0.016, 0.016))
+    opts = dict(with_skeletons=False, contact_max_um=None)
+    serial = mesh_mod.mesh_rows_for_object(*args, "o",
+                                           options=mesh_mod.MeshOptions(mesh_workers=1, **opts))
+    split = mesh_mod.mesh_rows_for_object(*args, "o",
+                                          options=mesh_mod.MeshOptions(mesh_workers=4, **opts))
+
+    assert [r["label_id"] for r in serial] == [r["label_id"] for r in split]
+    assert all(a["mesh"] == b["mesh"] for a, b in zip(serial, split))
+    sprawling = [r for r in split if r["label_id"] == 99][0]
+    assert sprawling["mesh"], "the inline instance lost its geometry"
+
+
+def test_the_mesh_pool_is_bounded_by_memory_not_just_cores():
+    from pixel_patrol_anatomy.parallel import mesh_worker_budget, _WORKER_CAP
+    assert mesh_worker_budget(1000) <= _WORKER_CAP
+    assert mesh_worker_budget(1) == 1

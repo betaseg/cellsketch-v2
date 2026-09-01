@@ -317,6 +317,13 @@ def _bbox_extent(binary: np.ndarray) -> float:
 # handed, so feeding it everything would hold every cropped mask in memory at the same time.
 _GEOMETRY_BATCH = 256
 
+# An instance whose padded bounding box is bigger than this is meshed here rather than sent
+# anywhere. Its cost follows that box, not its voxel count: an organelle threading through
+# the object has a box spanning most of it, and the EDT and smoothed copy of that box are
+# gigabytes. One of those in the parent is survivable; eight of them, one per worker, is how
+# a 22-process pool nearly took a machine down.
+_INLINE_INSTANCE_SAMPLES = 2_000_000
+
 
 def _instance_geometry(task: Tuple[Any, ...]) -> Tuple[bytes, bytes]:
     """One instance's (mesh, outline).
@@ -418,6 +425,7 @@ def _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
         for batch in batched(props, _GEOMETRY_BATCH):
             pending: List[Dict[str, Any]] = []
             tasks: List[Tuple[Any, ...]] = []
+            oversized: List[bool] = []
             for rp in batch:
                 stats = measured.get(int(rp.label), {})
                 shape_metrics = {key: stats.get(key, float("nan")) for key in shape_keys}
@@ -438,17 +446,28 @@ def _rows(volumes, kinds, sample_size, object_id, group_id, options, metrics,
                     "spatial_dims": ndim,
                     "skeleton": skeleton_payload(skeletons.get(int(rp.label))),
                 })
+                image = rp.image.astype(bool)
                 tasks.append((
-                    rp.image.astype(bool), origin, tuple(sample_size), planar,
+                    image, origin, tuple(sample_size), planar,
                     options.step_size,
                     sigma_for_shape(roundness, fill_ratio, sigma_min=0.3,
                                     sigma_max=options.smooth_sigma * 2),
                     options.target_reduction, options.level,
                 ))
-            geometry = pool.map(_instance_geometry, tasks, total=len(props))
-            for row, (mesh_payload, outline_payload) in zip(pending, geometry):
-                row["mesh"] = mesh_payload
-                row["outline"] = outline_payload
+                oversized.append(image.size > _INLINE_INSTANCE_SAMPLES)
+
+            # The big ones here, the rest in the pool, and the results put back in order.
+            geometry: List[Optional[Tuple[bytes, bytes]]] = [None] * len(tasks)
+            farmed = [i for i, big in enumerate(oversized) if not big]
+            for i, big in enumerate(oversized):
+                if big:
+                    geometry[i] = _instance_geometry(tasks[i])
+            for i, done in zip(farmed, pool.map(_instance_geometry,
+                                                [tasks[i] for i in farmed],
+                                                total=len(props))):
+                geometry[i] = done
+            for row, payloads in zip(pending, geometry):
+                row["mesh"], row["outline"] = payloads
                 rows.append(row)
 
     if options.contact_max_um is not None:

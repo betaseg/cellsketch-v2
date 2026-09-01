@@ -33,6 +33,19 @@ logger = logging.getLogger(__name__)
 # rather than in the pool: it is the price of finding out.
 _SAMPLE = 24
 
+# Meshing one instance holds an EDT, a smoothed copy and the marching-cubes output over its
+# padded bounding box. Measured at 0.024x0.016x0.016 um: a 1-Mvoxel bbox peaks near 75 MB, a
+# 7-Mvoxel one near 473 MB. Per-worker allowance for sizing the pool.
+_WORKER_GB = 0.5
+
+# More than this stopped helping anyway - 22 processes measured slower than 8 on a real
+# object - so capping costs no speed and bounds what the pool can hold at once.
+_WORKER_CAP = 8
+
+# Of the memory still free, the share the pool may plan to use. The parent is holding the
+# whole object and its distance transform, and wants the rest.
+_MEMORY_SHARE = 0.25
+
 T = TypeVar("T")
 R = TypeVar("R")
 
@@ -44,12 +57,31 @@ def batched(items: Sequence[T], size: int) -> Iterator[List[T]]:
         yield chunk
 
 
+def mesh_worker_budget(cores: int) -> int:
+    """How many mesh processes are safe, given the cores offered and the memory free.
+
+    Cores alone is the wrong answer and nearly took a machine down: one object worker on a
+    22-core box was handed 22 mesh processes, each able to hold half a gigabyte or more
+    while the parent held a 26 GB object. Bounded by free memory and by the point where
+    more processes stopped helping.
+    """
+    share = max(1, cores)
+    try:
+        import psutil
+
+        free_gb = psutil.virtual_memory().available / 1024**3
+        share = min(share, max(1, int(free_gb * _MEMORY_SHARE / _WORKER_GB)))
+    except Exception:  # noqa: BLE001 - no psutil is a reason to be careful, not to stop
+        share = min(share, _WORKER_CAP)
+    return max(1, min(share, _WORKER_CAP))
+
+
 def worker_share(requested: int = 0) -> int:
     """How many processes one object may use for its own per-instance work.
 
-    Objects already run in parallel, so this is the share of the cores left over, which the
-    batch works out and passes down in PP_ANATOMY_MESH_WORKERS. Running one object on its
-    own (the `mesh` command) gets the machine.
+    An explicit --mesh-workers is taken at its word. Otherwise the batch has already worked
+    out a bounded share and passed it down in PP_ANATOMY_MESH_WORKERS; running one object on
+    its own (the `mesh` command) works one out here.
     """
     if requested:
         return max(1, int(requested))
@@ -59,7 +91,7 @@ def worker_share(requested: int = 0) -> int:
             return max(1, int(raw))
         except ValueError:
             logger.warning("anatomy: PP_ANATOMY_MESH_WORKERS=%r is not a number; ignoring", raw)
-    return max(1, os.cpu_count() or 1)
+    return mesh_worker_budget(os.cpu_count() or 1)
 
 
 class WorkPool:

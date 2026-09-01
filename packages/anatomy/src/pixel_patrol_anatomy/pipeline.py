@@ -32,6 +32,7 @@ from pixel_patrol_anatomy.plugins.processors.contacts import ContactsProcessor
 from pixel_patrol_anatomy.plugins.processors.instances import InstanceProcessor
 from pixel_patrol_anatomy.plugins.processors.mesh import MeshProcessor
 from pixel_patrol_anatomy.plugins.processors.morphology import MorphologyProcessor
+from pixel_patrol_anatomy.parallel import mesh_worker_budget
 from pixel_patrol_anatomy.skeletons import CACHE
 
 logger = logging.getLogger(__name__)
@@ -289,8 +290,9 @@ def analyse(
     # Meshing farms instances out to processes of its own, and this pool is sized by memory
     # rather than by cores, so on big objects most of the machine would otherwise sit idle.
     # Each object gets the share left over; an explicit --mesh-workers already set it.
-    os.environ.setdefault("PP_ANATOMY_MESH_WORKERS",
-                          str(max(1, (os.cpu_count() or 1) // n_workers)))
+    os.environ.setdefault(
+        "PP_ANATOMY_MESH_WORKERS",
+        str(mesh_worker_budget(max(1, (os.cpu_count() or 1) // n_workers))))
     logger.info("anatomy: %d object(s), %d worker(s), %s mesh process(es) each",
                 len(folders), n_workers, os.environ["PP_ANATOMY_MESH_WORKERS"])
 
