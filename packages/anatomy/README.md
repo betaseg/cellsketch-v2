@@ -164,6 +164,19 @@ On a real dataset (eight vEM alpha objects, 2.5–10.5 GB stacked, five entities
 8 object folder(s); 3 worker(s) (largest object needs ~17.9 GB each)
 ```
 
+### Resuming
+
+Nothing is written until the batch finishes, so a run that died late used to lose every
+object it had already measured - hours, on a batch of vEM cells. Each object's rows now go
+to `<output>_parts/<object>.parquet` as it completes, and `--resume` reuses them instead of
+measuring those objects again. The directory is removed once the report is written, so it
+only holds anything after a run that failed. Parts are written by the parent under a
+temporary name and renamed, so a part is either whole or absent; one that is unreadable or
+empty is measured again rather than trusted.
+
+With `--reuse-geometry` as well, resuming an interrupted `--with-mesh` run costs neither the
+measuring nor the meshing of the objects that finished.
+
 ### Why the processing is ours
 
 `process` runs the processors itself rather than through PixelPatrol's pipeline, because an

@@ -187,13 +187,16 @@ def test_voxel_size_lands_in_the_standard_pixel_size_columns(table):
 
 def _fake_dispatch(killed_by_worker_count):
     """A dispatch that kills the object named 'bad' unless few enough workers are running."""
-    def dispatch(work, excluded, n_workers):
+    def dispatch(work, excluded, n_workers, on_result=None):
         finished, unrun = [], []
         for folder, group in work:
             if folder.name == "bad" and n_workers >= killed_by_worker_count:
                 unrun.append((folder, group))
             else:
-                finished.append(pipeline.ObjectResult(folder.name, object_row={"n": folder.name}))
+                result = pipeline.ObjectResult(folder.name, object_row={"n": folder.name})
+                finished.append(result)
+                if on_result is not None:
+                    on_result(result)
         return finished, unrun
     return dispatch
 
@@ -225,3 +228,52 @@ def test_an_object_that_always_kills_its_worker_is_reported_not_retried_forever(
     assert set(by_id) == {"a", "bad", "b"}
     assert by_id["bad"].error and "out of memory" in by_id["bad"].error
     assert by_id["a"].error is None and by_id["b"].error is None
+
+
+# ── --resume ─────────────────────────────────────────────────────────────────
+#
+# Nothing was written until the whole batch finished, so a run that died late lost every
+# object it had already measured. Each object's rows now go to a sidecar as it completes.
+# What matters is that resuming from those sidecars gives the same report as measuring.
+
+def _analysed(root, parts, resume):
+    import os
+    from pixel_patrol_anatomy.cli import find_object_dirs
+    os.environ["PP_ANATOMY_OBJECT_MASK"] = "pm"
+    return pipeline.analyse(find_object_dirs(root), root, ["control", "treated"],
+                            workers=1, parts_dir=parts, resume=resume)
+
+
+def test_a_resumed_report_is_the_report_it_would_have_measured(tmp_path):
+    from synthetic import make_dataset
+    root = make_dataset(tmp_path / "objects")
+    parts = tmp_path / "parts"
+
+    fresh = _analysed(root, parts, resume=False)
+    assert not fresh.failures, fresh.failures
+    assert list(parts.glob("*.parquet")), "no per-object rows were kept"
+
+    resumed = _analysed(root, parts, resume=True)
+    assert not resumed.failures, resumed.failures
+    assert resumed.rows.shape == fresh.rows.shape
+    # Row order follows completion, so compare on the sorted frames.
+    keys = ["obs_level", "object_id", "entity_name"]
+    by = [k for k in keys if k in fresh.rows.columns]
+    assert resumed.rows.sort(by).equals(fresh.rows.sort(by)), \
+        "resuming from the sidecars changed the report"
+
+
+def test_an_unreadable_part_is_measured_again_rather_than_trusted(tmp_path):
+    from synthetic import make_dataset
+    root = make_dataset(tmp_path / "objects")
+    parts = tmp_path / "parts"
+    fresh = _analysed(root, parts, resume=False)
+
+    # What a run killed mid-write leaves behind.
+    victim = sorted(parts.glob("*.parquet"))[0]
+    whole = victim.read_bytes()
+    victim.write_bytes(whole[: len(whole) // 2])
+
+    resumed = _analysed(root, parts, resume=True)
+    assert not resumed.failures, resumed.failures
+    assert resumed.rows.shape == fresh.rows.shape, "a truncated part cost an object its rows"

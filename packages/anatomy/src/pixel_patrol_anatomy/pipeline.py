@@ -17,7 +17,7 @@ import multiprocessing
 import os
 import time
 from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -199,7 +199,8 @@ def worker_count(requested: Optional[int], n_objects: int, peak_gb: float) -> in
 
 
 def _dispatch(work: Sequence[Tuple[Path, str]], excluded: Sequence[str],
-              n_workers: int) -> Tuple[List[ObjectResult], List[Tuple[Path, str]]]:
+              n_workers: int, on_result=None) -> Tuple[List[ObjectResult],
+                                                        List[Tuple[Path, str]]]:
     """Measure objects in a pool. Returns what finished, and what the pool never got to.
 
     A worker killed from outside cannot report anything and takes the pool with it. That is
@@ -207,32 +208,40 @@ def _dispatch(work: Sequence[Tuple[Path, str]], excluded: Sequence[str],
     sends SIGKILL, so `analyse_object`'s own error handling never runs. `pool.map` raises at
     that point and loses *every* result, including objects that finished hours before.
 
-    So futures are collected one at a time and whatever the broken pool never ran is handed
-    back for the caller to retry. Submission order, not completion order, so a retry at
-    lower concurrency meets the objects in the same sequence.
+    So futures are handled as they complete and `on_result` is called with each one straight
+    away, which is what lets a part be on disk before anything else can go wrong. What the
+    broken pool never ran is handed back in submission order, so a retry at lower
+    concurrency meets the objects in the same sequence.
     """
     # spawn, not fork: the parent holds native threads (polars, DuckDB, BLAS) and a forked
     # child can deadlock on their locks. Workers inherit the environment, which is how they
     # get the analysis options.
     context = multiprocessing.get_context("spawn")
     finished: List[ObjectResult] = []
-    unrun: List[Tuple[Path, str]] = []
+    unrun: List[Tuple[int, Path, str]] = []
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=context) as pool:
-        futures = {pool.submit(analyse_object, folder, group, tuple(excluded)): (folder, group)
-                   for folder, group in work}
-        for future, (folder, _group) in futures.items():
+        futures = {
+            pool.submit(analyse_object, folder, group, tuple(excluded)): (i, folder, group)
+            for i, (folder, group) in enumerate(work)
+        }
+        for future in as_completed(futures):
+            index, folder, group = futures[future]
             try:
-                finished.append(future.result())
+                result = future.result()
             except BrokenProcessPool:
-                unrun.append((folder, _group))
+                unrun.append((index, folder, group))
+                continue
             except Exception as exc:  # noqa: BLE001 - one bad object must not stop the batch
                 logger.error("anatomy: %s failed: %s: %s", folder.name, type(exc).__name__, exc)
-                finished.append(ObjectResult(folder.name, error=f"{type(exc).__name__}: {exc}"))
-    return finished, unrun
+                result = ObjectResult(folder.name, error=f"{type(exc).__name__}: {exc}")
+            finished.append(result)
+            if on_result is not None:
+                on_result(result)
+    return finished, [(folder, group) for _i, folder, group in sorted(unrun)]
 
 
 def _measure_all(work: List[Tuple[Path, str]], excluded: Sequence[str],
-                 n_workers: int, dispatch=None) -> List[ObjectResult]:
+                 n_workers: int, dispatch=None, on_result=None) -> List[ObjectResult]:
     """Measure every object, surviving a worker that is killed rather than raising.
 
     On a broken pool the concurrency is halved and the objects that never ran are retried,
@@ -244,10 +253,13 @@ def _measure_all(work: List[Tuple[Path, str]], excluded: Sequence[str],
     results: List[ObjectResult] = []
     if len(work) == 1 and n_workers == 1:
         folder, group = work[0]
-        return [analyse_object(folder, group, excluded)]
+        only = analyse_object(folder, group, excluded)
+        if on_result is not None:
+            on_result(only)
+        return [only]
 
     while work:
-        finished, unrun = dispatch(work, excluded, n_workers)
+        finished, unrun = dispatch(work, excluded, n_workers, on_result)
         results.extend(finished)
         if not unrun:
             break
@@ -274,6 +286,58 @@ def _measure_all(work: List[Tuple[Path, str]], excluded: Sequence[str],
     return results
 
 
+def _part_path(parts_dir: Path, object_id: str) -> Path:
+    return parts_dir / f"{object_id}.parquet"
+
+
+def _write_part(parts_dir: Path, result: ObjectResult) -> None:
+    """Keep one object's rows on disk the moment it is measured.
+
+    Nothing else is written until the whole batch finishes, so a run that dies late loses
+    every object it had already measured - which on a batch of these is hours. Written from
+    the parent, so there is one writer and no object can half-write its own part while a
+    worker is being killed.
+    """
+    rows = [result.object_row, *result.entity_rows]
+    if result.error or not result.object_row:
+        return
+    try:
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        frame = pl.DataFrame(rows, infer_schema_length=None, strict=False)
+        temporary = _part_path(parts_dir, result.object_id).with_suffix(".parquet.writing")
+        frame.write_parquet(temporary)
+        # Rename last: a reader never sees a partly written part, so resume cannot pick one up.
+        temporary.replace(_part_path(parts_dir, result.object_id))
+    except Exception as exc:  # noqa: BLE001 - failing to cache must not fail the run
+        logger.warning("anatomy: could not keep %s for resume (%s: %s)",
+                       result.object_id, type(exc).__name__, exc)
+
+
+def _read_part(path: Path) -> Optional[List[Dict[str, Any]]]:
+    """One object's rows back from disk, or None if the file cannot be trusted."""
+    try:
+        frame = pl.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001 - unreadable is a reason to measure again
+        logger.warning("anatomy: %s is not readable (%s); measuring that object again",
+                       path, type(exc).__name__)
+        return None
+    if frame.height == 0 or "obs_level" not in frame.columns:
+        logger.warning("anatomy: %s holds nothing usable; measuring that object again", path)
+        return None
+    return frame.to_dicts()
+
+
+def discard_parts(parts_dir: Path) -> None:
+    """Remove the per-object rows once the report they were insurance for exists."""
+    import shutil
+
+    try:
+        if parts_dir.is_dir():
+            shutil.rmtree(parts_dir)
+    except OSError as exc:
+        logger.warning("anatomy: could not remove %s (%s)", parts_dir, exc)
+
+
 def analyse(
     folders: Sequence[Path],
     root: Path,
@@ -282,6 +346,8 @@ def analyse(
     excluded: Sequence[str] = (),
     workers: Optional[int] = None,
     peak_gb: float = 4.0,
+    parts_dir: Optional[Path] = None,
+    resume: bool = False,
 ) -> Report:
     """Measure every object folder and return the rows plus whatever failed."""
     started = time.perf_counter()
@@ -296,9 +362,22 @@ def analyse(
     logger.info("anatomy: %d object(s), %d worker(s), %s mesh process(es) each",
                 len(folders), n_workers, os.environ["PP_ANATOMY_MESH_WORKERS"])
 
-    results = _measure_all(list(zip(folders, groups)), excluded, n_workers)
-
     rows: List[Dict[str, Any]] = []
+    work: List[Tuple[Path, str]] = []
+    for folder, group in zip(folders, groups):
+        cached = (_read_part(_part_path(parts_dir, folder.name))
+                  if resume and parts_dir and _part_path(parts_dir, folder.name).is_file()
+                  else None)
+        if cached is None:
+            work.append((folder, group))
+            continue
+        logger.info("anatomy: %s already measured; reusing its %d row(s)",
+                    folder.name, len(cached))
+        rows.extend(cached)
+
+    keep = (lambda result: _write_part(parts_dir, result)) if parts_dir else None
+    results = _measure_all(work, excluded, n_workers, on_result=keep) if work else []
+
     failures: Dict[str, str] = {}
     for result in results:
         if result.error:

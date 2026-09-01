@@ -88,6 +88,9 @@ Useful flags, see `pixel-patrol-anatomy process --help` for the rest:
 - `--reuse-geometry`: keep the `geometry.parquet` an object already has rather than meshing
   it again. Meshing is most of a long run, so this is how a batch that died partway is
   finished in minutes. A file that is missing, empty or truncated is written again
+- `--resume`: skip objects an interrupted run already measured. Each object's rows go to
+  `<output>_parts/` the moment it finishes and are removed once the report is written, so
+  a run that dies late no longer costs the objects it had already done
 
 ## Checking your input first (`dry-run`)
 

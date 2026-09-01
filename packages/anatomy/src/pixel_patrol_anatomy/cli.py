@@ -259,6 +259,10 @@ def colours(report: Path, palette: Path) -> None:
 @click.option("--no-instances", is_flag=True,
               help="Skip per-instance measurements: entity-level morphology only.")
 @click.option("--max-workers", type=int, default=None, help="Worker processes (default: auto).")
+@click.option("--resume", is_flag=True,
+              help="Skip objects already measured by an interrupted run. Each object's rows "
+                   "are kept in <output>_parts/ as it finishes and removed once the report "
+                   "is written, so this only has anything to reuse after a run that died.")
 @click.option("--with-mesh", is_flag=True,
               help="Also write per-object geometry for the 3D widgets and Blender: meshes "
                    "and skeletons for a volume, outlines and skeletons for a plane. It goes "
@@ -273,7 +277,7 @@ def process(
     max_skeleton_voxels: int | None, num_threads: int | None,
     skeleton_entities: str | None, skip_skeletons: bool, polarity_spread: bool,
     distance_histograms: bool, colours: Path | None, no_contacts: bool, no_instances: bool,
-    max_workers: int | None, with_mesh: bool,
+    max_workers: int | None, resume: bool, with_mesh: bool,
     mesh_dir: Path | None, mesh_smooth_sigma: float | None, mesh_step_size: int | None,
     mesh_target_reduction: float | None, mesh_level: float | None,
     mesh_workers: int | None, reuse_geometry: bool,
@@ -307,9 +311,15 @@ def process(
     click.echo(f"{len(objects)} object folder(s); {workers} worker(s) "
                f"(largest object needs ~{peak:.1f} GB each)")
 
+    parts = output.with_name(output.stem + "_parts")
     report = pipeline.analyse(objects, object_dir, list(paths),
-                              excluded=sorted(excluded), workers=workers, peak_gb=peak)
+                              excluded=sorted(excluded), workers=workers, peak_gb=peak,
+                              parts_dir=parts, resume=resume)
     pipeline.write(report, output, root=object_dir, paths=list(paths), flavor=FLAVOR)
+    # The report is the durable copy now, so the per-object ones have done their job. Kept
+    # when something failed, since that is the run worth resuming.
+    if not report.failures:
+        pipeline.discard_parts(parts)
     if colours:
         # The same call the `colours` command makes: one path for one column, and it can be
         # run again later without redoing any of the measuring.
