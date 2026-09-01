@@ -29,7 +29,31 @@ and every configuration knob; this page is the short path through a run.
    `pixel-patrol-anatomy colours report.parquet palette.json` sets a colour per structure at any point.
 5. Optionally import an object's geometry into Blender.
 
-## Install and run
+## Try it
+
+One command, no clone and no node:
+
+```bash
+uv pip install "pixel-patrol-anatomy @ git+https://github.com/betaseg/cellsketch-v2.git@main#subdirectory=packages/anatomy"
+```
+
+```bash
+pixel-patrol-anatomy dry-run experiment/
+pixel-patrol-anatomy process experiment/ -o report.parquet --object-mask pm \
+    -p control -p treated --with-mesh
+```
+
+Then open **<https://betaseg.github.io/cellsketch-v2/pixelpatrol-anatomy.html>** and choose
+`report.parquet`. That page is the PixelPatrol viewer with this package's seven widgets built
+into it; it reads the file in the browser, so nothing is uploaded and no server runs.
+
+`pixel-patrol-base` comes from git, pinned to a commit in this package's own dependencies,
+so the one command brings it along. Folder discovery for suffix-less directories is in no
+release yet.
+
+## Install for development
+
+The same install, editable, from a checkout:
 
 ```bash
 uv venv --python 3.12 .venv
@@ -40,13 +64,11 @@ uv pip install -e packages/anatomy
 Every command below assumes that activated environment; without it, reach into the venv
 directly instead (`.venv/bin/pixel-patrol-anatomy …`).
 
-That is everything for `dry-run`, `process` and `mesh`. Folder discovery for suffix-less
-directories is in no `pixel-patrol-base` release, so the package pins an unreleased one by
-commit in its own dependencies; nothing to name here, and nothing to keep in step.
+### Running the viewer locally
 
-`view` needs one thing more: the viewer itself is a build product and is not committed, so
-an install from git carries none and the command stops with *Viewer not built*. Build it
-once, from the commit the package already pins:
+`pixel-patrol view` serves the viewer itself, and the viewer is a JavaScript bundle that
+pixel-patrol builds rather than ships, so a plain install has none and the command says so.
+Building it is a one-off per pinned commit, not a step you repeat:
 
 ```bash
 git clone https://github.com/ida-mdc/pixel-patrol.git
@@ -55,10 +77,10 @@ git -C pixel-patrol checkout "$(grep -oE '[0-9a-f]{40}' packages/anatomy/pyproje
 uv pip install -e pixel-patrol/packages/pixel-patrol-base
 ```
 
+Editing this package's own widgets needs none of that: the viewer serves them from the
+source tree on every request, so a browser refresh is enough.
+
 ```bash
-pixel-patrol-anatomy dry-run experiment/
-pixel-patrol-anatomy process experiment/ -o report.parquet --object-mask pm \
-    -p control -p treated --with-mesh
 pixel-patrol-anatomy view report.parquet --significance
 ```
 

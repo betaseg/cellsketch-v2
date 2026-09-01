@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Written into the parquet footer metadata (pp_flavor); the viewer shows it as a chip in the
 # report-info strip at the foot of the page.
+HOSTED_VIEWER = "https://betaseg.github.io/cellsketch-v2/pixelpatrol-anatomy.html"
 FLAVOR = "object anatomy"
 
 # Peak resident memory per worker, as a multiple of (stack + one distance transform).
@@ -489,7 +490,22 @@ def view(report: Path, significance: bool, port: int) -> None:
     """
     from pixel_patrol_base import api
 
-    api.view(report, port=port, is_show_significance=significance)
+    try:
+        api.view(report, port=port, is_show_significance=significance)
+    except FileNotFoundError as exc:
+        if "viewer" not in str(exc).lower():
+            raise
+        # The viewer is a JavaScript bundle that pixel-patrol builds and does not ship, so a
+        # plain install has no local viewer and its advice ("cd viewer && npm run build")
+        # names a directory this user does not have. Point at the one that needs nothing.
+        raise SystemExit(
+            f"No local viewer in this installation.\n\n"
+            f"Open {HOSTED_VIEWER}\n"
+            f"and choose {report} - it runs in the browser, reads the file locally, and\n"
+            f"has this package's widgets built in. Nothing is uploaded.\n\n"
+            f"To run one locally instead, build the viewer once from a pixel-patrol\n"
+            f"checkout; see the README under Install."
+        ) from exc
 
 
 if __name__ == "__main__":  # pragma: no cover
